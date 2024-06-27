@@ -94,7 +94,8 @@ def get_all_sword_reach_in_basin(input,Verbose):
 def apply_sword_patches(input,Verbose):
     # this is included here to test custom patches. 
     # not run as part of normal confluence runs
-    patch_json = Path("/home/mdurand_umass_edu/dev-confluence/mnt/").joinpath('sword_patches_v215.json')
+    #patch_json = Path("/home/mdurand_umass_edu/dev-confluence/mnt/").joinpath('sword_patches_v216.json')
+    patch_json = Path("/Users/mtd/Analysis/SWOT/Discharge/Confluence/ohio_offline_runs/mnt/").joinpath('sword_patches_v216.json')
     with open(patch_json) as json_file:
         patch_data = json.load(json_file)
 
@@ -151,6 +152,22 @@ def apply_sword_patches(input,Verbose):
 
     return input
 
+def set_moi_params():
+
+    moi_params={
+        'FLPE_Uncertainty': 0.67, #default: 0.67
+        'Gage_Uncertainty': 0.10, #default: 0.10
+        'Fill_Uncertainty': 1.0,  #default: 1.0
+        'norm': 0.5,              #default: 0.5
+        'rho': 0.7,               #default: 0.7
+        'niter': 4,               #default: 4
+        'method':'linear',        #default: 'linear'
+        'quit_before_flpe':False, #default: False
+        'apply_patches': False #default: False
+    }
+
+    return moi_params
+
 
 def main():
 
@@ -190,9 +207,11 @@ def main():
         FLPE_DIR = Path("/mnt/data/flpe")
         OUTPUT_DIR = Path("/mnt/data/output")
     else:
-        INPUT_DIR = Path("/home/mdurand_umass_edu/dev-confluence/mnt/input")
-        FLPE_DIR = Path("/home/mdurand_umass_edu/dev-confluence/mnt/flpe")
-        OUTPUT_DIR = Path("/home/mdurand_umass_edu/dev-confluence/mnt/moi")
+        #basedir=Path("/home/mdurand_umass_edu/dev-confluence/mnt/")
+        basedir=Path("/Users/mtd/Analysis/SWOT/Discharge/Confluence/ohio_offline_runs/mnt")
+        INPUT_DIR = basedir.joinpath("input") 
+        FLPE_DIR = basedir.joinpath("flpe")
+        OUTPUT_DIR = basedir.joinpath("moi")
 
     #basin data
     try:
@@ -202,15 +221,21 @@ def main():
     except IndexError:
         basin_json = INPUT_DIR.joinpath("basin.json") 
 
-
     basin_data = get_basin_data(basin_json,index_to_run)
 
     print('Running ',Branch,' branch.')
 
+    print('setting moi params')
+    params_dict=set_moi_params()
+
     input = Input(FLPE_DIR, INPUT_DIR / "sos/", INPUT_DIR / "swot", INPUT_DIR / "sword", basin_data,Branch,Verbose)
     print('Exctracting sword...')
     input.extract_sword()
-    #input=apply_sword_patches(input,Verbose)
+
+    if params_dict['apply_patches']:
+        print('applying patches...')
+        input=apply_sword_patches(input,Verbose)
+
     print('getting all sword reaches in basin')
     input=get_all_sword_reach_in_basin(input,Verbose)
     print('extracting swot')
@@ -220,9 +245,8 @@ def main():
     print('extracting alg')
     input.extract_alg()
     
-    
     print('integrating')
-    integrate = Integrate(input.alg_dict, input.basin_dict, input.sos_dict, input.sword_dict,input.obs_dict,Branch,Verbose)
+    integrate = Integrate(input.alg_dict, input.basin_dict, input.sos_dict, input.sword_dict,input.obs_dict,params_dict,Branch,Verbose)
     integrate.integrate()
 
     output = Output(input.basin_dict, OUTPUT_DIR, integrate.integ_dict, integrate.alg_dict, integrate.obs_dict, input.sword_dir)

@@ -51,7 +51,7 @@ class Input:
         """
 
         self.alg_dict = {
-            "geobam": {},
+            "neobam": {},
             "hivdi": {},
             "metroman": {},
             "momma": {},
@@ -288,7 +288,7 @@ class Input:
 
             else:
                 #for unobserved reaches
-                algs=['geobam','hivdi','metroman','momma','sad','sic4dvar']
+                algs=['neobam','hivdi','metroman','momma','sad','sic4dvar']
                 for alg in algs:
                     self.alg_dict[alg][r_id] = {
                         "s1-flpe-exists": False,
@@ -302,7 +302,7 @@ class Input:
         r_id: str
             Unique reach identifier
         gb_file: Path
-            Path to geoBAM results file
+            Path to neoBAM results file
         hv_file: Path
             Path to HiVDI results file
         mo_file: Path
@@ -315,20 +315,20 @@ class Input:
             Path to SIC4DVar results file
         """
 
-        # geobam
+        # neobam
         if gb_file.exists():
             #print('reading',gb_file)
             gb = Dataset(gb_file, 'r', format="NETCDF4")
-            self.alg_dict["geobam"][r_id] = {
+            self.alg_dict["neobam"][r_id] = {
                 "s1-flpe-exists": True,
-                "q": np.array(self.__get_gb_data(gb, "q", "q", False)),
-                "n": np.array(self.__get_gb_data(gb, "logn", "mean", True)),
+                "q": np.array(self.__get_gb_data(gb,"q", "q", False)),
+                "n": np.array(self.__get_gb_data(gb,"logn", "mean", True)),
                 "a0": 1.0    # TODO temp value until work out neoBAM A0
             }
             gb.close()
 
         else:
-            self.alg_dict["geobam"][r_id] = { 
+            self.alg_dict["neobam"][r_id] = { 
                 "s1-flpe-exists" : False ,
                 "q" : np.nan,
                 "n" : np.nan,
@@ -460,7 +460,7 @@ class Input:
             Unique reach identifier
         """
 
-        self.alg_dict["geobam"][r_id] = {
+        self.alg_dict["neobam"][r_id] = {
             "q": np.nan,
             "n": np.nan,
             "a0": np.nan
@@ -505,8 +505,8 @@ class Input:
             "a0": np.nan
         }
 
-    def __get_gb_data(self, gb, group, pre, logged):
-        """Return geoBAM data as a numpy array.
+    def __get_gb_data(self, gb,group, pre, logged):
+        """Return neoBAM data as a numpy array.
         
         Parameters
         ----------
@@ -520,15 +520,15 @@ class Input:
             boolean indicating if result is logged
         """
 
-        chain1 = gb[group][f"{pre}1"][:].filled(np.nan)
-        chain2 = gb[group][f"{pre}2"][:].filled(np.nan)
-        chain3 = gb[group][f"{pre}3"][:].filled(np.nan)
+        q = gb[group][pre][:].filled(np.nan)
+        # chain2 = gb[group][f"{pre}2"][:].filled(np.nan)
+        # chain3 = gb[group][f"{pre}3"][:].filled(np.nan)
 
-        chains = np.vstack((chain1, chain2, chain3))
+        # chains = np.vstack((chain1, chain2, chain3))
 
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", category=RuntimeWarning)
             if logged:
-                return np.exp(np.nanmean(chains, axis=0))
+                return np.exp(np.nanmean(q, axis=0))
             else:
-                return np.nanmean(chains, axis=0)
+                return np.nanmean(q, axis=0)

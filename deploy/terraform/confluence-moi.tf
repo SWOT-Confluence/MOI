@@ -22,7 +22,7 @@ resource "aws_batch_job_definition" "generate_batch_jd_moi" {
       {
         "sourceVolume": "input",
         "containerPath": "/mnt/data/input",
-        "readOnly": true
+        "readOnly": false
       },
       {
         "sourceVolume": "flpe",
