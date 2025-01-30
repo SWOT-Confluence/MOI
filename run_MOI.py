@@ -40,7 +40,8 @@ def get_basin_data(basin_json,index_to_run,tmp_dir,sos_bucket):
     # download sos file to temp location
     if sos_bucket:
         sos_file = tmp_dir.joinpath(data[index]["sos"])
-        download_sos(sos_bucket, sos_file)
+        if sos_bucket != 'local':
+            download_sos(sos_bucket, sos_file)
 
 
     # ~~Error Handling~~
@@ -245,7 +246,10 @@ def main():
         INPUT_DIR = Path("/mnt/data/input")
         FLPE_DIR = Path("/mnt/data/flpe")
         OUTPUT_DIR = Path("/mnt/data/output")
-        TMP_DIR = Path("/tmp")
+        if args.sosbucket != 'local':
+            TMP_DIR = Path("/tmp")
+        else:
+            TMP_DIR = Path(os.path.join(INPUT_DIR, 'sos'))
     else:
         #basedir=Path("/home/mdurand_umass_edu/dev-confluence/mnt/")
         basedir=Path("/Users/mtd/Analysis/SWOT/Discharge/Confluence/ohio_offline_runs/mnt")
