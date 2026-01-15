@@ -317,7 +317,7 @@ class Input:
         """
 
         # neobam
-        if gb_file.exists():
+        try :
             #print('reading',gb_file)
             gb = Dataset(gb_file, 'r', format="NETCDF4")
             self.alg_dict["neobam"][r_id] = {
@@ -327,8 +327,7 @@ class Input:
                 "a0": 1.0    # TODO temp value until work out neoBAM A0
             }
             gb.close()
-
-        else:
+        except:
             self.alg_dict["neobam"][r_id] = { 
                 "s1-flpe-exists" : False ,
                 "q" : np.nan,
@@ -339,7 +338,7 @@ class Input:
             }
 
         # hivdi
-        if hv_file.exists():
+        try:
             hv = Dataset(hv_file, 'r', format="NETCDF4")
             self.alg_dict["hivdi"][r_id] = {
                 "s1-flpe-exists": True,
@@ -349,7 +348,7 @@ class Input:
                 "a0" : hv["reach"]["A0"][:].filled(np.nan)
             }
             hv.close()
-        else:
+        except:
             self.alg_dict["hivdi"][r_id] = { 
                 "s1-flpe-exists" : False ,
                 "q" : np.nan,
@@ -360,7 +359,7 @@ class Input:
             }
 
         # momma
-        if mo_file.exists():
+        try:
             mo = Dataset(mo_file, 'r', format="NETCDF4")
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", category=RuntimeWarning)
@@ -372,7 +371,7 @@ class Input:
                     "Save" : np.nanmean(mo["slope"][:].filled(np.nan))
                 }
             mo.close()
-        else:
+        except:
             self.alg_dict["momma"][r_id] = { 
                 "s1-flpe-exists" : False ,
                 "q" : np.nan,
@@ -384,7 +383,7 @@ class Input:
             }
 
         # sad
-        if sd_file.exists():
+        try:
             sd = Dataset(sd_file, 'r', format="NETCDF4")
             self.alg_dict["sad"][r_id] = {
                 "s1-flpe-exists": True,
@@ -393,7 +392,7 @@ class Input:
                 "a0" : sd["A0"][:].filled(np.nan)
             }
             sd.close()
-        else:
+        except:
             self.alg_dict["sad"][r_id] = { 
                 "s1-flpe-exists" : False ,
                 "q" : np.nan,
@@ -404,7 +403,7 @@ class Input:
             }
 
         # metroman    
-        if mm_file.exists():
+        try:
             mm = Dataset(mm_file, 'r', format="NETCDF4")
             # index = np.where(mm["reach_id"][:] == int(r_id))
             self.alg_dict["metroman"][r_id] = {
@@ -416,7 +415,7 @@ class Input:
             }
             mm.close()
             #print('MetroMan file found. ')
-        else:
+        except:
             self.alg_dict["metroman"][r_id] = { 
                 "s1-flpe-exists" : False ,
                 "q" : np.nan,
@@ -429,7 +428,7 @@ class Input:
             #print('MetroMan file not found. Using prior')
 
         # sic4dvar
-        if sv_file.exists():
+        try:
             sv = Dataset(sv_file, 'r', format="NETCDF4")
             self.alg_dict["sic4dvar"][r_id] = {
                 #"q31": sv["Qalgo31"][:].filled(np.nan),#unclear which of these to use
@@ -441,7 +440,7 @@ class Input:
                 "a0": sv["A0"][:].filled(np.nan)
             }
             sv.close()
-        else:
+        except:
             self.alg_dict["sic4dvar"][r_id] = { 
                 "s1-flpe-exists" : False ,
                 "q_mm": np.nan,
