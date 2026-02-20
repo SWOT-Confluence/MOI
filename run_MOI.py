@@ -248,7 +248,8 @@ def main():
         OUTPUT_DIR = Path("/mnt/data/output")
         TMP_DIR = Path("/tmp")
     else:
-        basedir=Path("/home/mdurand_umass_edu/dev-confluence/mnt/")
+        #basedir=Path("/home/mdurand_umass_edu/dev-confluence/mnt/")
+        basedir=Path("/users/PAS0503/osu5942/integrator_dev/mike/mnt/")
         #basedir=Path("/Users/mtd/Analysis/SWOT/Discharge/Confluence/ohio_offline_runs/mnt")
         INPUT_DIR = basedir.joinpath("input") 
         FLPE_DIR = basedir.joinpath("flpe")

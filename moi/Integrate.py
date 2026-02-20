@@ -696,7 +696,6 @@ class Integrate:
                # compute the G matrix, which defines mass conservation points
                G=self.calcG(m,n)
                
-               '''
                import csv
                with open('G.csv','w',newline='') as csvfile:
                    Gwriter = csv.writer(csvfile, delimiter=' ',
@@ -704,7 +703,7 @@ class Integrate:
                    Gwriter.writerow(self.basin_dict['reach_ids_all'])
                    for i in range(m):
                       Gwriter.writerow(G[i,:])
-               '''
+               sys.exit()
  
                # solve integrator problem
                if not FLPE_Data_OK or not self.junctions_valid:
