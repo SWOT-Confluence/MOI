@@ -83,21 +83,19 @@ def main():
             sys.exit("Error: No index found. Please use -i or SLURM_ARRAY_TASK_ID.")
 
     # Path Configuration
-    BASE_DIR = Path(__file__).resolve().parent
-    INPUT_DIR = BASE_DIR / "input"
-    FLPE_DIR = BASE_DIR / "flpe"
-    TMP_DIR = BASE_DIR / "tmp"
+    INPUT_DIR = Path("/mnt/data/input")
+    FLPE_DIR = Path("/mnt/data/flpe")
     BASIN_JSON = INPUT_DIR / args.basinjson
-
-    SWORD_DIR = INPUT_DIR / "sword" 
+    SWORD_DIR = INPUT_DIR / "sword"
     
     # Output Directories
-    OUTPUT_NC_DIR = Path("/fs/scratch/PAS1926/output_sfoi")
-    OUTPUT_NC_DIR.mkdir(parents=True, exist_ok=True)
+    OUTPUT_DIR = Path("/mnt/data/output")
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     
     basin_data = get_basin_data(BASIN_JSON, index_to_run)
     basin_id = basin_data["basin_id"]
-    log_DIR = Path("/fs/scratch/PAS1926/log")
+    
+    log_DIR = OUTPUT_DIR / "logs"
     log_DIR.mkdir(parents=True, exist_ok=True)
     log_file = log_DIR / f"sfoi_pipeline_{basin_id}.log"
 
@@ -155,7 +153,7 @@ def main():
                 print(f"[{basin_id}] Generating SFOI NetCDF files...")
                 params_dict['write_fill_only'] = False
                 output_obj = Output(
-                    input_obj.basin_dict, OUTPUT_NC_DIR, integrate_obj.integ_dict, 
+                    input_obj.basin_dict, OUTPUT_DIR, integrate_obj.integ_dict,
                     input_obj.alg_dict, input_obj.obs_dict, SWORD_DIR, params_dict
                 )
                 output_obj.write_output()
