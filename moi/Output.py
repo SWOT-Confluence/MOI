@@ -74,16 +74,16 @@ class Output:
             reaches_to_write=self.basin_dict['reach_ids']
         else:
             # offline runs,  it's nice to have the integrator values for reaches we do not have swot data for
-            print('debug mode: writing out all reach ids')
+            # print('debug mode: writing out all reach ids')
             reaches_to_write=self.basin_dict['reach_ids_all']
 
 
         for reach in reaches_to_write:
              # this first block  sets everything to nan, allowing "blank" output files to be written
              if self.params_dict['write_fill_only']:
-                 print('writing fill values only')
+                 # print('writing fill values only')
                  for algo in self.alg_dict.keys():
-                     print('... setting ',algo,'to fill')
+                     # print('... setting ',algo,'to fill')
                      if 'q' in self.alg_dict[algo][reach]['integrator'].keys():
                          self.alg_dict[algo][reach]['integrator']['q'][:]=np.nan
                      self.alg_dict[algo][reach]['integrator']['qbar']=np.nan
@@ -95,11 +95,11 @@ class Output:
              not_obs = False
              # just write out the steady flow discharge values if this was an unobserved reach
              try:
-                #print(self.obs_dict[reach])
+                # print(self.obs_dict[reach])
                 tmpdata=self.obs_dict[reach]
-                print('tmpdata found')
+                # print('tmpdata found')
              except:
-                print('reach not in obs_dict... filling with default')
+                # print('reach not in obs_dict... filling with default')
                 not_obs = True
              if reach not in self.basin_dict['reach_ids']: 
                 #print(reach)
@@ -109,18 +109,18 @@ class Output:
                 #print('second condition...')
                 not_obs = True
              if not_obs:
-                print('not obs found... doing regular')
+                # print('not obs found... doing regular')
                 # NetCDF file creation
                 out_file = self.out_dir / f"{reach}_integrator.nc"
                 out = Dataset(out_file, 'w', format="NETCDF4")
                 out.production_date = datetime.now().strftime('%d-%b-%Y %H:%M:%S')
 
-                #1 neobam
-                gb = out.createGroup("neobam")
-                gb_qbar_stage2  = out.createVariable("neobam/qbar_basinScale", "f8", fill_value=fillvalue)
-                gb_qbar_stage2[:] = np.nan_to_num(self.alg_dict['neobam'][reach]['integrator']['qbar'], copy=True, nan=fillvalue)
-                gb_sbQ_rel = out.createVariable("neobam/sbQ_rel", "f8", fill_value=fillvalue)
-                gb_sbQ_rel[:] = np.nan_to_num(self.alg_dict['neobam'][reach]['integrator']['sbQ_rel'], copy=True, nan=fillvalue)
+                #1 busboi
+                gb = out.createGroup("busboi")
+                gb_qbar_stage2  = out.createVariable("busboi/qbar_basinScale", "f8", fill_value=fillvalue)
+                gb_qbar_stage2[:] = np.nan_to_num(self.alg_dict['busboi'][reach]['integrator']['qbar'], copy=True, nan=fillvalue)
+                gb_sbQ_rel = out.createVariable("busboi/sbQ_rel", "f8", fill_value=fillvalue)
+                gb_sbQ_rel[:] = np.nan_to_num(self.alg_dict['busboi'][reach]['integrator']['sbQ_rel'], copy=True, nan=fillvalue)
 
                 #2 hivdi
                 hv = out.createGroup("hivdi")
@@ -164,12 +164,12 @@ class Output:
              iInsert=iDelete-np.arange(nDelete)
              iInsert=np.reshape(iInsert,[nDelete,]) 
              self.obs_dict[reach]['nt'] += nDelete
-             #print(self.alg_dict['neobam'])
-             #print(self.alg_dict['neobam'][reach]['integrator'])
-             #print(self.alg_dict['neobam'][reach]['integrator']['q'],iInsert,fillvalue,1)
+             #print(self.alg_dict['busboi'])
+             #print(self.alg_dict['busboi'][reach]['integrator'])
+             #print(self.alg_dict['busboi'][reach]['integrator']['q'],iInsert,fillvalue,1)
 
-             self.alg_dict['neobam'][reach]['integrator']['q']=np.insert( \
-                   self.alg_dict['neobam'][reach]['integrator']['q'],iInsert,fillvalue,1)
+             self.alg_dict['busboi'][reach]['integrator']['q']=np.insert( \
+                   self.alg_dict['busboi'][reach]['integrator']['q'],iInsert,fillvalue,1)
 
              self.alg_dict['hivdi'][reach]['integrator']['q']=np.insert( \
                    self.alg_dict['hivdi'][reach]['integrator']['q'],iInsert,fillvalue,1)
@@ -197,28 +197,29 @@ class Output:
              nt.units = "time steps"
              nt[:] = range(self.obs_dict[reach]['nt'])
 
-             # neobam
-             gb = out.createGroup("neobam")
-             gbq  = out.createVariable("neobam/q", "f8", ("nt",), fill_value=fillvalue)
-             gbq[:] = np.nan_to_num(self.alg_dict['neobam'][reach]['integrator']['q'], copy=True, nan=fillvalue)
+
+             # busboi
+             gb = out.createGroup("busboi")
+             gbq  = out.createVariable("busboi/q", "f8", ("nt",), fill_value=fillvalue)
+             gbq[:] = np.nan_to_num(self.alg_dict['busboi'][reach]['integrator']['q'], copy=True, nan=fillvalue)
              
-             gb_a0  = out.createVariable("neobam/a0", "f8", fill_value=fillvalue)
-             gb_a0[:] = np.nan_to_num(self.alg_dict['neobam'][reach]['integrator']['a0'], copy=True, nan=fillvalue)
+             gb_a0  = out.createVariable("busboi/a0", "f8", fill_value=fillvalue)
+             gb_a0[:] = np.nan_to_num(self.alg_dict['busboi'][reach]['integrator']['a0'], copy=True, nan=fillvalue)
              
-             gb_n  = out.createVariable("neobam/n", "f8", fill_value=fillvalue)
-             gb_n[:] = np.nan_to_num(self.alg_dict['neobam'][reach]['integrator']['n'], copy=True, nan=fillvalue)
+             gb_n  = out.createVariable("busboi/n", "f8", fill_value=fillvalue)
+             gb_n[:] = np.nan_to_num(self.alg_dict['busboi'][reach]['integrator']['n'], copy=True, nan=fillvalue)
              
-             gb_qbar_stage1  = out.createVariable("neobam/qbar_reachScale", "f8", fill_value=fillvalue)
+             gb_qbar_stage1  = out.createVariable("busboi/qbar_reachScale", "f8", fill_value=fillvalue)
              try:
-                 gb_qbar_stage1[:] = np.nan_to_num(self.alg_dict['neobam'][reach]['qbar'], copy=True, nan=fillvalue)
+                 gb_qbar_stage1[:] = np.nan_to_num(self.alg_dict['busboi'][reach]['qbar'], copy=True, nan=fillvalue)
              except:
                  gb_qbar_stage1[:]=np.nan
              
-             gb_qbar_stage2  = out.createVariable("neobam/qbar_basinScale", "f8", fill_value=fillvalue)
-             gb_qbar_stage2[:] = np.nan_to_num(self.alg_dict['neobam'][reach]['integrator']['qbar'], copy=True, nan=fillvalue)
+             gb_qbar_stage2  = out.createVariable("busboi/qbar_basinScale", "f8", fill_value=fillvalue)
+             gb_qbar_stage2[:] = np.nan_to_num(self.alg_dict['busboi'][reach]['integrator']['qbar'], copy=True, nan=fillvalue)
 
-             gb_sbQ_rel = out.createVariable("neobam/sbQ_rel", "f8", fill_value=fillvalue)
-             gb_sbQ_rel[:] = np.nan_to_num(self.alg_dict['neobam'][reach]['integrator']['sbQ_rel'], copy=True, nan=fillvalue)
+             gb_sbQ_rel = out.createVariable("busboi/sbQ_rel", "f8", fill_value=fillvalue)
+             gb_sbQ_rel[:] = np.nan_to_num(self.alg_dict['busboi'][reach]['integrator']['sbQ_rel'], copy=True, nan=fillvalue)
 
              # hivdi
              hv = out.createGroup("hivdi")
@@ -360,7 +361,7 @@ class Output:
             #during normal operations, write this out to the sword directory
             sword_dest_file=self.sword_dir.joinpath(self.basin_dict['sword'].replace('.nc', '_moi.nc'))
         else:
-            print('for debugging purposes, write FLPs to the output directory rather than sword directory')
+            # print('for debugging purposes, write FLPs to the output directory rather than sword directory')
             sword_dest_file=self.out_dir.joinpath(self.basin_dict['sword'].replace('.nc', '_moi.nc'))
 
 
@@ -383,17 +384,17 @@ class Output:
             
             for reach in self.basin_dict['reach_ids']:
                 reach_ind = np.where(reaches == reach)
-                print(self.alg_dict['neobam'][reach]['integrator']['a0'])
+                # print(self.alg_dict['busboi'][reach]['integrator']['a0'])
                 
                 try:
     
                     #1 bam 
                     sword_dataset['reaches']['discharge_models'][branch]['BAM']['Abar'][reach_ind]= \
-                        self.alg_dict['neobam'][reach]['integrator']['a0']
+                        self.alg_dict['busboi'][reach]['integrator']['a0']
                     sword_dataset['reaches']['discharge_models'][branch]['BAM']['n'][reach_ind]= \
-                        self.alg_dict['neobam'][reach]['integrator']['n']
+                        self.alg_dict['busboi'][reach]['integrator']['n']
                     sword_dataset['reaches']['discharge_models'][branch]['BAM']['sbQ_rel'][reach_ind]= \
-                        self.alg_dict['neobam'][reach]['integrator']['sbQ_rel']
+                        self.alg_dict['busboi'][reach]['integrator']['sbQ_rel']
                     #2 hivdi
                     sword_dataset['reaches']['discharge_models'][branch]['HiVDI']['Abar'][reach_ind]=\
                         self.alg_dict['hivdi'][reach]['integrator']['Abar']
