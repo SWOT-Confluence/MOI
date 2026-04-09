@@ -46,7 +46,7 @@ class Integrate:
 
         self.patch_input_deficiencies()
 
-        # print('getting pre mean q')
+        # if self.VerboseFlag: print('getting pre mean q')
         self.get_pre_mean_q()
 
         if self.Branch == 'constrained':
@@ -111,7 +111,7 @@ class Integrate:
                  try:
                      agency = self.sos_dict[str(reach)]['gage']['source']
                      gaged_reach = True
-                 except:
+                 except Exception:
                      gaged_reach = False
 
                  if gaged_reach:
@@ -120,14 +120,14 @@ class Integrate:
                      for time_val in self.obs_dict[reach]['t']:
                          try:
                              ordinal_time = (epoch + datetime.timedelta(seconds=time_val)).toordinal()
-                         except:
+                         except Exception:
                              ordinal_time = np.nan
                              warnings.warn('problem with time conversion to ordinal')
 
                          try:
                              idx = np.argwhere(self.sos_dict[str(reach)]['gage']['t'] == ordinal_time)[0,0]
                              gagedQs.append(self.sos_dict[str(reach)]['gage']['Q'][idx])
-                         except:
+                         except Exception:
                              pass
 
                      self.sos_dict[str(reach)]['gage']['Qbar'] = np.nan
@@ -136,7 +136,7 @@ class Integrate:
                          try:
                              self.sos_dict[str(reach)]['gage']['Qbar'] = np.nanmean(gagedQs)
                              self.sos_dict[str(reach)]['gage']['q33'] = np.nanquantile(gagedQs, .33)
-                         except:
+                         except Exception:
                              pass
 
     def pull_sword_attributes_for_reach(self, k):
@@ -283,7 +283,7 @@ class Integrate:
                                     Qbar[i] = np.nan
                                 else:
                                     Qbar[i] = val
-                        except:
+                        except Exception:
                             Qbar[i] = np.nan
 
                     if facc[i] > 5000:
@@ -344,7 +344,8 @@ class Integrate:
     def integrator_optimization_calcs(self, m, n, FlowLevel, PreviousResiduals):
         residuals = {}
         for alg in self.alg_dict:
-            print(f'    RUNNING SPARSE MOI for {alg} ({FlowLevel})')
+            if self.VerboseFlag:
+                print(f'    RUNNING SPARSE MOI for {alg} ({FlowLevel})')
 
             Qbar, sigQ, FLPE_Data_OK, facc = self.initialize_integration_vars(alg, FlowLevel, PreviousResiduals, n)
             u_conversion = 1000.0 / (365.25 * 24 * 3600)
@@ -532,10 +533,10 @@ class Integrate:
         return qsic4dvar
 
     def compute_FLPs(self):         
-        print('CALCULATING BUSBOI surrogate FLPs')
+        if self.VerboseFlag: print('CALCULATING BUSBOI surrogate FLPs')
         for reach in self.alg_dict['busboi']:
             try: datagood = (self.obs_dict[reach]['nt'] > 0 and self.obs_dict[reach]['dA'].size > 0)
-            except: datagood = False
+            except Exception: datagood = False
             if reach not in self.basin_dict['reach_ids'] or not datagood: continue
             
             with warnings.catch_warnings():
@@ -561,10 +562,10 @@ class Integrate:
             self.alg_dict['busboi'][reach]['integrator']['a0'] = param_est[1]
             self.alg_dict['busboi'][reach]['integrator']['q'] = self.bam_flowlaw(param_est, self.obs_dict[reach])
 
-        print('CALCULATING HiVDI FLPs')
+        if self.VerboseFlag: print('CALCULATING HiVDI FLPs')
         for reach in self.alg_dict['hivdi']:
             try: datagood = (self.obs_dict[reach]['nt'] > 0 and self.obs_dict[reach]['dA'].size > 0)
-            except: datagood = False
+            except Exception: datagood = False
             if reach not in self.basin_dict['reach_ids'] or not datagood: continue
             
             with warnings.catch_warnings():
@@ -583,10 +584,10 @@ class Integrate:
             self.alg_dict['hivdi'][reach]['integrator']['Abar'] = res.x[2]
             self.alg_dict['hivdi'][reach]['integrator']['q'] = self.hivdi_flowlaw(res.x, self.obs_dict[reach])
 
-        print('CALCULATING MetroMan FLPs')
+        if self.VerboseFlag: print('CALCULATING MetroMan FLPs')
         for reach in self.alg_dict['metroman']:
             try: datagood = (self.obs_dict[reach]['nt'] > 0 and self.obs_dict[reach]['dA'].size > 0)
-            except: datagood = False
+            except Exception: datagood = False
             if reach not in self.basin_dict['reach_ids'] or not datagood: continue
             
             with warnings.catch_warnings():
@@ -605,10 +606,10 @@ class Integrate:
             self.alg_dict['metroman'][reach]['integrator']['a0'] = res.x[2]
             self.alg_dict['metroman'][reach]['integrator']['q'] = self.metroman_flowlaw(res.x, self.obs_dict[reach])
 
-        print('CALCULATING MOMMA FLPs')
+        if self.VerboseFlag: print('CALCULATING MOMMA FLPs')
         for reach in self.alg_dict['momma']:
             try: datagood = (self.obs_dict[reach]['nt'] > 0 and self.obs_dict[reach]['dA'].size > 0)
-            except: datagood = False
+            except Exception: datagood = False
             if reach not in self.basin_dict['reach_ids'] or not datagood: continue
             
             with warnings.catch_warnings():
@@ -626,7 +627,7 @@ class Integrate:
             q33 = self.alg_dict['momma'][reach]['integrator'].get('q33', np.nan) 
 
             try: res = optimize.minimize(fun=self.momma_objfun, x0=init_params, args=(self.obs_dict[reach], qbar, q33, aux_var), bounds=param_bounds)
-            except: res = lambda: None; res.success = False
+            except Exception: res = lambda: None; res.success = False
 
             if not res.success: param_est = (self.alg_dict['momma'][reach].get('B', np.nan), self.alg_dict['momma'][reach].get('H', np.nan))
             else: param_est = res.x
@@ -636,10 +637,10 @@ class Integrate:
             self.alg_dict['momma'][reach]['integrator']['Save'] = aux_var
             self.alg_dict['momma'][reach]['integrator']['q'] = self.momma_flowlaw(param_est, self.obs_dict[reach], aux_var)
 
-        print('CALCULATING SAD FLPs')
+        if self.VerboseFlag: print('CALCULATING SAD FLPs')
         for reach in self.alg_dict['sad']:
             try: datagood = (self.obs_dict[reach]['nt'] > 0 and self.obs_dict[reach]['dA'].size > 0)
-            except: datagood = False
+            except Exception: datagood = False
             if reach not in self.basin_dict['reach_ids'] or not datagood: continue
             
             with warnings.catch_warnings():
@@ -657,10 +658,10 @@ class Integrate:
             self.alg_dict['sad'][reach]['integrator']['a0'] = res.x[1]
             self.alg_dict['sad'][reach]['integrator']['q'] = self.sad_flowlaw(res.x, self.obs_dict[reach])
 
-        print('CALCULATING SIC4DVar FLPs')
+        if self.VerboseFlag: print('CALCULATING SIC4DVar FLPs')
         for reach in self.alg_dict['sic4dvar']:
             try: datagood = (self.obs_dict[reach]['nt'] > 0 and self.obs_dict[reach]['dA'].size > 0)
-            except: datagood = False
+            except Exception: datagood = False
             if reach not in self.basin_dict['reach_ids'] or not datagood: continue
             
             with warnings.catch_warnings():
@@ -677,7 +678,7 @@ class Integrate:
             self.alg_dict['sic4dvar'][reach]['integrator']['a0'] = res.x[1]
             self.alg_dict['sic4dvar'][reach]['integrator']['q'] = self.sic4dvar_flowlaw(res.x, self.obs_dict[reach])
     
-        # print('Enforcing strict array shapes for Output.py compatibility...')
+        # if self.VerboseFlag: print('Enforcing strict array shapes for Output.py compatibility...')
         for alg in self.alg_dict:
             for reach in self.basin_dict['reach_ids_all']:
                 if reach in self.obs_dict and 'integrator' in self.alg_dict[alg].get(reach, {}):
@@ -711,7 +712,7 @@ class Integrate:
                 try:
                     k = np.argwhere(self.sword_dict['reach_id'] == int(d))[0, 0]
                     w = self.sword_dict['width'][k]
-                except: w = 1.0
+                except Exception: w = 1.0
                 widths.append(w)
             total_w = sum(widths)
             
@@ -730,7 +731,9 @@ class Integrate:
             reach_regions.append(unique_regions.index(sub_basin_id))
             
         K = len(unique_regions)
-        print(f"      [Topology] Divided 7426 basin into {K} heterogeneous runoff regions.")
+        if self.VerboseFlag:
+            current_basin = str(self.basin_dict['reach_ids_all'][0])[:4] if self.basin_dict['reach_ids_all'] else "the"
+            print(f"      [Topology] Divided {current_basin} basin into {K} heterogeneous runoff regions.")
 
         runoff_prior_vals = np.full(K, 10.0)
         for k in range(K):
@@ -765,9 +768,9 @@ class Integrate:
                             try:
                                 k_up = np.argwhere(self.sword_dict['reach_id'] == up_r_id)[0, 0]
                                 facc_up_sum += self.sword_dict['facc'][k_up]
-                            except: pass
+                            except Exception: pass
                 delta_A = max(0, facc_current - facc_up_sum)
-            except:
+            except Exception:
                 delta_A = 0.0
 
             region_idx = reach_regions[i]
@@ -835,7 +838,7 @@ class Integrate:
                 try:
                     k = np.argwhere(self.sword_dict['reach_id'] == int(d))[0, 0]
                     w = float(self.sword_dict['width'][k])
-                except:
+                except Exception:
                     w = 1.0
                 widths.append(w)
     
@@ -883,7 +886,7 @@ class Integrate:
                             try:
                                 k_up = np.argwhere(self.sword_dict['reach_id'] == up_r_id)[0, 0]
                                 facc_up_sum += float(self.sword_dict['facc'][k_up])
-                            except:
+                            except Exception:
                                 pass
     
                 delta_A[i] = max(0.0, facc_current - facc_up_sum)
@@ -899,7 +902,7 @@ class Integrate:
                             break
                 outlet_mask[i] = not downstream_in_basin
     
-            except:
+            except Exception:
                 delta_A[i] = 0.0
                 outlet_mask[i] = False
     
@@ -951,7 +954,7 @@ class Integrate:
 
     def integrate(self):
           """Integrate reach-level FLPE data. (Main Runner)"""
-          # print('creating junction list')
+          # if self.VerboseFlag: print('creating junction list')
           self.CreateJunctionList()       
 
           FlowLevels = ['Mean', 'q33'] 
@@ -966,16 +969,19 @@ class Integrate:
               print(f'Number of junctions = {m}, Number of reaches = {n}')
 
           for FlowLevel in FlowLevels:
-              print(f'\nRunning flow level {FlowLevel}')
+              if self.VerboseFlag:
+                  print(f'\nRunning flow level {FlowLevel}')
               residuals = {} 
               for alg in self.alg_dict: residuals[alg] = np.full((n,), np.nan)
               
               for i in range(self.params_dict['niter']):
-                  print(f'  Running iteration {i+1} / {self.params_dict["niter"]}')
+                  if self.VerboseFlag:
+                      print(f'  Running iteration {i+1} / {self.params_dict["niter"]}')
                   residuals = self.integrator_optimization_calcs(m, n, FlowLevel, residuals)
 
           if self.params_dict.get('quit_before_flpe', False):
               sys.exit('done with integration... exiting')
 
-          print('Computing all FLPs (Final Parameter Estimation)')
+          if self.VerboseFlag:
+              print('Computing all FLPs (Final Parameter Estimation)')
           self.compute_FLPs()
