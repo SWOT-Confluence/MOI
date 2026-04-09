@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import sys
 # Critical: Ensure the custom Integrate.py with the mass probe is loaded first
-sys.path.insert(0, "/fs/ess/PAS1926/integrator_dev/Yushan/mnt/MOI_test")
+
 
 import argparse
 import json
@@ -83,13 +83,13 @@ def main():
             sys.exit("Error: No index found. Please use -i or SLURM_ARRAY_TASK_ID.")
 
     # Path Configuration
-    BASE_DIR = Path("/fs/ess/PAS1926/integrator_dev/Yushan/mnt/")
+    BASE_DIR = Path(__file__).resolve().parent
     INPUT_DIR = BASE_DIR / "input"
     FLPE_DIR = BASE_DIR / "flpe"
     TMP_DIR = BASE_DIR / "tmp"
     BASIN_JSON = INPUT_DIR / args.basinjson
 
-    SWORD_DIR = INPUT_DIR / "sword_17c" 
+    SWORD_DIR = INPUT_DIR / "sword" 
     
     # Output Directories
     OUTPUT_NC_DIR = Path("/fs/scratch/PAS1926/output_sfoi")
