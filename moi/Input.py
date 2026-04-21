@@ -4,6 +4,7 @@ from pathlib import Path
 import warnings
 import os
 import sys
+import geopandas as gpd
 
 # Third-party imports
 from netCDF4 import Dataset,chartostring
@@ -51,7 +52,7 @@ class Input:
         """
 
         self.alg_dict = {
-            "neobam": {},
+            "busboi": {},
             "hivdi": {},
             "metroman": {},
             "momma": {},
@@ -98,23 +99,45 @@ class Input:
 
         n_not_found=0
         for reach in self.basin_dict['reach_ids_all']:
+            self.sos_dict[reach] = {
+                'Qbar': np.nan,
+                'q33': np.nan,
+                'cal_status': -1,
+                'overwritten_indices': np.nan,
+                'overwritten_source': ''
+            }
             try:
-                # initialize reach dictionary
-                self.sos_dict[reach]={}
                 # find index in the sos data array
                 k=np.argwhere(sosreachids==np.int64(reach))
+                
+                if len(k) == 0:
+                    print(f'Reach {reach} not found in SOS. Filled with NaN.')
+                    n_not_found += 1
+                    continue
+                    
                 k=k[0,0]
                 # assign key data elements
                 self.sos_dict[reach]['Qbar']=sosQbars[k]
                 self.sos_dict[reach]['q33']=sosfdc[k,13] #probability = .66
-                self.sos_dict[reach]['cal_status']=-1 
 
                 # assign data elements for constrained data
                 if self.branch == 'constrained':
                     self.sos_dict[reach]['overwritten_indices']=overwritten_indices[k]
-                    source_str=str(chartostring(overwritten_source[k,:]))
-                    self.sos_dict[reach]['overwritten_source']=source_str.strip('x')
-
+                    raw_chars = overwritten_source[k, :]
+                    if hasattr(raw_chars, 'compressed'):
+                        raw_chars = raw_chars.compressed()  
+                    
+                    clean_chars = []
+                    for c in raw_chars:
+                        if hasattr(c, 'decode'):
+                            clean_chars.append(c.decode('utf-8', errors='ignore'))
+                        else:
+                            clean_chars.append(str(c))
+                            
+                    source_str = "".join(clean_chars)
+                    source_str = source_str.replace("'", "").replace("[", "").replace("]", "").replace(" ", "")
+                    self.sos_dict[reach]['overwritten_source'] = source_str.strip('x').strip()
+                    # ------------------------------------------------------------------
 
                     #copy the gage data to this dictionary if it's a constrained reach
                     if (self.sos_dict[reach]['overwritten_indices']==1 and 
@@ -129,25 +152,11 @@ class Input:
                          igage=np.nan
                          for i in range(num_reaches):
                              gage_reach=str(sos_dataset[agency][agency + '_reach_id'][i])
-                             
                              if gage_reach==reach:
                                  igage=i
 
                          if not np.isnan(igage):
-                             #cal_status:
-                             #  ungaged: -1
-                             #  validation: 0
-                             #  calibration: 1
-                             #  historical: 2
                              self.sos_dict[reach]['cal_status']=sos_dataset[agency]['CAL'][igage]
-
-                         """
-                         if reach=='73120000131':
-                             print('Input - got to reach 73120000131')
-                             print(self.sos_dict[reach]['overwritten_source'])
-                             print('cal_status=',cal_status)
-                             sys.exit('stopping at dev point')
-                         """
 
                          if not np.isnan(igage) and self.sos_dict[reach]['cal_status']==1:
                              self.sos_dict[reach]['gage']={}
@@ -157,110 +166,147 @@ class Input:
 
                              self.sos_dict[reach]['gage']['t']=sos_dataset[agency][agency+'_qt'][igage,:]
                              self.sos_dict[reach]['gage']['Q']=sos_dataset[agency][agency+'_q'][igage,:]
-                             #print('for reach',reach,'c/v=',sos_dataset[agency]['CAL'][igage])
-                             #sys.exit('stopping at dev point')
-                         
-                else:
-                    self.sos_dict[reach]['overwritten_indices']=np.nan
+                             
             except Exception as e:
-                #print(e)
-                print(f'reach data not found for {reach}')
+                print(f'Error processing reach {reach}: {str(e)}')
                 n_not_found+=1
-
 
         sos_dataset.close()
 
-        #print('A total of ',n_not_found,' data not found')
-
 
     def extract_sword(self):
-        """Extracts and stores SWORD data in sword_dict.
-        
-        Parameters
-        ----------
-        """
-        swordfile=self.sword_dir.joinpath(self.sword_dir, self.basin_dict['sword'])
-        sword_dataset=Dataset(swordfile)
+        """Extracts and stores SWORD data in sword_dict. (v15/v16/v17 Compatible)"""
+        swordfile = self.sword_dir / self.basin_dict['sword']
+        sword_dataset = Dataset(swordfile)
 
-        self.sword_dict={} #organized by field rather than by reaches
+        self.sword_dict = {}
 
-        # grab sizes of the data
-        dimfields=['orbits','num_domains','num_reaches']
+        dimfields = ['num_domains', 'num_reaches']
         for field in dimfields:
-            self.sword_dict[field]=sword_dataset['reaches'].dimensions[field].size    
+            self.sword_dict[field] = sword_dataset['reaches'].dimensions[field].size    
 
-        # grab data    
-        reachfields=['reach_id','facc','n_rch_up','n_rch_down','rch_id_up','rch_id_dn','swot_obs','swot_orbits']
+        if 'num_orbits' in sword_dataset['reaches'].dimensions:
+            self.sword_dict['orbits'] = sword_dataset['reaches'].dimensions['num_orbits'].size
+        elif 'orbits' in sword_dataset['reaches'].dimensions:
+            self.sword_dict['orbits'] = sword_dataset['reaches'].dimensions['orbits'].size
+        else:
+            self.sword_dict['orbits'] = 1
+
+        reachfields = ['reach_id', 'facc', 'n_rch_up', 'n_rch_down', 'rch_id_up', 'rch_id_dn', 'swot_obs']
         for field in reachfields:
-            self.sword_dict[field]=sword_dataset['reaches/' + field][:]
- 
-        sword_dataset.close()
+            self.sword_dict[field] = sword_dataset['reaches/' + field][:]
 
+        try:
+            self.sword_dict['swot_orbits'] = sword_dataset['reaches/swot_orbits'][:]
+        except Exception:
+            self.sword_dict['swot_orbits'] = np.zeros((1, self.sword_dict['num_reaches']))
+
+        try:
+            self.sword_dict['width'] = sword_dataset['reaches/width'][:]
+        except Exception:
+            self.sword_dict['width'] = np.zeros(self.sword_dict['num_reaches'])
+
+        sword_dataset.close()
+        
+    
+    def extract_sword_gpkg(self):
+        swordfile = self.sword_dir.joinpath(self.basin_dict['sword']) 
+
+        try:
+            gdf = gpd.read_file(swordfile)
+        except Exception as e:
+            raise RuntimeError(f"Failed to read SWORD gpkg file: {swordfile}. Error: {e}")
+
+        self.sword_dict = {}
+
+        self.sword_dict['num_reaches'] = len(gdf)
+
+        self.sword_dict['reach_id'] = gdf['reach_id'].values
+        self.sword_dict['facc'] = gdf['facc'].values
+        self.sword_dict['n_rch_up'] = gdf['n_rch_up'].values
+        self.sword_dict['n_rch_down'] = gdf['n_rch_down'].values
+        self.sword_dict['swot_obs'] = gdf['swot_obs'].values
+
+        self.sword_dict['width'] = gdf['width'].fillna(0).values 
+
+        rch_id_up = np.zeros((4, len(gdf)), dtype=np.int64)
+        rch_id_dn = np.zeros((4, len(gdf)), dtype=np.int64)
+
+        for i in range(1, 5):
+            up_col = f'rch_id_up_{i}'
+            dn_col = f'rch_id_dn_{i}'
+
+            if up_col in gdf.columns:
+                rch_id_up[i-1, :] = gdf[up_col].fillna(0).astype(np.int64).values
+            if dn_col in gdf.columns:
+                rch_id_dn[i-1, :] = gdf[dn_col].fillna(0).astype(np.int64).values
+
+        self.sword_dict['rch_id_up'] = rch_id_up
+        self.sword_dict['rch_id_dn'] = rch_id_dn
+
+        self.sword_dict['swot_orbits'] = np.zeros((1, len(gdf)))
+        
+        
     def extract_swot(self):
- 
-        self.obs_dict={}
+        self.obs_dict = {}
 
         for reach in self.basin_dict['reach_ids']:
-             reach = str(reach)
-             swotfile=self.swot_dir.joinpath(reach+'_SWOT.nc')
-             try:
+            reach = str(reach)
+            swotfile = self.swot_dir.joinpath(reach + '_SWOT.nc')
+            
+            # --- NEW DIAGNOSTIC BLOCK ---
+            try:
                 swot_dataset = Dataset(swotfile)
-                # if self.VerboseFlag:
-                #    print(f'swot file found for {reach}')
-             except:
-                if self.VerboseFlag:
-                    print(f'swot file not found for {reach}')
+            except Exception as e:
+                # Force print to log so you can see the REAL error
+                print(f"FAILED to open {swotfile}. Reason: {e}")
                 continue
+            # -----------------------------
 
-             self.obs_dict[reach]={}
-             nt = swot_dataset.dimensions['nt'].size
-             self.obs_dict[reach]['nt']=nt
-             self.obs_dict[reach]['h']=swot_dataset["reach/wse"][0:nt].filled(np.nan)
-             self.obs_dict[reach]['w']=swot_dataset["reach/width"][0:nt].filled(np.nan)
-             self.obs_dict[reach]['S']=swot_dataset["reach/slope2"][0:nt].filled(np.nan)
-             self.obs_dict[reach]['dA']=swot_dataset["reach/d_x_area"][0:nt].filled(np.nan)
-             self.obs_dict[reach]['t']=swot_dataset["reach/time"][0:nt].filled(np.nan)
+            self.obs_dict[reach] = {}
+            nt = swot_dataset.dimensions['nt'].size
+            self.obs_dict[reach]['nt'] = nt
+            self.obs_dict[reach]['h'] = swot_dataset["reach/wse"][0:nt].filled(np.nan)
+            self.obs_dict[reach]['w'] = swot_dataset["reach/width"][0:nt].filled(np.nan)
+            self.obs_dict[reach]['S'] = swot_dataset["reach/slope2"][0:nt].filled(np.nan)
+            self.obs_dict[reach]['dA'] = swot_dataset["reach/d_x_area"][0:nt].filled(np.nan)
+            self.obs_dict[reach]['t'] = swot_dataset["reach/time"][0:nt].filled(np.nan)
 
+            self.obs_dict[reach]['reach_q'] = swot_dataset["reach/reach_q"][0:nt].filled(np.nan)
+            self.obs_dict[reach]['xovr_cal_q'] = swot_dataset["reach/xovr_cal_q"][0:nt].filled(np.nan)
 
-             self.obs_dict[reach]['reach_q']=swot_dataset["reach/reach_q"][0:nt].filled(np.nan)
-             self.obs_dict[reach]['xovr_cal_q']=swot_dataset["reach/xovr_cal_q"][0:nt].filled(np.nan)
+            swot_dataset.close()
 
-             #print(self.obs_dict[reach]['xovr_cal_q']>0)
-             #print(self.obs_dict[reach]['reach_q']>0)
-             #print(np.isnan(self.obs_dict[reach]['dA']))
+            # select observations that are NOT equal to the fill value
+            iDelete = np.where(np.isnan(self.obs_dict[reach]['h']) | \
+                               np.isnan(self.obs_dict[reach]['w']) | \
+                               np.isnan(self.obs_dict[reach]['S']) | \
+                               np.isnan(self.obs_dict[reach]['dA'])| \
+                               (self.obs_dict[reach]['reach_q'] > 1) | \
+                               (self.obs_dict[reach]['xovr_cal_q'] > 1)[0] )
 
-             swot_dataset.close()
+            self.obs_dict[reach]['h'] = np.delete(self.obs_dict[reach]['h'], iDelete, 0)
+            self.obs_dict[reach]['w'] = np.delete(self.obs_dict[reach]['w'], iDelete, 0)
+            self.obs_dict[reach]['S'] = np.delete(self.obs_dict[reach]['S'], iDelete, 0)
+            self.obs_dict[reach]['dA'] = np.delete(self.obs_dict[reach]['dA'], iDelete, 0)
+            self.obs_dict[reach]['t'] = np.delete(self.obs_dict[reach]['t'], iDelete, 0)
 
-             #select observations that are NOT equal to the fill value
-             iDelete=np.where(np.isnan(self.obs_dict[reach]['h']) | \
-                              np.isnan(self.obs_dict[reach]['w']) | \
-                              np.isnan(self.obs_dict[reach]['S']) | \
-                              np.isnan(self.obs_dict[reach]['dA'])| \
-                              (self.obs_dict[reach]['reach_q'] > 1) | \
-                              (self.obs_dict[reach]['xovr_cal_q'] > 1) )
+            self.obs_dict[reach]['iDelete'] = iDelete
 
-             self.obs_dict[reach]['h']=np.delete(self.obs_dict[reach]['h'],iDelete,0)
-             self.obs_dict[reach]['w']=np.delete(self.obs_dict[reach]['w'],iDelete,0)
-             self.obs_dict[reach]['S']=np.delete(self.obs_dict[reach]['S'],iDelete,0)
-             self.obs_dict[reach]['dA']=np.delete(self.obs_dict[reach]['dA'],iDelete,0)
-             self.obs_dict[reach]['t']=np.delete(self.obs_dict[reach]['t'],iDelete,0)
+            Smin = 1.7e-5
+            self.obs_dict[reach]['S'][self.obs_dict[reach]['S'] < Smin] = \
+                np.putmask(self.obs_dict[reach]['S'], self.obs_dict[reach]['S'] < Smin, Smin)
 
-
-             self.obs_dict[reach]['iDelete']=iDelete
-
-             Smin=1.7e-5
-             self.obs_dict[reach]['S'][self.obs_dict[reach]['S']<Smin]=\
-                np.putmask(self.obs_dict[reach]['S'],self.obs_dict[reach]['S']<Smin,Smin)
-
-             #Obs.S[Obs.S<Smin]=putmask(Obs.S,Obs.S<Smin,Smin) #limit slopes to a minimum value
-
-             #sys.exit('stopping at dev point')
-
-             shape_iDelete=np.shape(iDelete)
-             nDelete=shape_iDelete[1]
-             self.obs_dict[reach]['nt'] -= nDelete
+            shape_iDelete = np.shape(iDelete)
+            nDelete = shape_iDelete[1]
+            self.obs_dict[reach]['nt'] -= nDelete
+            
+        # RESTORED CHECK: Triggers if ALL files failed to open or process
         if self.obs_dict == {}:
             raise LookupError('No reaches in basin processed')
+
+
+
 
     def extract_alg(self):
         """Extracts and stores reach-level FLPE algorithm data in alg_dict."""
@@ -272,7 +318,7 @@ class Input:
         for r_id in reach_ids_all:
             if r_id in reach_ids:
                 # for observed reaches in the domain
-                gb_file = self.alg_dir / "geobam" / f"{r_id}_geobam.nc"
+                bb_file = self.alg_dir / "busboi" / f"{r_id}_busboi.nc"
                 hv_file = self.alg_dir / "hivdi" / f"{r_id}_hivdi.nc"
                 mo_file = self.alg_dir / "momma" / f"{r_id}_momma.nc"
                 sd_file = self.alg_dir / "sad" / f"{r_id}_sad.nc"
@@ -285,25 +331,25 @@ class Input:
                 else: 
                     mm_file = Path(mm_file) 
 
-                self.__extract_valid(r_id, gb_file, hv_file, mo_file, sd_file, mm_file, sv_file)
+                self.__extract_valid(r_id, bb_file, hv_file, mo_file, sd_file, mm_file, sv_file)
 
             else:
                 #for unobserved reaches
-                algs=['neobam','hivdi','metroman','momma','sad','sic4dvar']
+                algs=['busboi','hivdi','metroman','momma','sad','sic4dvar']
                 for alg in algs:
                     self.alg_dict[alg][r_id] = {
                         "s1-flpe-exists": False,
                         "qbar": np.nan
                         }
 
-    def __extract_valid(self, r_id, gb_file, hv_file, mo_file, sd_file, mm_file, sv_file):
+    def __extract_valid(self, r_id, bb_file, hv_file, mo_file, sd_file, mm_file, sv_file):
         """ Extract valid data from the output of each reach-level FLPE alg.
         Parameters
         ----------
         r_id: str
             Unique reach identifier
-        gb_file: Path
-            Path to neoBAM results file
+        bb_file: Path
+            Path to BUSBOI results file
         hv_file: Path
             Path to HiVDI results file
         mo_file: Path
@@ -316,22 +362,58 @@ class Input:
             Path to SIC4DVar results file
         """
 
-        # neobam
-        if gb_file.exists():
-            #print('reading',gb_file)
-            gb = Dataset(gb_file, 'r', format="NETCDF4")
-            self.alg_dict["neobam"][r_id] = {
+        # busboi
+        if bb_file.exists():
+            bb = Dataset(bb_file, 'r', format="NETCDF4")
+            try:
+                q = np.array(bb["q"]["q"][:].filled(np.nan))
+            except Exception:
+                q = np.nan
+
+            try:
+                r = np.array(bb["r"]["mean"][:].filled(np.nan))
+            except Exception:
+                try:
+                    r = np.array(bb["r"]["mean"].getValue())
+                except Exception:
+                    r = np.nan
+
+            try:
+                bed = np.array(bb["bed"]["elevation"][:].filled(np.nan))
+            except Exception:
+                bed = np.nan
+
+            try:
+                chainage = np.array(bb["bed"]["chainage"][:].filled(np.nan))
+            except Exception:
+                chainage = np.nan
+
+            try:
+                prior_q = np.array(bb["prior_q"]["q"][:].filled(np.nan))
+            except Exception:
+                prior_q = np.nan
+
+            self.alg_dict["busboi"][r_id] = {
                 "s1-flpe-exists": True,
-                "q": np.array(self.__get_gb_data(gb,"q", "q", False)),
-                "n": np.array(self.__get_gb_data(gb,"logn", "mean", True)),
-                "a0": 1.0    # TODO temp value until work out neoBAM A0
+                "q": q,
+                "r": r,
+                "bed": bed,
+                "chainage": chainage,
+                "prior_q": prior_q,
+                # placeholders for MOI surrogate BAM-compatible refit
+                "n": np.nan,
+                "a0": np.nan
             }
-            gb.close()
+            bb.close()
 
         else:
-            self.alg_dict["neobam"][r_id] = { 
+            self.alg_dict["busboi"][r_id] = { 
                 "s1-flpe-exists" : False ,
                 "q" : np.nan,
+                "r" : np.nan,
+                "bed" : np.nan,
+                "chainage" : np.nan,
+                "prior_q" : np.nan,
                 "n" : np.nan,
                 "a0" : np.nan,
                 "qbar" : self.sos_dict[str(r_id)]['Qbar'],
@@ -461,8 +543,12 @@ class Input:
             Unique reach identifier
         """
 
-        self.alg_dict["neobam"][r_id] = {
+        self.alg_dict["busboi"][r_id] = {
             "q": np.nan,
+            "r": np.nan,
+            "bed": np.nan,
+            "chainage": np.nan,
+            "prior_q": np.nan,
             "n": np.nan,
             "a0": np.nan
         }
@@ -507,7 +593,7 @@ class Input:
         }
 
     def __get_gb_data(self, gb,group, pre, logged):
-        """Return neoBAM data as a numpy array.
+        """Return legacy neoBAM data as a numpy array.
         
         Parameters
         ----------
