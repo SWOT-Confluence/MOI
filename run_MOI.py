@@ -171,7 +171,7 @@ def set_moi_params():
         'method':'linear',        #default: 'linear'
         'quit_before_flpe':False, #default: False
         'apply_patches': False, #default: False
-        'write_fill_only': True #default: False
+        'write_fill_only': False #default: False
     }
 
     return moi_params
