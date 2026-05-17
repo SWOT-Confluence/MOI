@@ -60,7 +60,7 @@ def set_moi_params():
         'method': 'linear',
         'quit_before_flpe': False,
         'apply_patches': False,
-        'write_fill_only': True,
+        'write_fill_only': False,
     }
 
 
