@@ -3,3 +3,5 @@ __pycache__
 tests/__pycache__
 moi/.DS_Store
 .terraform
+# macOS metadata
+.DS_Store

@@ -47,6 +47,46 @@ class Output:
         self.obs_dict = obs_dict
         self.sword_dir = sword_dir
         self.params_dict = params_dict
+
+    def _write_bias_correlation_diagnostics(self, out):
+        """Persist basin-scale augmentation diagnostics in each reach file."""
+        all_diagnostics = self.stage_estimate.get('bias_correction', {})
+        if not all_diagnostics:
+            return
+
+        root = out.createGroup('moi_bias_correlation')
+        for algorithm, flow_diagnostics in all_diagnostics.items():
+            algorithm_group = root.createGroup(str(algorithm))
+            for flow_level, diagnostic in flow_diagnostics.items():
+                prefix = str(flow_level).lower()
+                values = {
+                    f'{prefix}_bias_fraction': diagnostic.get(
+                        'estimated_bias_fraction', np.nan
+                    ),
+                    f'{prefix}_bias_std_fraction': diagnostic.get(
+                        'bias_std_fraction', np.nan
+                    ),
+                    f'{prefix}_correlation_rho': diagnostic.get(
+                        'correlation_rho', np.nan
+                    ),
+                }
+                for variable_name, value in values.items():
+                    variable = algorithm_group.createVariable(variable_name, 'f8')
+                    variable.assignValue(float(value))
+
+                algorithm_group.setncattr(
+                    f'{prefix}_bias_enabled',
+                    int(bool(diagnostic.get('enabled', False))),
+                )
+                algorithm_group.setncattr(
+                    f'{prefix}_solver_status',
+                    str(diagnostic.get('status', 'unknown')),
+                )
+                effects = diagnostic.get('correlation_effects', [])
+                algorithm_group.setncattr(
+                    f'{prefix}_correlation_effects',
+                    ','.join(f'{float(value):.12g}' for value in effects),
+                )
         
     def write_output(self):
         """Write data stored to NetCDF files for each reach"""
@@ -81,6 +121,7 @@ class Output:
                 out_file = self.out_dir / f"{reach}_integrator.nc"
                 out = Dataset(out_file, 'w', format="NETCDF4")
                 out.production_date = datetime.now().strftime('%d-%b-%Y %H:%M:%S')
+                self._write_bias_correlation_diagnostics(out)
 
                 # 1 busboi
                 gb = out.createGroup("busboi")
@@ -142,6 +183,7 @@ class Output:
              out_file = self.out_dir / f"{reach}_integrator.nc"
              out = Dataset(out_file, 'w', format="NETCDF4")
              out.production_date = datetime.now().strftime('%d-%b-%Y %H:%M:%S')
+             self._write_bias_correlation_diagnostics(out)
 
              out.createDimension("nt", self.obs_dict[reach]['nt'])
              nt = out.createVariable("nt", "i4", ("nt",))

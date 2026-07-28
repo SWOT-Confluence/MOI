@@ -53,7 +53,27 @@ def set_moi_params():
     return {
         'FLPE_Uncertainty': 0.67,
         'Gage_Uncertainty': 0.10,
+        'Gage_Min_Matched_Samples': 1,
+        'Gage_Match_SWOT_Days': True,
+        'Gage_Allow_Full_Record_Fallback': False,
         'Fill_Uncertainty': 1.0,
+        # Bias-aware sparse SFOI. Bias is estimated independently for each
+        # algorithm and applies only to FLPE discharge rows, never runoff,
+        # mass-balance, or gage rows.
+        'SFOI_Bias_Augmentation': True,
+        'SFOI_Bias_Flow_Levels': ('Mean',),
+        'SFOI_Bias_Prior_Std': 0.50,
+        'SFOI_Bias_Initial': 0.0,
+        'SFOI_Bias_Min': -0.80,
+        'SFOI_Bias_Max': 2.0,
+        # Within-runoff-region random correlation represented with sparse
+        # latent effects. Keep rho modest until calibrated against real errors.
+        'SFOI_Correlation_Enabled': True,
+        'SFOI_Correlation_Rho': 0.20,
+        'SFOI_Correlation_Effect_Bound': 8.0,
+        'SFOI_Augmented_Maxiter': 30,
+        'SFOI_Augmented_Change_Thresh': 1.0e-5,
+        'SFOI_Augmented_Robust_Damping': 0.50,
         'norm': 0.5,
         'rho': 0.7,
         'niter': 1,
@@ -89,6 +109,63 @@ def main():
     parser.add_argument('-i', '--index', type=int, default=None, help='Index of basin in JSON')
     parser.add_argument('-j', '--basinjson', type=str, default='basin.json', help='Name of the basin.json')
     parser.add_argument('-v', '--verbose', action='store_true', help='Verbose logging')
+    parser.add_argument(
+        '--svs-file',
+        type=Path,
+        default=None,
+        help='SVS NetCDF file used for independent Mean and q33 gage constraints.',
+    )
+    parser.add_argument(
+        '--svs-reach-id-col',
+        default='reach_id_v17b',
+        help='SVS reach-ID variable; compatible v17 alternatives are auto-detected.',
+    )
+    parser.add_argument(
+        '--gage-calval-csv',
+        type=Path,
+        default=None,
+        help=(
+            'CSV assigning reach IDs to calibration/validation groups. '
+            'Defaults to CalValSeparation.csv beside the selected SVS file.'
+        ),
+    )
+    parser.add_argument(
+        '--gage-include-json',
+        type=Path,
+        default=None,
+        help='Optional JSON list/dict limiting which reach IDs become gage constraints.',
+    )
+    parser.add_argument(
+        '--gage-exclude-json',
+        type=Path,
+        default=None,
+        help='Optional JSON list/dict of reach IDs reserved from gage constraints.',
+    )
+    parser.add_argument(
+        '--correlation-rho',
+        type=float,
+        default=None,
+        help=(
+            'Within-runoff-region FLPE error correlation in [0, 1). '
+            'Defaults to the configured value (0.20).'
+        ),
+    )
+    parser.add_argument(
+        '--bias-prior-std',
+        type=float,
+        default=None,
+        help='Weak prior standard deviation for the multiplicative FLPE bias.',
+    )
+    parser.add_argument(
+        '--disable-correlation',
+        action='store_true',
+        help='Disable region-correlated FLPE errors and retain bias augmentation.',
+    )
+    parser.add_argument(
+        '--disable-bias-augmentation',
+        action='store_true',
+        help='Disable the systematic FLPE bias state.',
+    )
     parser.add_argument(
         '-b',
         '--branch',
@@ -126,6 +203,18 @@ def main():
             log.write(f"Starting SFOI Pipeline Index {index_to_run}, Basin {basin_id}\n")
 
             params_dict = set_moi_params()
+            if args.correlation_rho is not None:
+                if not 0.0 <= args.correlation_rho < 1.0:
+                    raise ValueError('--correlation-rho must satisfy 0 <= rho < 1')
+                params_dict['SFOI_Correlation_Rho'] = args.correlation_rho
+            if args.bias_prior_std is not None:
+                if args.bias_prior_std <= 0:
+                    raise ValueError('--bias-prior-std must be positive')
+                params_dict['SFOI_Bias_Prior_Std'] = args.bias_prior_std
+            if args.disable_correlation:
+                params_dict['SFOI_Correlation_Enabled'] = False
+            if args.disable_bias_augmentation:
+                params_dict['SFOI_Bias_Augmentation'] = False
 
             # ---------------------------------------------------------
             # 1. INPUT EXTRACTION
@@ -142,11 +231,49 @@ def main():
             )
             input_obj.extract_sword()
             input_obj = get_all_sword_reach_in_basin(input_obj, False)
+            svs_loaded = False
 
             try:
                 input_obj.extract_swot()
                 input_obj.extract_sos()
                 input_obj.extract_alg()
+
+                if args.branch == 'constrained':
+                    svs_file = args.svs_file
+                    if svs_file is None:
+                        svs_candidates = sorted((input_dir / 'svs').glob('*SVS*.nc'))
+                        if len(svs_candidates) == 1:
+                            svs_file = svs_candidates[0]
+                        elif len(svs_candidates) > 1:
+                            raise RuntimeError(
+                                'Multiple SVS files found; select one with --svs-file: '
+                                + ', '.join(str(path) for path in svs_candidates)
+                            )
+
+                    if svs_file is not None:
+                        calval_file = args.gage_calval_csv
+                        if calval_file is None:
+                            calval_file = svs_file.parent / 'CalValSeparation.csv'
+                        if not calval_file.is_file():
+                            raise FileNotFoundError(
+                                'Calibration/validation CSV not found. Expected '
+                                f'{calval_file}; select another file with '
+                                '--gage-calval-csv.'
+                            )
+
+                        input_obj.extract_svs(
+                            svs_file,
+                            reach_id_col=args.svs_reach_id_col,
+                            include_reach_ids=args.gage_include_json,
+                            exclude_reach_ids=args.gage_exclude_json,
+                            calval_file=calval_file,
+                        )
+                        svs_loaded = True
+                    else:
+                        warnings.warn(
+                            'No SVS file found for constrained MOI; falling back to '
+                            'eligible gages embedded in the SoS file.'
+                        )
             except Exception as e:
                 log.write(f"Data Missing: {str(e)}. Skipping basin.\n")
                 print(f"[{basin_id}] SKIP: Essential data missing ({str(e)})")
@@ -166,6 +293,9 @@ def main():
                 params_dict,
                 args.branch,
                 args.verbose,
+                # An explicit (even empty) SVS selection must not be refilled
+                # from SoS, because that could reintroduce validation gages.
+                gage_dict=getattr(input_obj, 'gage_dict', {}) if svs_loaded else None,
             )
 
             try:
