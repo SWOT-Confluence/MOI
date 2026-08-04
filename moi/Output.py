@@ -69,6 +69,12 @@ class Output:
                     f'{prefix}_correlation_rho': diagnostic.get(
                         'correlation_rho', np.nan
                     ),
+                    f'{prefix}_state_damping': diagnostic.get(
+                        'state_damping', np.nan
+                    ),
+                    f'{prefix}_last_delta': diagnostic.get(
+                        'last_delta', np.nan
+                    ),
                 }
                 for variable_name, value in values.items():
                     variable = algorithm_group.createVariable(variable_name, 'f8')
@@ -81,6 +87,14 @@ class Output:
                 algorithm_group.setncattr(
                     f'{prefix}_solver_status',
                     str(diagnostic.get('status', 'unknown')),
+                )
+                algorithm_group.setncattr(
+                    f'{prefix}_converged',
+                    int(bool(diagnostic.get('converged', False))),
+                )
+                algorithm_group.setncattr(
+                    f'{prefix}_outer_iterations',
+                    int(diagnostic.get('outer_iterations', 0)),
                 )
                 effects = diagnostic.get('correlation_effects', [])
                 algorithm_group.setncattr(

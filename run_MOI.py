@@ -74,6 +74,7 @@ def set_moi_params():
         'SFOI_Augmented_Maxiter': 30,
         'SFOI_Augmented_Change_Thresh': 1.0e-5,
         'SFOI_Augmented_Robust_Damping': 0.50,
+        'SFOI_Augmented_State_Damping': 0.50,
         'norm': 0.5,
         'rho': 0.7,
         'niter': 1,

@@ -77,6 +77,10 @@ The default settings are deliberately conservative:
 - within-region correlation is `0.20`;
 - gage and mass rows are protected from robust downweighting;
 - robust downweighting occurs only above the upper chi-square bound.
+- physical state, bias, and correlation effects use `0.50` under-relaxation
+  after the first feasible augmented solve to suppress two-cycle oscillations;
+- convergence is evaluated using the undamped candidate change together with
+  the robust-weight change, so under-relaxation cannot cause false convergence.
 
 Runtime overrides are available:
 

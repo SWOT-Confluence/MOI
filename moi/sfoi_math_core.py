@@ -971,6 +971,7 @@ def adjust_lsq_bias_correlated_sparse(
     robust_limit: float = 3.0,
     alpha: float = 0.05,
     robust_damping: float = 0.5,
+    state_damping: float = 0.5,
     theta_floor: float = 5.0,
     w_max: Optional[float] = 1.0e6,
     fixed_weight_mask: Optional[np.ndarray] = None,
@@ -1001,7 +1002,11 @@ def adjust_lsq_bias_correlated_sparse(
     mass rows can be protected with ``fixed_weight_mask`` and
     ``robust_eligible_mask``. Robust downweighting is applied only when the
     global statistic is above the upper chi-square bound; low statistics cause
-    weights to recover toward their nominal values.
+    weights to recover toward their nominal values. After the first feasible
+    solve, physical state, bias, and correlation effects are under-relaxed as
+    one augmented state to suppress period-two Gauss-Newton/IRLS oscillations.
+    Convergence is checked against the undamped candidate residual so damping
+    cannot create false convergence.
     """
     A_obs = sp.csr_matrix(A_obs, dtype=float)
     L = _clean_vector('L', L)
@@ -1060,6 +1065,9 @@ def adjust_lsq_bias_correlated_sparse(
 
     theta_floor = max(float(theta_floor), 1.0e-6)
     robust_damping = float(np.clip(robust_damping, 0.0, 1.0))
+    state_damping = float(state_damping)
+    if not 0.0 < state_damping <= 1.0:
+        raise ValueError('state_damping must satisfy 0 < damping <= 1')
     effect_bound = max(float(correlation_effect_bound), 1.0)
 
     if x0 is None:
@@ -1120,6 +1128,7 @@ def adjust_lsq_bias_correlated_sparse(
     fixed_sigma = cov * np.maximum(np.abs(L), theta_floor)
     diagnostics: List[dict] = []
     delta: List[float] = []
+    step_delta_history: List[float] = []
     converged = False
     final_status = 'failed'
     final_residual = np.full(n_obs, np.nan, dtype=float)
@@ -1261,7 +1270,7 @@ def adjust_lsq_bias_correlated_sparse(
             rhs_fit = rhs_data
             weights_fit = data_weights
 
-        z_next, solve_status = _solve_wls_sparse(
+        z_candidate, solve_status = _solve_wls_sparse(
             J_fit,
             rhs_fit,
             weights_fit,
@@ -1273,7 +1282,41 @@ def adjust_lsq_bias_correlated_sparse(
             verbose=False,
         )
 
-        x_next = z_next[:n_physical]
+        candidate_x = z_candidate[:n_physical]
+        next_offset = n_physical
+        if bias_enabled:
+            candidate_bias = float(z_candidate[next_offset])
+            next_offset += 1
+        else:
+            candidate_bias = 0.0
+        candidate_effects = (
+            np.asarray(z_candidate[next_offset:], dtype=float)
+            if n_correlation_groups
+            else np.array([], dtype=float)
+        )
+
+        physical_scale = np.maximum(
+            np.maximum(np.abs(candidate_x), np.abs(x_physical)),
+            theta_floor,
+        )
+        physical_delta = float(
+            np.sqrt(np.mean(((candidate_x - x_physical) / physical_scale) ** 2))
+        )
+        bias_delta = abs(candidate_bias - bias) if bias_enabled else 0.0
+        effect_delta = (
+            float(np.sqrt(np.mean((candidate_effects - effects) ** 2)))
+            if n_correlation_groups
+            else 0.0
+        )
+        iteration_delta = max(physical_delta, bias_delta, effect_delta)
+        delta.append(iteration_delta)
+
+        # The initial physical state may not satisfy hard mass constraints.
+        # Accept the first feasible candidate in full; every later convex
+        # combination of feasible states remains feasible and within bounds.
+        applied_state_damping = 1.0 if outer == 0 else state_damping
+        z_next = z_current + applied_state_damping * (z_candidate - z_current)
+        x_next = np.asarray(z_next[:n_physical], dtype=float)
         next_offset = n_physical
         if bias_enabled:
             bias_next = float(z_next[next_offset])
@@ -1286,18 +1329,25 @@ def adjust_lsq_bias_correlated_sparse(
             else np.array([], dtype=float)
         )
 
-        physical_scale = np.maximum(np.abs(x_next), theta_floor)
-        physical_delta = float(
-            np.sqrt(np.mean(((x_next - x_physical) / physical_scale) ** 2))
+        accepted_scale = np.maximum(
+            np.maximum(np.abs(x_next), np.abs(x_physical)),
+            theta_floor,
         )
-        bias_delta = abs(bias_next - bias) if bias_enabled else 0.0
-        effect_delta = (
+        accepted_physical_delta = float(
+            np.sqrt(np.mean(((x_next - x_physical) / accepted_scale) ** 2))
+        )
+        accepted_bias_delta = abs(bias_next - bias) if bias_enabled else 0.0
+        accepted_effect_delta = (
             float(np.sqrt(np.mean((effects_next - effects) ** 2)))
             if n_correlation_groups
             else 0.0
         )
-        iteration_delta = max(physical_delta, bias_delta, effect_delta)
-        delta.append(iteration_delta)
+        step_delta = max(
+            accepted_physical_delta,
+            accepted_bias_delta,
+            accepted_effect_delta,
+        )
+        step_delta_history.append(step_delta)
 
         x_physical = x_next
         bias = bias_next
@@ -1358,6 +1408,11 @@ def adjust_lsq_bias_correlated_sparse(
             'physical_delta': physical_delta,
             'bias_delta': bias_delta,
             'effect_delta': effect_delta,
+            'step_delta': step_delta,
+            'accepted_physical_delta': accepted_physical_delta,
+            'accepted_bias_delta': accepted_bias_delta,
+            'accepted_effect_delta': accepted_effect_delta,
+            'state_damping': applied_state_damping,
             'robust_delta': robust_delta,
             'So': So,
             'chi2_stat': chi2_stat,
@@ -1376,7 +1431,9 @@ def adjust_lsq_bias_correlated_sparse(
                 f'iter={outer + 1}, delta={iteration_delta:.6g}, '
                 f'bias={bias:.6g}, So={So:.6g}, '
                 f'downweighted={diagnostic["n_downweighted"]}, '
-                f'rho={rho:.3g}'
+                f'rho={rho:.3g}, step_delta={step_delta:.6g}, '
+                f'robust_delta={robust_delta:.6g}, '
+                f'state_damping={applied_state_damping:.3g}'
             )
 
         final_status = solve_status
@@ -1418,7 +1475,7 @@ def adjust_lsq_bias_correlated_sparse(
         index=np.asarray(robust_factor >= 0.999, dtype=bool),
         delta=delta,
         status=(
-            f'success_bias_correlated_{final_status}'
+            f'success_bias_correlated_converged_{final_status}'
             if converged
             else f'success_bias_correlated_maxiter_{final_status}'
         ),
@@ -1435,6 +1492,9 @@ def adjust_lsq_bias_correlated_sparse(
     result.correlation_groups = np.asarray(group_index, dtype=int)
     result.correlation_effects = np.asarray(effects, dtype=float)
     result.robust_factor = np.asarray(robust_factor, dtype=float)
+    result.converged = bool(converged)
+    result.state_damping = float(state_damping)
+    result.step_delta = step_delta_history
     result.flpe_prediction = (1.0 + bias) * x_physical[:n_reaches]
     return result
 

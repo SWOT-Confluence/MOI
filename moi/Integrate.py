@@ -653,6 +653,9 @@ class Integrate:
                             robust_damping=self.params_dict.get(
                                 'SFOI_Augmented_Robust_Damping', 0.5
                             ),
+                            state_damping=self.params_dict.get(
+                                'SFOI_Augmented_State_Damping', 0.5
+                            ),
                             theta_floor=self.params_dict.get(
                                 'SFOI_Theta_Floor', 5.0
                             ),
@@ -718,7 +721,14 @@ class Integrate:
                                     result.correlation_effects, dtype=float
                                 ).tolist(),
                                 'status': result.status,
+                                'converged': bool(result.converged),
                                 'outer_iterations': result.outer_iterations,
+                                'state_damping': float(result.state_damping),
+                                'last_delta': (
+                                    float(result.delta[-1])
+                                    if result.delta
+                                    else np.nan
+                                ),
                             }
                             self.integ_dict['bias_correction'].setdefault(alg, {})[
                                 FlowLevel
