@@ -18,13 +18,14 @@ the inner loop. The matched gage mean constrains the `Mean` run and the matched
 
 When exactly one `*SVS*.nc` file exists in `/mnt/data/input/svs`, constrained
 runs discover it automatically. A calibration/validation CSV is required and
-defaults to `CalValSeparation.csv` in the same directory as the selected SVS
-file. It must contain `reach_id_v17b` and `group` columns; only rows whose group
-is `calibration` are eligible for gage constraints. Validation and unclassified
-reaches are retained for independent evaluation and are not refilled from SoS
-gage data.
+defaults to `CalValSeparation.csv` in the cloned MOI module directory (for
+example, `modules/moi/CalValSeparation.csv`). It must contain `reach_id_v17b`
+and `group` columns; only rows whose group is `calibration` are eligible for
+gage constraints. Validation and unclassified reaches are retained for
+independent evaluation and are not refilled from SoS gage data.
 
-The inputs can also be selected explicitly:
+The SVS input can also be selected explicitly; the module CSV remains the
+default unless `--gage-calval-csv` is provided as an override:
 
 ```bash
 python run_MOI.py \
@@ -32,8 +33,7 @@ python run_MOI.py \
   -j basins.json \
   -b constrained \
   --svs-file /mnt/data/input/svs/SVS_v1_0_1.nc \
-  --svs-reach-id-col reach_id_v17b \
-  --gage-calval-csv /mnt/data/input/svs/CalValSeparation.csv
+  --svs-reach-id-col reach_id_v17b
 ```
 
 Use `--gage-include-json` to select training/constraint gages and
@@ -86,7 +86,6 @@ python run_MOI.py \
   -j basins.json \
   -b constrained \
   --svs-file /mnt/data/input/svs/SVS_v1_0_1.nc \
-  --gage-calval-csv /mnt/data/input/svs/CalValSeparation.csv \
   --correlation-rho 0.20 \
   --bias-prior-std 0.50
 ```
@@ -95,6 +94,22 @@ Use `--disable-correlation` or `--disable-bias-augmentation` for ablation runs.
 The estimated bias, approximate bias standard deviation, correlation
 coefficient, latent region effects, and solver status are stored under the
 `moi_bias_correlation` group in every reach-level NetCDF output.
+
+## SWORD v17c bifurcation handling
+
+MOI reads the corrected SWORD v17c `facc` values and retains `facc_quality` as
+correction provenance. At bifurcations, discharge is partitioned using the
+normalized corrected-`facc` shares of the downstream reaches. If those shares
+are unavailable, MOI falls back to downstream width and then to an equal split.
+The fractions always sum to one.
+
+Immediate bifurcation children receive zero lateral drainage-area increment.
+This keeps the MOI mass equations consistent with the v17c area partition and
+prevents cloned pre-v17c parent area from being reintroduced as lateral runoff.
+Normal one-to-one links and confluences continue to use the nonnegative
+difference between downstream and weighted-upstream `facc` as lateral area.
+The `facc_quality` fill value (`-9999`) means that the reach retained its v17b
+value; it does not cause that reach to be filtered out.
 
 ## installation
 

@@ -126,7 +126,7 @@ def main():
         default=None,
         help=(
             'CSV assigning reach IDs to calibration/validation groups. '
-            'Defaults to CalValSeparation.csv beside the selected SVS file.'
+            'Defaults to CalValSeparation.csv in the cloned MOI module.'
         ),
     )
     parser.add_argument(
@@ -253,7 +253,7 @@ def main():
                     if svs_file is not None:
                         calval_file = args.gage_calval_csv
                         if calval_file is None:
-                            calval_file = svs_file.parent / 'CalValSeparation.csv'
+                            calval_file = Input.default_calval_file()
                         if not calval_file.is_file():
                             raise FileNotFoundError(
                                 'Calibration/validation CSV not found. Expected '

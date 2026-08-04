@@ -78,6 +78,11 @@ class Input:
         self.VerboseFlag = verbose
 
     @staticmethod
+    def default_calval_file():
+        """Return the Cal/Val CSV shipped in the cloned MOI module."""
+        return Path(__file__).resolve().parents[1] / 'CalValSeparation.csv'
+
+    @staticmethod
     def _filled_array(values, fill=np.nan):
         """Return a normal ndarray from a NetCDF variable or masked array."""
         if hasattr(values, 'filled'):
@@ -470,6 +475,22 @@ class Input:
         for field in reachfields:
             self.sword_dict[field] = sword_dataset['reaches/' + field][:]
 
+        # SWORD v17c marks reaches whose flow accumulation was changed by the
+        # denoise_v3 correction.  The fill value (-9999) means "unchanged from
+        # v17b", not invalid, so retain it as provenance rather than filtering
+        # those reaches out.  Older SWORD versions do not have this variable.
+        reaches_group = sword_dataset['reaches']
+        if 'facc_quality' in reaches_group.variables:
+            self.sword_dict['facc_quality'] = self._filled_array(
+                reaches_group['facc_quality'][:],
+                fill=-9999,
+            ).astype(np.int32)
+
+        self.sword_dict['facc'] = self._filled_array(
+            self.sword_dict['facc'],
+            fill=np.nan,
+        ).astype(float)
+
         try:
             self.sword_dict['swot_orbits'] = sword_dataset['reaches/swot_orbits'][:]
         except Exception:
@@ -498,10 +519,15 @@ class Input:
         self.sword_dict['num_reaches'] = len(gdf)
 
         self.sword_dict['reach_id'] = gdf['reach_id'].values
-        self.sword_dict['facc'] = gdf['facc'].values
+        self.sword_dict['facc'] = gdf['facc'].to_numpy(dtype=float, na_value=np.nan)
         self.sword_dict['n_rch_up'] = gdf['n_rch_up'].values
         self.sword_dict['n_rch_down'] = gdf['n_rch_down'].values
         self.sword_dict['swot_obs'] = gdf['swot_obs'].values
+
+        if 'facc_quality' in gdf.columns:
+            self.sword_dict['facc_quality'] = (
+                gdf['facc_quality'].fillna(-9999).astype(np.int32).values
+            )
 
         self.sword_dict['width'] = gdf['width'].fillna(0).values 
 

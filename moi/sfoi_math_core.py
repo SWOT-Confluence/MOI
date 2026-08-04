@@ -138,6 +138,47 @@ def _get_sword_scalar(sword_dict: dict, sword_idx: Dict[str, int], reach: str, f
         return default
 
 
+def _downstream_partition_weights(
+    downstream_reaches: Sequence[str],
+    sword_dict: dict,
+    sword_idx: Dict[str, int],
+) -> np.ndarray:
+    """Return conservative flow fractions for a junction's downstream reaches.
+
+    SWORD v17c already partitions corrected ``facc`` among bifurcation children.
+    When the v17c ``facc_quality`` variable is present, use those effective-area
+    shares so MOI's discharge partition matches the SWORD correction.  Fall back
+    to the SWORD width rule used to construct v17c, then to an equal split.
+    Fractions are always normalized to sum to one.
+    """
+    downstream = [str(reach) for reach in downstream_reaches]
+    if not downstream:
+        return np.empty(0, dtype=float)
+    if len(downstream) == 1:
+        return np.ones(1, dtype=float)
+
+    if 'facc_quality' in sword_dict:
+        facc = np.asarray([
+            _get_sword_scalar(sword_dict, sword_idx, reach, 'facc')
+            for reach in downstream
+        ], dtype=float)
+        if np.all(np.isfinite(facc) & (facc > 0)):
+            total_facc = float(np.sum(facc))
+            if np.isfinite(total_facc) and total_facc > 0:
+                return facc / total_facc
+
+    widths = np.asarray([
+        _get_sword_scalar(sword_dict, sword_idx, reach, 'width')
+        for reach in downstream
+    ], dtype=float)
+    if np.all(np.isfinite(widths) & (widths > 0)):
+        total_width = float(np.sum(widths))
+        if np.isfinite(total_width) and total_width > 0:
+            return widths / total_width
+
+    return np.full(len(downstream), 1.0 / len(downstream), dtype=float)
+
+
 def _build_upstream_contribs(
     reach_ids: Sequence,
     sword_dict: dict,
@@ -145,9 +186,10 @@ def _build_upstream_contribs(
 ) -> Dict[str, List[Tuple[str, float]]]:
     """Return mapping downstream reach -> [(upstream reach, coefficient), ...].
 
-    For normal confluences, coefficients are 1. For distributaries, the previous
-    MOI logic partitions upstream flow by downstream width. This keeps that
-    global-run compatible behavior while preserving sparse mass equations.
+    For normal confluences, coefficients are 1. For distributaries, corrected
+    SWORD v17c facc shares are preferred, with downstream width and equal shares
+    as fallbacks. This keeps discharge partitioning consistent with SWORD while
+    preserving sparse mass equations and compatibility with older versions.
     """
     reach_list = _as_reach_list(reach_ids)
     reach_set = set(reach_list)
@@ -161,19 +203,13 @@ def _build_upstream_contribs(
             if not U or not D:
                 continue
 
-            widths = []
-            for d in D:
-                w = _get_sword_scalar(sword_dict, sword_idx, d, 'width', default=1.0)
-                if not np.isfinite(w) or w <= 0:
-                    w = 1.0
-                widths.append(w)
-            total_w = float(np.sum(widths))
+            weights = _downstream_partition_weights(D, sword_dict, sword_idx)
 
             for idx, d in enumerate(D):
-                p = widths[idx] / total_w if total_w > 0 else 1.0 / len(D)
+                p = float(weights[idx])
                 up_contribs.setdefault(d, [])
                 for u in U:
-                    up_contribs[d].append((u, float(p)))
+                    up_contribs[d].append((u, p))
 
     # Fallback: if some SWORD upstream links were not represented in junctions,
     # add them with coefficient 1.0.
@@ -221,8 +257,11 @@ def compute_delta_area_for_mass_rows(
     """Compute lateral drainage-area increment for each reach.
 
     For dependent reaches, delta_A = facc_current - weighted direct-upstream facc.
-    For source reaches, this value is kept for diagnostics/prior construction but
-    no mass row is built for them.
+    Immediate bifurcation children receive zero lateral area: v17c already
+    encodes the parent-area split in child facc, and this also prevents cloned
+    v17b parent area from being re-injected as lateral runoff. For source reaches,
+    this value is kept for diagnostics/prior construction but no mass row is
+    built for them.
     """
     reach_list = _as_reach_list(reach_ids)
     reach_index = _build_reach_index(reach_list)
@@ -230,8 +269,17 @@ def compute_delta_area_for_mass_rows(
 
     for i, reach in enumerate(reach_list):
         fcur = float(facc[i]) if np.isfinite(facc[i]) else 0.0
+        contribs = upstream_contribs.get(reach, [])
+        is_bifurcation_child = any(
+            not np.isclose(float(coeff), 1.0, rtol=0.0, atol=1.0e-12)
+            for _, coeff in contribs
+        )
+        if is_bifurcation_child:
+            delta_A[i] = 0.0
+            continue
+
         upstream_area = 0.0
-        for up, coeff in upstream_contribs.get(reach, []):
+        for up, coeff in contribs:
             j = reach_index.get(str(up))
             if j is not None and np.isfinite(facc[j]):
                 upstream_area += float(coeff) * float(facc[j])
