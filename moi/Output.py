@@ -69,6 +69,9 @@ class Output:
                     f'{prefix}_correlation_rho': diagnostic.get(
                         'correlation_rho', np.nan
                     ),
+                    f'{prefix}_last_delta': diagnostic.get(
+                        'last_delta', np.nan
+                    ),
                 }
                 for variable_name, value in values.items():
                     variable = algorithm_group.createVariable(variable_name, 'f8')
@@ -81,6 +84,14 @@ class Output:
                 algorithm_group.setncattr(
                     f'{prefix}_solver_status',
                     str(diagnostic.get('status', 'unknown')),
+                )
+                algorithm_group.setncattr(
+                    f'{prefix}_converged',
+                    int(bool(diagnostic.get('converged', False))),
+                )
+                algorithm_group.setncattr(
+                    f'{prefix}_outer_iterations',
+                    int(diagnostic.get('outer_iterations', 0)),
                 )
                 effects = diagnostic.get('correlation_effects', [])
                 algorithm_group.setncattr(
@@ -338,7 +349,12 @@ class Output:
         try:
             reaches = sword_dataset['reaches']['reach_id'][:]
             for reach in self.basin_dict['reach_ids']:
-                reach_ind = np.where(reaches == reach)
+                reach_ind = np.where(reaches == np.int64(reach))
+                if reach_ind[0].size != 1:
+                    raise RuntimeError(
+                        f'Expected one SWORD match for reach {reach}, '
+                        f'found {reach_ind[0].size}'
+                    )
                 try:
                     # 1) BAM branch (using busboi outputs)
                     sword_dataset['reaches']['discharge_models'][branch]['BAM']['Abar'][reach_ind] = \
@@ -394,7 +410,7 @@ class Output:
                 except Exception as e:
                     print(reach, 'data not found for sword...', e)
         except Exception as e:
-            print('Error during sword writing...', e)
+            raise RuntimeError(f'Error during SWORD writing: {e}') from e
         finally:
             if sword_dataset:
                 sword_dataset.close()

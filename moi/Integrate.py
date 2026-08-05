@@ -510,6 +510,16 @@ class Integrate:
 
          return Qbar, sigQ, FLPE_Data_OK, facc, datasource
 
+    @staticmethod
+    def _require_converged_augmented_result(result):
+        """Reject an augmented result that exhausted its outer iterations."""
+        if not result.converged:
+            raise RuntimeError(
+                'bias-correlated outer solver did not converge: '
+                f'{result.status}; iterations={result.outer_iterations}; '
+                f'last_delta={result.delta[-1] if result.delta else np.nan}'
+            )
+
     def integrator_optimization_calcs(self, m, n, FlowLevel, PreviousResiduals):
         """Run sparse paper-style SFOI for each reach-scale FLPE algorithm.
 
@@ -539,6 +549,8 @@ class Integrate:
             stdQc_rel = np.full((n,), self.params_dict.get('FLPE_Uncertainty', 0.6), dtype=float)
             x_hat_saved = None
             result = None
+            bias_enabled = False
+            correlation_enabled = False
 
             if FLPE_Data_OK and self.junctions_valid:
                 try:
@@ -696,6 +708,11 @@ class Integrate:
                             robust_eligible_mask=robust_eligible,
                         )
 
+                    if (
+                        (bias_enabled or correlation_enabled)
+                    ):
+                        self._require_converged_augmented_result(result)
+
                     x_hat_saved = result.x
                     if x_hat_saved is not None and np.all(np.isfinite(x_hat_saved[:n])):
                         Qintegrator = np.clip(x_hat_saved[:n], 0.1, np.inf)
@@ -718,7 +735,13 @@ class Integrate:
                                     result.correlation_effects, dtype=float
                                 ).tolist(),
                                 'status': result.status,
+                                'converged': bool(result.converged),
                                 'outer_iterations': result.outer_iterations,
+                                'last_delta': (
+                                    float(result.delta[-1])
+                                    if result.delta
+                                    else np.nan
+                                ),
                             }
                             self.integ_dict['bias_correction'].setdefault(alg, {})[
                                 FlowLevel
@@ -764,6 +787,10 @@ class Integrate:
                             print(f"      SFOI status={result.status}, outer_iters={result.outer_iterations}, delta_last={result.delta[-1] if result.delta else np.nan}")
                 except Exception as e:
                     print(f"      Sparse paper-SFOI solver failed: {e}")
+                    if bias_enabled or correlation_enabled:
+                        raise RuntimeError(
+                            f'{alg} {FlowLevel} augmented solve failed: {e}'
+                        ) from e
 
             if Success and FlowLevel == 'Mean':
                 if not hasattr(self, 'reach_epsilons'):

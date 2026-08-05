@@ -596,8 +596,11 @@ class Input:
             self.obs_dict[reach]['iDelete'] = iDelete
 
             Smin = 1.7e-5
-            self.obs_dict[reach]['S'][self.obs_dict[reach]['S'] < Smin] = \
-                np.putmask(self.obs_dict[reach]['S'], self.obs_dict[reach]['S'] < Smin, Smin)
+            np.putmask(
+                self.obs_dict[reach]['S'],
+                self.obs_dict[reach]['S'] < Smin,
+                Smin,
+            )
 
             shape_iDelete = np.shape(iDelete)
             nDelete = shape_iDelete[1]

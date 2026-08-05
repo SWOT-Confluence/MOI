@@ -50,10 +50,13 @@ each algorithm:
 Q_FLPE_i = (1 + bias) * Q_physical_i + error_i
 ```
 
-Only the FLPE discharge rows receive this bias. Runoff priors, mass-balance
-rows, and gages remain unbiased. A positive estimate means that the FLPE prior
-is systematically high; for example, `bias = 0.20` corresponds to a direct
-debiasing factor of `1 / 1.20`.
+The augmented Jacobian applies this bias to the first reach-prior rows. In the
+rolled-back baseline, missing FLPE values are filled before system assembly, so
+those rows currently include Fill priors as well as true FLPE priors. Runoff,
+mass-balance, and gage rows remain unbiased. Separating Fill from true FLPE rows
+would change the statistical model and is intentionally outside this rollback.
+A positive estimate means that the affected prior is systematically high; for
+example, `bias = 0.20` corresponds to a direct debiasing factor of `1 / 1.20`.
 
 Random FLPE errors can be correlated within the runoff regions already built by
 MOI. The implementation uses one penalized Gaussian latent effect per region:
@@ -76,7 +79,9 @@ The default settings are deliberately conservative:
 - bias prior standard deviation is `0.50`;
 - within-region correlation is `0.20`;
 - gage and mass rows are protected from robust downweighting;
-- robust downweighting occurs only above the upper chi-square bound.
+- robust downweighting occurs only above the upper chi-square bound;
+- an augmented solve that reaches `maxiter` without satisfying both state and
+  robust-weight tolerances is rejected before NetCDF export.
 
 Runtime overrides are available:
 
@@ -95,21 +100,23 @@ The estimated bias, approximate bias standard deviation, correlation
 coefficient, latent region effects, and solver status are stored under the
 `moi_bias_correlation` group in every reach-level NetCDF output.
 
-## SWORD v17c bifurcation handling
+## Rolled-back bifurcation behavior
 
 MOI reads the corrected SWORD v17c `facc` values and retains `facc_quality` as
-correction provenance. At bifurcations, discharge is partitioned using the
-normalized corrected-`facc` shares of the downstream reaches. If those shares
-are unavailable, MOI falls back to downstream width and then to an equal split.
-The fractions always sum to one.
+correction provenance. The mathematical core intentionally matches the
+pre-bifurcation `c9b28ac` baseline: downstream width, with equal weights as a
+fallback, partitions distributary flow. Corrected `facc` is not interpreted as
+a dynamic branch-flow fraction.
 
-Immediate bifurcation children receive zero lateral drainage-area increment.
-This keeps the MOI mass equations consistent with the v17c area partition and
-prevents cloned pre-v17c parent area from being reintroduced as lateral runoff.
-Normal one-to-one links and confluences continue to use the nonnegative
-difference between downstream and weighted-upstream `facc` as lateral area.
-The `facc_quality` fill value (`-9999`) means that the reach retained its v17b
-value; it does not cause that reach to be filtered out.
+Lateral drainage area is always computed with the baseline nonnegative formula
+`max(0, facc_current - weighted_upstream_facc)`. Fractional coefficients no
+longer force a bifurcation child's lateral area to zero. The `facc_quality` fill
+value (`-9999`) means that the reach retained its v17b value; it is preserved as
+metadata and does not affect the rolled-back equations.
+
+This baseline still uses aggregate junction construction. Complex or incomplete
+bifurcations therefore remain outside the validated scope and should be excluded
+upstream until an edge-based formulation is implemented and tested separately.
 
 ## installation
 

@@ -277,7 +277,7 @@ def main():
             except Exception as e:
                 log.write(f"Data Missing: {str(e)}. Skipping basin.\n")
                 print(f"[{basin_id}] SKIP: Essential data missing ({str(e)})")
-                sys.exit(0)
+                sys.exit(1)
 
             # ---------------------------------------------------------
             # 2. INTEGRATION
