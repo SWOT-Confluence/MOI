@@ -520,6 +520,40 @@ class Integrate:
                 f'last_delta={result.delta[-1] if result.delta else np.nan}'
             )
 
+    def _augmented_solver_features(self, FlowLevel, n_gage_rows):
+        """Enable bias/correlation only where calibration gages identify them.
+
+        An ungaged basin has no independent observation that can distinguish a
+        systematic FLPE bias or a regional correlation effect from the physical
+        discharge state. Such basins therefore use the ordinary MOI solver.
+        """
+        configured_levels = self.params_dict.get(
+            'SFOI_Bias_Flow_Levels', ('Mean',)
+        )
+        if isinstance(configured_levels, str):
+            configured_levels = {
+                value.strip()
+                for value in configured_levels.split(',')
+                if value.strip()
+            }
+        else:
+            configured_levels = set(configured_levels)
+
+        has_identifying_gage = (
+            self.Branch == 'constrained'
+            and int(n_gage_rows) > 0
+            and FlowLevel in configured_levels
+        )
+        bias_enabled = (
+            has_identifying_gage
+            and bool(self.params_dict.get('SFOI_Bias_Augmentation', True))
+        )
+        correlation_enabled = (
+            has_identifying_gage
+            and bool(self.params_dict.get('SFOI_Correlation_Enabled', True))
+        )
+        return bias_enabled, correlation_enabled
+
     def integrator_optimization_calcs(self, m, n, FlowLevel, PreviousResiduals):
         """Run sparse paper-style SFOI for each reach-scale FLPE algorithm.
 
@@ -599,27 +633,11 @@ class Integrate:
                             f'gage_rows={gage_obs["A"].shape[0]}'
                         )
 
-                    configured_levels = self.params_dict.get(
-                        'SFOI_Bias_Flow_Levels', ('Mean',)
-                    )
-                    if isinstance(configured_levels, str):
-                        configured_levels = {
-                            value.strip()
-                            for value in configured_levels.split(',')
-                            if value.strip()
-                        }
-                    else:
-                        configured_levels = set(configured_levels)
-
-                    bias_enabled = (
-                        bool(self.params_dict.get('SFOI_Bias_Augmentation', True))
-                        and self.Branch == 'constrained'
-                        and gage_obs['A'].shape[0] > 0
-                        and FlowLevel in configured_levels
-                    )
-                    correlation_enabled = (
-                        bool(self.params_dict.get('SFOI_Correlation_Enabled', True))
-                        and FlowLevel in configured_levels
+                    bias_enabled, correlation_enabled = (
+                        self._augmented_solver_features(
+                            FlowLevel,
+                            gage_obs['A'].shape[0],
+                        )
                     )
 
                     if bias_enabled or correlation_enabled:
@@ -664,6 +682,16 @@ class Integrate:
                             alpha=self.params_dict.get('SFOI_Alpha', 0.05),
                             robust_damping=self.params_dict.get(
                                 'SFOI_Augmented_Robust_Damping', 0.5
+                            ),
+                            oscillation_damping=self.params_dict.get(
+                                'SFOI_Augmented_Oscillation_Damping', 0.5
+                            ),
+                            oscillation_direction_threshold=self.params_dict.get(
+                                'SFOI_Augmented_Oscillation_Direction_Threshold',
+                                -0.5,
+                            ),
+                            minimum_step_relaxation=self.params_dict.get(
+                                'SFOI_Augmented_Minimum_Step_Relaxation', 0.05
                             ),
                             theta_floor=self.params_dict.get(
                                 'SFOI_Theta_Floor', 5.0
@@ -741,6 +769,12 @@ class Integrate:
                                     float(result.delta[-1])
                                     if result.delta
                                     else np.nan
+                                ),
+                                'oscillation_events': int(
+                                    getattr(result, 'oscillation_events', 0)
+                                ),
+                                'final_step_relaxation': float(
+                                    getattr(result, 'step_relaxation', 1.0)
                                 ),
                             }
                             self.integ_dict['bias_correction'].setdefault(alg, {})[

@@ -925,6 +925,9 @@ def adjust_lsq_bias_correlated_sparse(
     robust_limit: float = 3.0,
     alpha: float = 0.05,
     robust_damping: float = 0.5,
+    oscillation_damping: float = 0.5,
+    oscillation_direction_threshold: float = -0.5,
+    minimum_step_relaxation: float = 0.05,
     theta_floor: float = 5.0,
     w_max: Optional[float] = 1.0e6,
     fixed_weight_mask: Optional[np.ndarray] = None,
@@ -955,7 +958,10 @@ def adjust_lsq_bias_correlated_sparse(
     mass rows can be protected with ``fixed_weight_mask`` and
     ``robust_eligible_mask``. Robust downweighting is applied only when the
     global statistic is above the upper chi-square bound; low statistics cause
-    weights to recover toward their nominal values.
+    weights to recover toward their nominal values. Strongly opposing
+    consecutive Gauss-Newton directions indicate a fixed-point oscillation.
+    Those steps are progressively under-relaxed, which collapses a period-two
+    cycle toward its midpoint while preserving bounds and linear constraints.
     """
     A_obs = sp.csr_matrix(A_obs, dtype=float)
     L = _clean_vector('L', L)
@@ -1014,6 +1020,19 @@ def adjust_lsq_bias_correlated_sparse(
 
     theta_floor = max(float(theta_floor), 1.0e-6)
     robust_damping = float(np.clip(robust_damping, 0.0, 1.0))
+    oscillation_damping = float(oscillation_damping)
+    if not 0.0 < oscillation_damping <= 1.0:
+        raise ValueError('oscillation_damping must satisfy 0 < value <= 1')
+    oscillation_direction_threshold = float(oscillation_direction_threshold)
+    if not -1.0 <= oscillation_direction_threshold < 0.0:
+        raise ValueError(
+            'oscillation_direction_threshold must satisfy -1 <= value < 0'
+        )
+    minimum_step_relaxation = float(minimum_step_relaxation)
+    if not 0.0 < minimum_step_relaxation <= 1.0:
+        raise ValueError(
+            'minimum_step_relaxation must satisfy 0 < value <= 1'
+        )
     effect_bound = max(float(correlation_effect_bound), 1.0)
 
     if x0 is None:
@@ -1085,6 +1104,9 @@ def adjust_lsq_bias_correlated_sparse(
     )
     final_design = None
     final_weights = None
+    previous_step_direction = None
+    step_relaxation = 1.0
+    oscillation_events = 0
 
     def assemble_state(
         physical: np.ndarray,
@@ -1215,7 +1237,7 @@ def adjust_lsq_bias_correlated_sparse(
             rhs_fit = rhs_data
             weights_fit = data_weights
 
-        z_next, solve_status = _solve_wls_sparse(
+        z_candidate, solve_status = _solve_wls_sparse(
             J_fit,
             rhs_fit,
             weights_fit,
@@ -1226,6 +1248,81 @@ def adjust_lsq_bias_correlated_sparse(
             x0=z_current,
             verbose=False,
         )
+
+        # Detect a fixed-point oscillation from the direction of consecutive
+        # augmented-state updates. Scaling prevents large Q values from hiding
+        # a reversal in the dimensionless bias or correlation effects.
+        raw_step = np.asarray(z_candidate - z_current, dtype=float)
+        direction_scale = np.ones(n_augmented, dtype=float)
+        direction_scale[:n_physical] = np.maximum.reduce(
+            [
+                np.abs(z_current[:n_physical]),
+                np.abs(z_candidate[:n_physical]),
+                np.full(n_physical, theta_floor, dtype=float),
+            ]
+        )
+        if bias_enabled:
+            direction_scale[bias_index] = max(
+                1.0,
+                abs(float(z_current[bias_index])),
+                abs(float(z_candidate[bias_index])),
+            )
+        if n_correlation_groups:
+            direction_scale[effect_start:] = np.maximum.reduce(
+                [
+                    np.abs(z_current[effect_start:]),
+                    np.abs(z_candidate[effect_start:]),
+                    np.ones(n_correlation_groups, dtype=float),
+                ]
+            )
+
+        raw_direction = raw_step / direction_scale
+        raw_direction_norm = float(np.linalg.norm(raw_direction))
+        raw_physical_scale = np.maximum(
+            np.abs(z_candidate[:n_physical]), theta_floor
+        )
+        raw_physical_delta = float(
+            np.sqrt(
+                np.mean(
+                    (raw_step[:n_physical] / raw_physical_scale) ** 2
+                )
+            )
+        )
+        raw_bias_delta = (
+            abs(float(raw_step[bias_index])) if bias_enabled else 0.0
+        )
+        raw_effect_delta = (
+            float(np.sqrt(np.mean(raw_step[effect_start:] ** 2)))
+            if n_correlation_groups
+            else 0.0
+        )
+        raw_iteration_delta = max(
+            raw_physical_delta,
+            raw_bias_delta,
+            raw_effect_delta,
+        )
+        direction_cosine = np.nan
+        oscillation_detected = False
+        if previous_step_direction is not None and raw_direction_norm > _EPS:
+            previous_norm = float(np.linalg.norm(previous_step_direction))
+            if previous_norm > _EPS:
+                direction_cosine = float(
+                    np.dot(raw_direction, previous_step_direction)
+                    / (raw_direction_norm * previous_norm)
+                )
+                if direction_cosine <= oscillation_direction_threshold:
+                    oscillation_detected = True
+                    oscillation_events += 1
+                    step_relaxation = max(
+                        minimum_step_relaxation,
+                        step_relaxation * oscillation_damping,
+                    )
+
+        z_next = z_current + step_relaxation * raw_step
+        z_next = np.minimum(np.maximum(z_next, augmented_lb), augmented_ub)
+        applied_direction = (z_next - z_current) / direction_scale
+        if raw_direction_norm > _EPS:
+            previous_step_direction = applied_direction
 
         x_next = z_next[:n_physical]
         next_offset = n_physical
@@ -1312,6 +1409,10 @@ def adjust_lsq_bias_correlated_sparse(
             'physical_delta': physical_delta,
             'bias_delta': bias_delta,
             'effect_delta': effect_delta,
+            'raw_delta': raw_iteration_delta,
+            'direction_cosine': direction_cosine,
+            'oscillation_detected': oscillation_detected,
+            'step_relaxation': step_relaxation,
             'robust_delta': robust_delta,
             'So': So,
             'chi2_stat': chi2_stat,
@@ -1330,7 +1431,8 @@ def adjust_lsq_bias_correlated_sparse(
                 f'iter={outer + 1}, delta={iteration_delta:.6g}, '
                 f'bias={bias:.6g}, So={So:.6g}, '
                 f'downweighted={diagnostic["n_downweighted"]}, '
-                f'rho={rho:.3g}'
+                f'rho={rho:.3g}, relaxation={step_relaxation:.3g}, '
+                f'direction_cosine={direction_cosine:.3g}'
             )
 
         final_status = solve_status
@@ -1341,7 +1443,11 @@ def adjust_lsq_bias_correlated_sparse(
         final_design = J_fit
         final_weights = weights_fit
 
-        if iteration_delta < change_thresh and robust_delta < change_thresh:
+        if (
+            iteration_delta < change_thresh
+            and raw_iteration_delta < change_thresh
+            and robust_delta < change_thresh
+        ):
             converged = True
             break
 
@@ -1363,6 +1469,9 @@ def adjust_lsq_bias_correlated_sparse(
             bias_std = np.nan
 
     W_return = _clip_weight_vector(1.0 / final_sigma_marginal, w_max)
+    convergence_label = (
+        'forced_converged' if oscillation_events else 'converged'
+    )
     result = SparseSFOIResult(
         x=np.asarray(x_physical, dtype=float).ravel(),
         P=W_return ** 2,
@@ -1372,7 +1481,7 @@ def adjust_lsq_bias_correlated_sparse(
         index=np.asarray(robust_factor >= 0.999, dtype=bool),
         delta=delta,
         status=(
-            f'success_bias_correlated_{final_status}'
+            f'success_bias_correlated_{convergence_label}_{final_status}'
             if converged
             else f'failed_bias_correlated_maxiter_{final_status}'
         ),
@@ -1390,6 +1499,8 @@ def adjust_lsq_bias_correlated_sparse(
     result.correlation_groups = np.asarray(group_index, dtype=int)
     result.correlation_effects = np.asarray(effects, dtype=float)
     result.robust_factor = np.asarray(robust_factor, dtype=float)
+    result.oscillation_events = int(oscillation_events)
+    result.step_relaxation = float(step_relaxation)
     result.flpe_prediction = (1.0 + bias) * x_physical[:n_reaches]
     return result
 

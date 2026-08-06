@@ -79,8 +79,11 @@ class Input:
 
     @staticmethod
     def default_calval_file():
-        """Return the Cal/Val CSV shipped in the cloned MOI module."""
-        return Path(__file__).resolve().parents[1] / 'CalValSeparation.csv'
+        """Return the basin-stratified Cal/Val CSV shipped with MOI."""
+        return (
+            Path(__file__).resolve().parents[1]
+            / 'CalValSeparation_basin_stratified_v2.csv'
+        )
 
     @staticmethod
     def _filled_array(values, fill=np.nan):

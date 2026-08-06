@@ -189,8 +189,8 @@ def test_correlation_rho_is_validated():
         )
 
 
-def test_augmented_result_reports_period_two_nonconvergence(monkeypatch):
-    """A period-two fixed point must be reported as a failed outer solve."""
+def test_augmented_result_damps_period_two_oscillation_to_convergence(monkeypatch):
+    """A reversing fixed-point direction is relaxed to the cycle midpoint."""
 
     def period_two_candidate(
         A_obs,
@@ -230,11 +230,17 @@ def test_augmented_result_reports_period_two_nonconvergence(monkeypatch):
 
     result = adjust_lsq_bias_correlated_sparse(**common)
 
-    assert not result.converged
-    assert result.status.startswith('failed_bias_correlated_maxiter_')
-    assert result.outer_iterations == common['maxiter']
-    assert result.x == pytest.approx([0.0], abs=1.0e-12)
-    assert result.delta[-1] > common['change_thresh']
+    assert result.converged
+    assert result.status.startswith(
+        'success_bias_correlated_forced_converged_'
+    )
+    assert result.outer_iterations == 3
+    assert result.x == pytest.approx([1.0], abs=1.0e-12)
+    assert result.delta[-1] <= common['change_thresh']
+    assert result.oscillation_events == 1
+    assert result.step_relaxation == pytest.approx(0.5)
+    assert result.diagnostics[1]['oscillation_detected']
+    assert result.diagnostics[1]['direction_cosine'] == pytest.approx(-1.0)
     assert result.diagnostics[-1]['robust_delta'] == 0.0
 
 

@@ -18,11 +18,13 @@ the inner loop. The matched gage mean constrains the `Mean` run and the matched
 
 When exactly one `*SVS*.nc` file exists in `/mnt/data/input/svs`, constrained
 runs discover it automatically. A calibration/validation CSV is required and
-defaults to `CalValSeparation.csv` in the cloned MOI module directory (for
-example, `modules/moi/CalValSeparation.csv`). It must contain `reach_id_v17b`
-and `group` columns; only rows whose group is `calibration` are eligible for
-gage constraints. Validation and unclassified reaches are retained for
-independent evaluation and are not refilled from SoS gage data.
+defaults to `CalValSeparation_basin_stratified_v2.csv` in the cloned MOI module
+directory (for example,
+`modules/moi/CalValSeparation_basin_stratified_v2.csv`). It must contain
+`reach_id_v17b` and `group` columns; only rows whose group is `calibration` are
+eligible for gage constraints. Validation, excluded, and unclassified reaches
+are retained for independent evaluation and are not refilled from SoS gage
+data.
 
 The SVS input can also be selected explicitly; the module CSV remains the
 default unless `--gage-calval-csv` is provided as an override:
@@ -76,10 +78,15 @@ covariance matrix.
 The default settings are deliberately conservative:
 
 - augmentation is enabled for `Mean` only;
+- bias augmentation and correlation are enabled only when the basin has at
+  least one usable calibration gage; an ungaged basin uses ordinary sparse MOI;
 - bias prior standard deviation is `0.50`;
 - within-region correlation is `0.20`;
 - gage and mass rows are protected from robust downweighting;
 - robust downweighting occurs only above the upper chi-square bound;
+- when consecutive augmented Gauss-Newton steps point in strongly opposite
+  directions, the new step is progressively under-relaxed (default factor
+  `0.5`) to collapse period-two oscillations toward their midpoint;
 - an augmented solve that reaches `maxiter` without satisfying both state and
   robust-weight tolerances is rejected before NetCDF export.
 

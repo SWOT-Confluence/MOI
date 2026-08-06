@@ -12,8 +12,25 @@ from moi.sfoi_math_core import adjust_lsq_mult_sparse
 def test_default_calval_file_is_shipped_with_moi_module():
     calval_file = Input.default_calval_file()
 
-    assert calval_file == Path(__file__).resolve().parents[1] / 'CalValSeparation.csv'
+    assert calval_file == (
+        Path(__file__).resolve().parents[1]
+        / 'CalValSeparation_basin_stratified_v2.csv'
+    )
     assert calval_file.is_file()
+
+
+def test_augmented_features_require_a_calibration_gage():
+    integrator = object.__new__(Integrate)
+    integrator.Branch = 'constrained'
+    integrator.params_dict = {
+        'SFOI_Bias_Augmentation': True,
+        'SFOI_Correlation_Enabled': True,
+        'SFOI_Bias_Flow_Levels': ('Mean',),
+    }
+
+    assert integrator._augmented_solver_features('Mean', 0) == (False, False)
+    assert integrator._augmented_solver_features('Mean', 1) == (True, True)
+    assert integrator._augmented_solver_features('q33', 1) == (False, False)
 
 
 def test_filled_array_handles_masked_integer_netcdf_values():

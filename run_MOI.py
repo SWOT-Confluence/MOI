@@ -74,6 +74,11 @@ def set_moi_params():
         'SFOI_Augmented_Maxiter': 30,
         'SFOI_Augmented_Change_Thresh': 1.0e-5,
         'SFOI_Augmented_Robust_Damping': 0.50,
+        # Progressively shorten a Gauss-Newton step when its direction strongly
+        # opposes the preceding step (the signature of a period-two cycle).
+        'SFOI_Augmented_Oscillation_Damping': 0.50,
+        'SFOI_Augmented_Oscillation_Direction_Threshold': -0.50,
+        'SFOI_Augmented_Minimum_Step_Relaxation': 0.05,
         'norm': 0.5,
         'rho': 0.7,
         'niter': 1,
@@ -126,7 +131,8 @@ def main():
         default=None,
         help=(
             'CSV assigning reach IDs to calibration/validation groups. '
-            'Defaults to CalValSeparation.csv in the cloned MOI module.'
+            'Defaults to CalValSeparation_basin_stratified_v2.csv in the '
+            'cloned MOI module.'
         ),
     )
     parser.add_argument(
