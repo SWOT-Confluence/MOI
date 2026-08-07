@@ -21,6 +21,9 @@ dependencies = [
     "zenodo-get>=3.0.3",
 ]
 
+[tool.setuptools.packages.find]
+include = ["confluence*"]
+
 [tool.ruff]
 line-length = 120
 target-version = "py311"

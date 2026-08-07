@@ -76,13 +76,13 @@ This is similar to example two, but notice there are two yml files in the exampl
 1. We set a different user and branch name for our new module code. This will pull the momma repository from the github user `tedlanghorst` and the branch `dev`. Any modules that are not specified here will fall back to pulling from the `default_github_username` and `default_repository_branch` parameters. Note that this refers to the repository name (momma) instead of the module name (unconstrained_momma).
     ```yml
     repo_branches:
-      momma: "tedlanghorst:dev"
+      momma: "post_UAT"
     ```
 
 1. We specified **only** `momma` in the `repos_to_rebuild` argument, which means we will not rebuild the images for `consensus`, `validation`, and `output`.
     ```yml
     rebuild_all_modules: False
-    repos_to_rebuild:
+    modules_to_rebuild:
       - "momma"
     ```
 
