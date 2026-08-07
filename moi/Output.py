@@ -4,6 +4,7 @@ from pathlib import Path
 import time
 import random
 import os, sys
+import warnings
 
 # Third-party imports
 from netCDF4 import Dataset
@@ -98,6 +99,33 @@ class Output:
                     f'{prefix}_correlation_effects',
                     ','.join(f'{float(value):.12g}' for value in effects),
                 )
+
+    def _write_time_strings(self, out, reach):
+        """Write root-level SWOT time strings aligned with the restored nt axis."""
+        nt = len(out.dimensions['nt'])
+        values = self.obs_dict.get(str(reach), {}).get('time_str')
+        if values is None:
+            warnings.warn(
+                f'Reach {reach} has no time_str metadata; writing empty strings.',
+                RuntimeWarning,
+            )
+            values = np.full(nt, '', dtype=str)
+        else:
+            values = np.asarray(values, dtype=str).ravel()
+
+        if values.size != nt:
+            raise ValueError(
+                f'Reach {reach} time_str length does not match output nt: '
+                f'{values.size} != {nt}'
+            )
+
+        time_str = out.createVariable('time_str', str, ('nt',))
+        time_str.long_name = 'SWOT reach time string in UTC.'
+        time_str.source = self.obs_dict.get(str(reach), {}).get(
+            'time_str_source',
+            'unavailable',
+        )
+        time_str[:] = values
         
     def write_output(self):
         """Write data stored to NetCDF files for each reach"""
@@ -200,6 +228,7 @@ class Output:
              nt = out.createVariable("nt", "i4", ("nt",))
              nt.units = "time steps"
              nt[:] = range(self.obs_dict[reach]['nt'])
+             self._write_time_strings(out, reach)
 
              # 1 busboi
              gb = out.createGroup("busboi")

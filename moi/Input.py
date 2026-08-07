@@ -99,6 +99,70 @@ class Input:
         return np.asarray(values)
 
     @staticmethod
+    def _decode_time_strings(values, expected_size=None):
+        """Decode a SWOT ``time_str`` variable into one string per time step."""
+        raw = np.asarray(values)
+        if hasattr(values, 'filled'):
+            fill = b' ' if raw.dtype.kind == 'S' else ' '
+            raw = np.asarray(values.filled(fill))
+
+        # SWOT time strings are normally a two-dimensional S1 character array.
+        # netCDF4.chartostring preserves the leading time dimension and joins
+        # the trailing character dimension. VLEN strings arrive as 1-D values.
+        if raw.ndim >= 2 and raw.dtype.kind in ('S', 'U'):
+            try:
+                raw = np.asarray(chartostring(raw))
+            except (AttributeError, TypeError, ValueError):
+                pass
+        elif (
+            raw.ndim == 1
+            and expected_size == 1
+            and raw.size != 1
+            and raw.dtype.kind in ('S', 'U')
+        ):
+            raw = raw.reshape(1, -1)
+
+        def decode_one(value):
+            pieces = np.asarray(value).ravel() if isinstance(value, np.ndarray) else [value]
+            decoded = []
+            for piece in pieces:
+                if isinstance(piece, (bytes, np.bytes_)):
+                    decoded.append(bytes(piece).decode('utf-8', errors='replace'))
+                else:
+                    decoded.append(str(piece))
+            return ''.join(decoded).rstrip('\x00 ')
+
+        if raw.ndim == 0:
+            decoded = np.asarray([decode_one(raw.item())], dtype=str)
+        elif raw.ndim == 1:
+            decoded = np.asarray([decode_one(value) for value in raw], dtype=str)
+        else:
+            decoded = np.asarray([decode_one(row) for row in raw], dtype=str)
+
+        if expected_size is not None and decoded.size != int(expected_size):
+            raise ValueError(
+                'SWOT time_str length does not match nt: '
+                f'{decoded.size} != {int(expected_size)}'
+            )
+        return decoded
+
+    @staticmethod
+    def _time_strings_from_seconds(times):
+        """Build UTC ISO strings when an older SWOT file lacks ``time_str``."""
+        epoch = datetime.datetime(2000, 1, 1)
+        decoded = []
+        for seconds in np.asarray(times, dtype=float).ravel():
+            if not np.isfinite(seconds):
+                decoded.append('')
+                continue
+            try:
+                value = epoch + datetime.timedelta(seconds=float(seconds))
+                decoded.append(value.strftime('%Y-%m-%dT%H:%M:%SZ'))
+            except (OverflowError, ValueError):
+                decoded.append('')
+        return np.asarray(decoded, dtype=str)
+
+    @staticmethod
     def _read_reach_id_json(path):
         """Read a JSON list/dict of reach IDs into a normalized string set."""
         if path is None:
@@ -576,6 +640,20 @@ class Input:
             self.obs_dict[reach]['S'] = swot_dataset["reach/slope2"][0:nt].filled(np.nan)
             self.obs_dict[reach]['dA'] = swot_dataset["reach/d_x_area"][0:nt].filled(np.nan)
             self.obs_dict[reach]['t'] = swot_dataset["reach/time"][0:nt].filled(np.nan)
+            reach_group = swot_dataset['reach']
+            if 'time_str' in reach_group.variables:
+                self.obs_dict[reach]['time_str'] = self._decode_time_strings(
+                    reach_group['time_str'][0:nt],
+                    expected_size=nt,
+                )
+                self.obs_dict[reach]['time_str_source'] = 'SWOT reach/time_str'
+            else:
+                self.obs_dict[reach]['time_str'] = self._time_strings_from_seconds(
+                    self.obs_dict[reach]['t']
+                )
+                self.obs_dict[reach]['time_str_source'] = (
+                    'derived from SWOT reach/time'
+                )
 
             self.obs_dict[reach]['reach_q'] = swot_dataset["reach/reach_q"][0:nt].filled(np.nan)
             self.obs_dict[reach]['xovr_cal_q'] = swot_dataset["reach/xovr_cal_q"][0:nt].filled(np.nan)

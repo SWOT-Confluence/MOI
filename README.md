@@ -2,6 +2,13 @@
 
 MOI serves as the integrator module to the Confluence workflow. It extracts reach-level FLPE algorithm results and SoS data to integrate results on the basin-level. This module writes output to a specified output directory.
 
+Observed reach-level integrator NetCDF files include a root-level VLEN string
+variable `time_str(nt)`, copied from the corresponding SWOT
+`reach/time_str`. The complete pre-QC time axis is retained so each timestamp
+stays aligned with the final discharge arrays after rejected observations are
+restored as fill values. For older SWOT files without `time_str`, MOI derives
+UTC ISO timestamps from `reach/time`.
+
 ## Gage-constrained SFOI
 
 For `constrained` runs, MOI can read the Surface-water Validation System (SVS)
