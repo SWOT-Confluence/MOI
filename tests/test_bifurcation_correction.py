@@ -116,3 +116,28 @@ def test_cloned_child_area_is_not_special_cased():
     )
 
     np.testing.assert_allclose(problem['delta_A'][1:3], [400.0, 600.0])
+
+
+def test_soft_mass_uncertainty_is_an_explicit_absolute_sigma():
+    sword = _bifurcation_sword()
+    theta_floor = 5.0
+    mass_sigma = 12.0
+    problem = build_sparse_sfoi_problem(
+        reach_ids=['100', '110', '120', '130'],
+        sword_dict=sword,
+        junctions=_junctions(),
+        Qbar=np.array([100.0, 90.0, 10.0, 110.0]),
+        sigQ=np.full(4, 10.0),
+        facc=sword['facc'],
+        u_conversion=0.1,
+        params_dict={
+            'SFOI_Theta_Floor': theta_floor,
+            'SFOI_Soft_Mass_Sigma': mass_sigma,
+        },
+        prefix_len=1,
+    )
+
+    n_mass = problem['A_eq'].shape[0]
+    mass_cov = problem['cov_sfoi'][-n_mass:]
+    assert problem['soft_mass_sigma'] == mass_sigma
+    np.testing.assert_allclose(mass_cov * theta_floor, mass_sigma)

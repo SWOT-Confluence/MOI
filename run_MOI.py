@@ -52,11 +52,17 @@ def set_moi_params():
     """Initialize standard MOI parameters for SFOI."""
     return {
         'FLPE_Uncertainty': 0.67,
+        # SoS discharge used when an algorithm has no genuine FLPE estimate.
+        # It remains a prior row and is never bias/correlation augmented.
+        'Prior_Uncertainty': 0.60,
         'Gage_Uncertainty': 0.10,
         'Gage_Min_Matched_Samples': 1,
         'Gage_Match_SWOT_Days': True,
         'Gage_Allow_Full_Record_Fallback': False,
         'Fill_Uncertainty': 1.0,
+        # Soft mass rows target zero, so configure their uncertainty as an
+        # absolute discharge residual rather than a coefficient of variation.
+        'SFOI_Soft_Mass_Sigma': 5.0,
         # Bias-aware sparse SFOI. Bias is estimated independently for each
         # algorithm and applies only to FLPE discharge rows, never runoff,
         # mass-balance, or gage rows.
@@ -71,14 +77,23 @@ def set_moi_params():
         'SFOI_Correlation_Enabled': True,
         'SFOI_Correlation_Rho': 0.20,
         'SFOI_Correlation_Effect_Bound': 8.0,
-        'SFOI_Augmented_Maxiter': 30,
-        'SFOI_Augmented_Change_Thresh': 1.0e-5,
+        'SFOI_Augmented_Maxiter': 40,
+        # Component-specific convergence tolerances. The legacy aggregate
+        # threshold remains only as a backward-compatible fallback.
+        'SFOI_Augmented_Change_Thresh': 1.0e-2,
+        'SFOI_Augmented_Physical_RMS_Thresh': 1.0e-2,
+        'SFOI_Augmented_Physical_P95_Thresh': 2.0e-2,
+        'SFOI_Augmented_Bias_Thresh': 1.0e-3,
+        'SFOI_Augmented_Effect_Thresh': 1.0e-2,
+        'SFOI_Augmented_Robust_Thresh': 1.0e-3,
         'SFOI_Augmented_Robust_Damping': 0.50,
         # Progressively shorten a Gauss-Newton step when its direction strongly
         # opposes the preceding step (the signature of a period-two cycle).
         'SFOI_Augmented_Oscillation_Damping': 0.50,
         'SFOI_Augmented_Oscillation_Direction_Threshold': -0.50,
         'SFOI_Augmented_Minimum_Step_Relaxation': 0.05,
+        'SFOI_Augmented_Relaxation_Recovery': 1.25,
+        'SFOI_Augmented_Relaxation_Recovery_Patience': 3,
         'norm': 0.5,
         'rho': 0.7,
         'niter': 1,

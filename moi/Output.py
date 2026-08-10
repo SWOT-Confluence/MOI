@@ -73,6 +73,21 @@ class Output:
                     f'{prefix}_last_delta': diagnostic.get(
                         'last_delta', np.nan
                     ),
+                    f'{prefix}_last_physical_rms_delta': diagnostic.get(
+                        'last_physical_rms_delta', np.nan
+                    ),
+                    f'{prefix}_last_physical_p95_delta': diagnostic.get(
+                        'last_physical_p95_delta', np.nan
+                    ),
+                    f'{prefix}_last_raw_delta': diagnostic.get(
+                        'last_raw_delta', np.nan
+                    ),
+                    f'{prefix}_last_robust_delta': diagnostic.get(
+                        'last_robust_delta', np.nan
+                    ),
+                    f'{prefix}_final_reduced_chi_square': diagnostic.get(
+                        'final_So', np.nan
+                    ),
                 }
                 for variable_name, value in values.items():
                     variable = algorithm_group.createVariable(variable_name, 'f8')
@@ -94,6 +109,24 @@ class Output:
                     f'{prefix}_outer_iterations',
                     int(diagnostic.get('outer_iterations', 0)),
                 )
+                algorithm_group.setncattr(
+                    f'{prefix}_n_real_flpe_rows',
+                    int(diagnostic.get('n_real_flpe_rows', 0)),
+                )
+                algorithm_group.setncattr(
+                    f'{prefix}_oscillation_events',
+                    int(diagnostic.get('oscillation_events', 0)),
+                )
+                algorithm_group.setncattr(
+                    f'{prefix}_relaxation_recoveries',
+                    int(diagnostic.get('relaxation_recoveries', 0)),
+                )
+                thresholds = diagnostic.get('convergence_thresholds', {})
+                for threshold_name, threshold_value in thresholds.items():
+                    algorithm_group.setncattr(
+                        f'{prefix}_{threshold_name}_threshold',
+                        float(threshold_value),
+                    )
                 effects = diagnostic.get('correlation_effects', [])
                 algorithm_group.setncattr(
                     f'{prefix}_correlation_effects',

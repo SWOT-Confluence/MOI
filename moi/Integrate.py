@@ -3,6 +3,7 @@ import warnings
 import sys
 import datetime
 import csv
+import copy
 
 # Third-party imports
 import numpy as np
@@ -55,6 +56,7 @@ class Integrate:
             "q_mean": np.array([]),
             "gage_constraints": {},
             "bias_correction": {},
+            "solver_reuse": {},
             "flpe": {
                 "busboi" : np.array([]),
                 "hivdi" : np.array([]),
@@ -116,14 +118,33 @@ class Integrate:
             for reach in self.alg_dict[alg]:
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore", category=RuntimeWarning)
-                    if self.alg_dict[alg][reach].get('s1-flpe-exists', False):
-                        q_val = self.alg_dict[alg][reach].get('q', np.nan)
-                        self.alg_dict[alg][reach]['qbar'] = np.nanmean(q_val)
-                        self.alg_dict[alg][reach]['q33'] = np.nanquantile(q_val, .33)
-                    
-                    if np.isnan(self.alg_dict[alg][reach].get('qbar', np.nan)):
-                        self.alg_dict[alg][reach]['qbar'] = self.sos_dict[str(reach)].get('Qbar', np.nan)
-                        self.alg_dict[alg][reach]['q33'] = self.sos_dict[str(reach)].get('q33', np.nan)
+                    reach_data = self.alg_dict[alg][reach]
+                    has_flpe = bool(reach_data.get('s1-flpe-exists', False))
+                    qbar = np.nan
+                    q33 = np.nan
+                    if has_flpe:
+                        q_val = reach_data.get('q', np.nan)
+                        qbar = np.nanmean(q_val)
+                        q33 = np.nanquantile(q_val, .33)
+
+                    qbar_is_flpe = bool(has_flpe and np.isfinite(qbar))
+                    q33_is_flpe = bool(has_flpe and np.isfinite(q33))
+                    if not qbar_is_flpe:
+                        qbar = self.sos_dict[str(reach)].get('Qbar', np.nan)
+                    if not q33_is_flpe:
+                        q33 = self.sos_dict[str(reach)].get('q33', np.nan)
+
+                    reach_data['qbar'] = qbar
+                    reach_data['q33'] = q33
+                    # Preserve provenance after numerical fallback. Without
+                    # these fields, a finite SoS prior is indistinguishable
+                    # from a genuine FLPE estimate later in system assembly.
+                    reach_data['qbar_source'] = (
+                        'FLPE' if qbar_is_flpe else 'Prior'
+                    )
+                    reach_data['q33_source'] = (
+                        'FLPE' if q33_is_flpe else 'Prior'
+                    )
 
     @staticmethod
     def _swot_ordinal_days(times):
@@ -367,6 +388,58 @@ class Integrate:
             f'max={np.nanmax(finite):.6g}'
         )
 
+    @staticmethod
+    def _prior_only_solver_signature(
+        A,
+        L,
+        cov,
+        A_eq,
+        b_eq,
+        lb,
+        ub,
+        x0,
+        idxbad,
+        fixed_weight,
+        robust_eligible,
+    ):
+        """Return an exact signature for safe reuse of a prior-only solve.
+
+        The signature includes every numerical problem input. Two algorithm
+        labels therefore share a solver result only when they have no genuine
+        FLPE observations and their ordinary WLS systems are identical.
+        """
+
+        def dense_signature(values):
+            if values is None:
+                return None
+            array = np.ascontiguousarray(np.asarray(values))
+            return array.shape, array.dtype.str, array.tobytes()
+
+        def sparse_signature(matrix):
+            if matrix is None:
+                return None
+            matrix = sp.csr_matrix(matrix)
+            return (
+                matrix.shape,
+                matrix.indptr.tobytes(),
+                matrix.indices.tobytes(),
+                matrix.data.tobytes(),
+            )
+
+        return (
+            sparse_signature(A),
+            dense_signature(L),
+            dense_signature(cov),
+            sparse_signature(A_eq),
+            dense_signature(b_eq),
+            dense_signature(lb),
+            dense_signature(ub),
+            dense_signature(x0),
+            dense_signature(idxbad),
+            dense_signature(fixed_weight),
+            dense_signature(robust_eligible),
+        )
+
     def _print_initial_state(self, alg, FlowLevel, Qbar, sigQ, facc, datasource, problem):
         if not self.VerboseFlag:
             return
@@ -397,58 +470,65 @@ class Integrate:
 
 
     def initialize_integration_vars(self, alg, FlowLevel, PreviousResiduals, n):
-         self.GoodFLPE[alg] = True
-         Qbar = np.empty([n,])
-         sigQ = np.empty([n,])
-         facc = np.empty([n,])
-         runoff = np.empty([n,])
-         datasource = []
+        Qbar = np.full(n, np.nan, dtype=float)
+        sigQ = np.full(n, np.nan, dtype=float)
+        facc = np.full(n, np.nan, dtype=float)
+        runoff = np.full(n, np.nan, dtype=float)
+        datasource = []
+        prior_uncertainty = float(
+            self.params_dict.get(
+                'Prior_Uncertainty',
+                self.params_dict.get('FLPE_Uncertainty', 0.6),
+            )
+        )
 
-         i = 0
-         for reach in self.basin_dict['reach_ids_all']:
-            k = np.argwhere(self.sword_dict['reach_id'] == np.int64(reach))[0,0]
+        value_key = 'qbar' if FlowLevel == 'Mean' else 'q33'
+        source_key = 'qbar_source' if FlowLevel == 'Mean' else 'q33_source'
+        sos_key = 'Qbar' if FlowLevel == 'Mean' else 'q33'
+
+        for i, reach in enumerate(self.basin_dict['reach_ids_all']):
+            k = np.argwhere(self.sword_dict['reach_id'] == np.int64(reach))[0, 0]
             facc[i] = self.pull_sword_attributes_for_reach(k)['facc']
+            reach_data = self.alg_dict[alg].get(reach, {})
+            value = reach_data.get(value_key, np.nan)
+            if np.ma.is_masked(value):
+                value = np.nan
+            source = reach_data.get(source_key)
+            if source is None:
+                source = (
+                    'FLPE'
+                    if reach_data.get('s1-flpe-exists', False)
+                    and np.isfinite(value)
+                    else 'Prior'
+                )
 
-            if reach in self.alg_dict[alg].keys():
-                # Gages are intentionally not substituted here. The FLPE/fill
-                # observation remains in Qbar and gages are appended later as
-                # independent high-confidence rows in the SFOI system.
-                if FlowLevel == 'Mean':
-                    val = self.alg_dict[alg][reach].get('qbar', np.nan)
-                    if np.ma.is_masked(val):
-                        Qbar[i] = np.nan
-                    else:
-                        nstdev = 10.0
-                        sos_qbar = self.sos_dict.get(str(reach), {}).get('Qbar', np.nan)
-                        if (
-                            np.isfinite(val)
-                            and np.isfinite(sos_qbar)
-                            and abs(val - sos_qbar)
-                            > abs(sos_qbar) * self.params_dict['FLPE_Uncertainty'] * nstdev
-                        ):
-                            Qbar[i] = np.nan 
-                        else:
-                            Qbar[i] = val
-                elif FlowLevel == 'q33':
-                    try:
-                        val = self.alg_dict[alg][reach].get('q33', np.nan)
-                        if np.ma.is_masked(val):
-                            Qbar[i] = np.nan
-                        else:
-                            nstdev = 10.0
-                            sos_qbar = self.sos_dict.get(str(reach), {}).get('Qbar', np.nan)
-                            if (
-                                np.isfinite(val)
-                                and np.isfinite(sos_qbar)
-                                and abs(val - sos_qbar)
-                                > abs(sos_qbar) * self.params_dict['FLPE_Uncertainty'] * nstdev
-                            ):
-                                Qbar[i] = np.nan
-                            else:
-                                Qbar[i] = val
-                    except Exception:
-                        Qbar[i] = np.nan
+            prior_value = self.sos_dict.get(str(reach), {}).get(sos_key, np.nan)
+            if np.ma.is_masked(prior_value):
+                prior_value = np.nan
 
+            # Screen only genuine FLPE estimates. If one fails, fall back to
+            # the named SoS prior and preserve that provenance explicitly.
+            if source == 'FLPE':
+                nstdev = 10.0
+                if (
+                    not np.isfinite(value)
+                    or (
+                        np.isfinite(prior_value)
+                        and abs(value - prior_value)
+                        > abs(prior_value)
+                        * self.params_dict.get('FLPE_Uncertainty', 0.6)
+                        * nstdev
+                    )
+                ):
+                    value = prior_value
+                    source = 'Prior'
+            elif not np.isfinite(value):
+                value = prior_value
+
+            Qbar[i] = value
+            datasource.append(source if np.isfinite(value) else 'None')
+
+            if source == 'FLPE' and np.isfinite(value):
                 if facc[i] > 5000:
                     dynamic_unc = 0.20
                 elif facc[i] > 500:
@@ -460,55 +540,51 @@ class Integrate:
                     self.params_dict.get('use_previous_residual_weighting', False)
                     and not np.isnan(PreviousResiduals[alg][i])
                 ):
-                    raw_sig = max(abs(PreviousResiduals[alg][i]), abs(Qbar[i]) * 0.01) ** (
-                        -(self.params_dict.get('norm', 2.0) - 2.0)
-                    )
+                    raw_sig = max(
+                        abs(PreviousResiduals[alg][i]), abs(Qbar[i]) * 0.01
+                    ) ** (-(self.params_dict.get('norm', 2.0) - 2.0))
                     sigQ[i] = min(raw_sig, abs(Qbar[i]) * dynamic_unc * 2.0)
                 else:
                     sigQ[i] = abs(Qbar[i]) * dynamic_unc
+            elif np.isfinite(value):
+                sigQ[i] = abs(Qbar[i]) * prior_uncertainty
 
-                datasource.append('FLPE')
-            else:
-                 Qbar[i] = np.nan
-                 sigQ[i] = np.nan
-                 datasource.append('None')
-            i += 1
- 
-         for i in range(n):
-             if not np.isnan(Qbar[i]) and facc[i] > 0:
-                 runoff[i] = Qbar[i] / facc[i] / 1000**2 * 86400 * 365
-             else:
-                 runoff[i] = np.nan
+        valid = np.isfinite(Qbar) & np.isfinite(facc) & (facc > 0)
+        runoff[valid] = Qbar[valid] / facc[valid] / 1000**2 * 86400 * 365
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', category=RuntimeWarning)
+            runoff_avg = np.nanmean(runoff)
+        if not np.isfinite(runoff_avg):
+            runoff_avg = 315.36
 
-         with warnings.catch_warnings():
-             warnings.simplefilter("ignore", category=RuntimeWarning)
-             runoff_avg = np.nanmean(runoff)
-         
-         if np.isnan(runoff_avg) or np.isinf(runoff_avg):
-             runoff_avg = 315.36 # fallback
+        for i in range(n):
+            if not np.isfinite(Qbar[i]):
+                Qbar[i] = runoff_avg * facc[i] * 1000**2 / 86400 / 365
+                sigQ[i] = Qbar[i] * self.params_dict.get('Fill_Uncertainty', 1.0)
+                datasource[i] = 'Fill'
 
-         for i in range(n):
-             if np.isnan(Qbar[i]) or np.isinf(Qbar[i]):
-                 Qbar[i] = runoff_avg * facc[i] * 1000**2 / 86400 / 365
-                 sigQ[i] = Qbar[i] * self.params_dict.get('Fill_Uncertainty', 0.5)
-                 datasource[i] = 'Fill'
-
-         bignumber = 1e9
-         sigQmin = 10.
-         for i in range(n):
-             if Qbar[i] == 0. and np.isnan(PreviousResiduals[alg][i]):
-                 sigQ[i] = bignumber
-             if sigQ[i] < sigQmin:
+        bignumber = 1.0e9
+        sigQmin = 10.0
+        for i in range(n):
+            if Qbar[i] == 0.0 and np.isnan(PreviousResiduals[alg][i]):
+                sigQ[i] = bignumber
+            if sigQ[i] < sigQmin:
                 sigQ[i] = sigQmin
-             if np.isinf(PreviousResiduals[alg][i]):
-                 Qbar[i] = 5.
-                 sigQ[i] = 0.1
+            if np.isinf(PreviousResiduals[alg][i]):
+                Qbar[i] = 5.0
+                sigQ[i] = 0.1
 
-         iFLPE = np.where(np.array(datasource) == 'FLPE')
-         FLPE_Data_OK = not np.all(Qbar[iFLPE] == 0)
-         self.GoodFLPE[alg] = FLPE_Data_OK
-
-         return Qbar, sigQ, FLPE_Data_OK, facc, datasource
+        real_flpe_mask = np.asarray(datasource, dtype=str) == 'FLPE'
+        self.GoodFLPE[alg] = bool(np.any(real_flpe_mask))
+        input_data_ok = bool(np.all(np.isfinite(Qbar)) and np.all(np.isfinite(sigQ)))
+        return (
+            Qbar,
+            sigQ,
+            input_data_ok,
+            facc,
+            datasource,
+            real_flpe_mask,
+        )
 
     @staticmethod
     def _require_converged_augmented_result(result):
@@ -520,7 +596,9 @@ class Integrate:
                 f'last_delta={result.delta[-1] if result.delta else np.nan}'
             )
 
-    def _augmented_solver_features(self, FlowLevel, n_gage_rows):
+    def _augmented_solver_features(
+        self, FlowLevel, n_gage_rows, n_real_flpe_rows=None
+    ):
         """Enable bias/correlation only where calibration gages identify them.
 
         An ungaged basin has no independent observation that can distinguish a
@@ -543,6 +621,10 @@ class Integrate:
             self.Branch == 'constrained'
             and int(n_gage_rows) > 0
             and FlowLevel in configured_levels
+            and (
+                n_real_flpe_rows is None
+                or int(n_real_flpe_rows) > 0
+            )
         )
         bias_enabled = (
             has_identifying_gage
@@ -567,11 +649,21 @@ class Integrate:
         multiplicative-error outer loop and robust outlier inner loop.
         """
         residuals = {}
+        prior_only_solver_cache = {}
         for alg in self.alg_dict:
             if self.VerboseFlag:
                 print(f'    RUNNING SPARSE PAPER-SFOI for {alg} ({FlowLevel})')
 
-            Qbar, sigQ, FLPE_Data_OK, facc, datasource = self.initialize_integration_vars(alg, FlowLevel, PreviousResiduals, n)
+            (
+                Qbar,
+                sigQ,
+                input_data_ok,
+                facc,
+                datasource,
+                real_flpe_mask,
+            ) = self.initialize_integration_vars(
+                alg, FlowLevel, PreviousResiduals, n
+            )
             u_conversion = 1000.0 / (365.25 * 24 * 3600)
 
             problem = self.build_soft_sfoi_system(n, Qbar, sigQ, facc, u_conversion)
@@ -586,7 +678,7 @@ class Integrate:
             bias_enabled = False
             correlation_enabled = False
 
-            if FLPE_Data_OK and self.junctions_valid:
+            if input_data_ok and self.junctions_valid:
                 try:
                     use_hard_mass = bool(self.params_dict.get('SFOI_Hard_Mass', False))
                     if use_hard_mass:
@@ -637,16 +729,48 @@ class Integrate:
                         self._augmented_solver_features(
                             FlowLevel,
                             gage_obs['A'].shape[0],
+                            int(np.sum(real_flpe_mask)),
                         )
                     )
 
-                    if bias_enabled or correlation_enabled:
+                    cache_key = None
+                    reused_from_algorithm = None
+                    if not np.any(real_flpe_mask):
+                        cache_key = self._prior_only_solver_signature(
+                            solver_A,
+                            solver_L,
+                            solver_cov,
+                            solver_A_eq,
+                            solver_b_eq,
+                            problem['lb'],
+                            problem.get('ub', None),
+                            problem['x0'],
+                            problem.get('idxbad', None),
+                            fixed_weight,
+                            robust_eligible,
+                        )
+                        cached = prior_only_solver_cache.get(cache_key)
+                        if cached is not None:
+                            result = copy.deepcopy(cached['result'])
+                            reused_from_algorithm = cached['algorithm']
+                            result.reused_from_algorithm = reused_from_algorithm
+                            self.integ_dict.setdefault('solver_reuse', {}).setdefault(
+                                FlowLevel, {}
+                            )[alg] = reused_from_algorithm
+                            if self.VerboseFlag:
+                                print(
+                                    '      [solver] prior-only inputs match '
+                                    f'{reused_from_algorithm}; reusing its result for {alg}'
+                                )
+
+                    if result is None and (bias_enabled or correlation_enabled):
                         result = adjust_lsq_bias_correlated_sparse(
                             A_obs=solver_A,
                             L=solver_L,
                             cov=solver_cov,
                             n_reaches=n,
                             n_regions=problem['K_regions'],
+                            flpe_eligible_mask=real_flpe_mask,
                             correlation_groups=problem['reach_regions'],
                             correlation_rho=(
                                 self.params_dict.get('SFOI_Correlation_Rho', 0.20)
@@ -671,10 +795,25 @@ class Integrate:
                             ub=problem.get('ub', None),
                             x0=problem['x0'],
                             maxiter=self.params_dict.get(
-                                'SFOI_Augmented_Maxiter', 30
+                                'SFOI_Augmented_Maxiter', 40
                             ),
                             change_thresh=self.params_dict.get(
-                                'SFOI_Augmented_Change_Thresh', 1.0e-5
+                                'SFOI_Augmented_Change_Thresh', 1.0e-2
+                            ),
+                            physical_rms_thresh=self.params_dict.get(
+                                'SFOI_Augmented_Physical_RMS_Thresh', 1.0e-2
+                            ),
+                            physical_p95_thresh=self.params_dict.get(
+                                'SFOI_Augmented_Physical_P95_Thresh', 2.0e-2
+                            ),
+                            bias_thresh=self.params_dict.get(
+                                'SFOI_Augmented_Bias_Thresh', 1.0e-3
+                            ),
+                            effect_thresh=self.params_dict.get(
+                                'SFOI_Augmented_Effect_Thresh', 1.0e-2
+                            ),
+                            robust_thresh=self.params_dict.get(
+                                'SFOI_Augmented_Robust_Thresh', 1.0e-3
                             ),
                             robust_limit=self.params_dict.get(
                                 'SFOI_Outlier_Limit', 2.5
@@ -693,6 +832,12 @@ class Integrate:
                             minimum_step_relaxation=self.params_dict.get(
                                 'SFOI_Augmented_Minimum_Step_Relaxation', 0.05
                             ),
+                            relaxation_recovery=self.params_dict.get(
+                                'SFOI_Augmented_Relaxation_Recovery', 1.25
+                            ),
+                            relaxation_recovery_patience=self.params_dict.get(
+                                'SFOI_Augmented_Relaxation_Recovery_Patience', 3
+                            ),
                             theta_floor=self.params_dict.get(
                                 'SFOI_Theta_Floor', 5.0
                             ),
@@ -701,7 +846,7 @@ class Integrate:
                             robust_eligible_mask=robust_eligible,
                             verbose=self.VerboseFlag,
                         )
-                    else:
+                    elif result is None:
                         result = adjust_lsq_mult_sparse(
                             A_obs=solver_A,
                             L=solver_L,
@@ -736,6 +881,12 @@ class Integrate:
                             robust_eligible_mask=robust_eligible,
                         )
 
+                    if cache_key is not None and reused_from_algorithm is None:
+                        prior_only_solver_cache[cache_key] = {
+                            'algorithm': alg,
+                            'result': copy.deepcopy(result),
+                        }
+
                     if (
                         (bias_enabled or correlation_enabled)
                     ):
@@ -752,6 +903,11 @@ class Integrate:
                         )
                         Success = True
                         if hasattr(result, 'bias'):
+                            final_iteration = (
+                                result.diagnostics[-1]
+                                if result.diagnostics
+                                else {}
+                            )
                             bias_diagnostic = {
                                 'flow_level': FlowLevel,
                                 'enabled': bool(result.bias_enabled),
@@ -770,8 +926,32 @@ class Integrate:
                                     if result.delta
                                     else np.nan
                                 ),
+                                'last_physical_rms_delta': float(
+                                    final_iteration.get('physical_delta', np.nan)
+                                ),
+                                'last_physical_p95_delta': float(
+                                    final_iteration.get(
+                                        'physical_p95_delta', np.nan
+                                    )
+                                ),
+                                'last_raw_delta': float(
+                                    final_iteration.get('raw_delta', np.nan)
+                                ),
+                                'last_robust_delta': float(
+                                    final_iteration.get('robust_delta', np.nan)
+                                ),
+                                'final_So': float(result.So),
+                                'n_real_flpe_rows': int(
+                                    np.sum(real_flpe_mask)
+                                ),
+                                'convergence_thresholds': dict(
+                                    getattr(result, 'convergence_thresholds', {})
+                                ),
                                 'oscillation_events': int(
                                     getattr(result, 'oscillation_events', 0)
+                                ),
+                                'relaxation_recoveries': int(
+                                    getattr(result, 'relaxation_recoveries', 0)
                                 ),
                                 'final_step_relaxation': float(
                                     getattr(result, 'step_relaxation', 1.0)

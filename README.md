@@ -52,6 +52,10 @@ are reach IDs.
 
 ## Bias augmentation and correlated FLPE errors
 
+The complete equations, convergence definitions, parameter defaults, and code
+map are documented in
+[`docs/SFOI_MATHEMATICAL_MODEL.md`](docs/SFOI_MATHEMATICAL_MODEL.md).
+
 Constrained Mean-flow runs estimate one systematic multiplicative FLPE bias for
 each algorithm:
 
@@ -59,13 +63,12 @@ each algorithm:
 Q_FLPE_i = (1 + bias) * Q_physical_i + error_i
 ```
 
-The augmented Jacobian applies this bias to the first reach-prior rows. In the
-rolled-back baseline, missing FLPE values are filled before system assembly, so
-those rows currently include Fill priors as well as true FLPE priors. Runoff,
-mass-balance, and gage rows remain unbiased. Separating Fill from true FLPE rows
-would change the statistical model and is intentionally outside this rollback.
-A positive estimate means that the affected prior is systematically high; for
-example, `bias = 0.20` corresponds to a direct debiasing factor of `1 / 1.20`.
+The augmented Jacobian applies this bias only to reach rows backed by genuine
+FLPE data. Missing/invalid FLPE values use a separately labeled SoS Prior, then
+a runoff-derived Fill if necessary; neither receives bias or regional
+correlation. Runoff, mass-balance, and gage rows also remain unbiased. A
+positive estimate means the FLPE estimate is systematically high; for example,
+`bias = 0.20` corresponds to a direct debiasing factor of `1 / 1.20`.
 
 Random FLPE errors can be correlated within the runoff regions already built by
 MOI. The implementation uses one penalized Gaussian latent effect per region:
@@ -94,8 +97,14 @@ The default settings are deliberately conservative:
 - when consecutive augmented Gauss-Newton steps point in strongly opposite
   directions, the new step is progressively under-relaxed (default factor
   `0.5`) to collapse period-two oscillations toward their midpoint;
-- an augmented solve that reaches `maxiter` without satisfying both state and
-  robust-weight tolerances is rejected before NetCDF export.
+- relaxation recovers by a factor of `1.25` after three stable directions;
+- convergence requires both raw and applied physical RMS/p95, bias, regional
+  effect, and robust-factor deltas to satisfy their component-specific
+  tolerances;
+- an augmented solve that reaches `maxiter` without satisfying all gates is
+  rejected before NetCDF export;
+- algorithms with no genuine FLPE data reuse an identical prior-only ordinary
+  solve instead of repeating it under different algorithm labels.
 
 Runtime overrides are available:
 

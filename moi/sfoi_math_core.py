@@ -364,8 +364,19 @@ def build_sparse_sfoi_problem(
     cov_obs = np.concatenate([covQ, covR])
 
     # Equality-style mass rows are kept as diagnostics and can also be used as
-    # Mike-style soft observation rows by appending them to A_obs.
-    mass_cv = float(params_dict.get('SFOI_Mass_CV', params_dict.get('SFOI_Soft_Mass_CV', 1.0)))
+    # Mike-style soft observation rows by appending them to A_obs. Their target
+    # is zero, so a relative CV is not statistically meaningful. Encode an
+    # explicit absolute sigma through the solver's multiplicative theta floor.
+    theta_floor = max(float(params_dict.get('SFOI_Theta_Floor', 5.0)), 1.0e-6)
+    legacy_mass_cv = float(
+        params_dict.get('SFOI_Mass_CV', params_dict.get('SFOI_Soft_Mass_CV', 1.0))
+    )
+    soft_mass_sigma = float(
+        params_dict.get('SFOI_Soft_Mass_Sigma', legacy_mass_cv * theta_floor)
+    )
+    if not np.isfinite(soft_mass_sigma) or soft_mass_sigma <= 0:
+        raise ValueError('SFOI_Soft_Mass_Sigma must be finite and positive')
+    mass_cov_at_floor = soft_mass_sigma / theta_floor
 
     # Equality constraints for dependent reaches only.
     reach_index = _build_reach_index(reach_list)
@@ -406,7 +417,9 @@ def build_sparse_sfoi_problem(
 
     A_sfoi = sp.vstack([A_obs, A_eq], format='csr') if A_eq.shape[0] > 0 else A_obs
     L_sfoi = np.concatenate([L_obs, np.zeros(A_eq.shape[0], dtype=float)])
-    cov_sfoi = np.concatenate([cov_obs, np.full(A_eq.shape[0], mass_cv, dtype=float)])
+    cov_sfoi = np.concatenate(
+        [cov_obs, np.full(A_eq.shape[0], mass_cov_at_floor, dtype=float)]
+    )
 
     # Nonnegative variables. Optional q minimum can be provided, but default is 0.
     q_min = float(params_dict.get('SFOI_Q_Min', 0.0))
@@ -438,6 +451,7 @@ def build_sparse_sfoi_problem(
         'upstream_contribs': upstream_contribs,
         'u_conversion': u_conversion,
         'R_prior': R_prior,
+        'soft_mass_sigma': soft_mass_sigma,
     }
 
 
@@ -907,6 +921,7 @@ def adjust_lsq_bias_correlated_sparse(
     cov: np.ndarray,
     n_reaches: int,
     n_regions: int,
+    flpe_eligible_mask: Optional[np.ndarray] = None,
     correlation_groups: Optional[Sequence[int]] = None,
     correlation_rho: float = 0.0,
     bias_enabled: bool = True,
@@ -922,12 +937,19 @@ def adjust_lsq_bias_correlated_sparse(
     x0: Optional[np.ndarray] = None,
     maxiter: int = 30,
     change_thresh: float = 1.0e-5,
+    physical_rms_thresh: Optional[float] = None,
+    physical_p95_thresh: Optional[float] = None,
+    bias_thresh: Optional[float] = None,
+    effect_thresh: Optional[float] = None,
+    robust_thresh: Optional[float] = None,
     robust_limit: float = 3.0,
     alpha: float = 0.05,
     robust_damping: float = 0.5,
     oscillation_damping: float = 0.5,
     oscillation_direction_threshold: float = -0.5,
     minimum_step_relaxation: float = 0.05,
+    relaxation_recovery: float = 1.25,
+    relaxation_recovery_patience: int = 3,
     theta_floor: float = 5.0,
     w_max: Optional[float] = 1.0e6,
     fixed_weight_mask: Optional[np.ndarray] = None,
@@ -936,9 +958,10 @@ def adjust_lsq_bias_correlated_sparse(
 ) -> SparseSFOIResult:
     """Estimate physical flow, systematic FLPE bias, and sparse correlation effects.
 
-    The first ``n_reaches`` rows of ``A_obs`` must be the FLPE discharge
-    observations and the first ``n_reaches`` state variables must be physical
-    reach discharge. Only those rows receive the multiplicative bias:
+    The first ``n_reaches`` rows of ``A_obs`` are reach-discharge priors and the
+    first ``n_reaches`` state variables are physical reach discharge. Only rows
+    selected by ``flpe_eligible_mask`` are genuine FLPE observations and receive
+    the multiplicative bias/correlation augmentation:
 
         Q_flpe_i = (1 + b) Q_i + error_i.
 
@@ -954,7 +977,9 @@ def adjust_lsq_bias_correlated_sparse(
     equivalent to block equicorrelation after marginalizing the latent effects,
     while preserving the sparse design needed for large basins.
 
-    Variance scales are frozen during each Gauss-Newton/IRLS step. Gage and soft
+    Prior/Fill discharge rows, runoff, mass-balance, and gage rows remain
+    unbiased and uncorrelated. Variance scales are frozen during each
+    Gauss-Newton/IRLS step. Gage and soft
     mass rows can be protected with ``fixed_weight_mask`` and
     ``robust_eligible_mask``. Robust downweighting is applied only when the
     global statistic is above the upper chi-square bound; low statistics cause
@@ -962,6 +987,15 @@ def adjust_lsq_bias_correlated_sparse(
     consecutive Gauss-Newton directions indicate a fixed-point oscillation.
     Those steps are progressively under-relaxed, which collapses a period-two
     cycle toward its midpoint while preserving bounds and linear constraints.
+    After several non-oscillating iterations, relaxation recovers gradually
+    toward one.
+
+    Convergence is component-wise rather than controlled by one numerically
+    arbitrary delta. Both the raw Gauss-Newton candidate and the applied
+    (possibly relaxed) step must satisfy physical RMS, physical p95, bias, and
+    regional-effect tolerances; robust weights must satisfy their own tolerance.
+    ``change_thresh`` remains as a backward-compatible fallback for callers that
+    do not supply the component thresholds.
     """
     A_obs = sp.csr_matrix(A_obs, dtype=float)
     L = _clean_vector('L', L)
@@ -976,6 +1010,19 @@ def adjust_lsq_bias_correlated_sparse(
         raise ValueError('physical state must be [Q_reaches, R_regions]')
     if n_obs < n_reaches:
         raise ValueError('A_obs does not contain all FLPE discharge rows')
+
+    if flpe_eligible_mask is None:
+        flpe_eligible = np.ones(n_reaches, dtype=bool)
+    else:
+        flpe_eligible = np.asarray(flpe_eligible_mask, dtype=bool).ravel()
+        if flpe_eligible.size != n_reaches:
+            raise ValueError(
+                'flpe_eligible_mask must contain one value per reach row'
+            )
+
+    if bias_enabled and not np.any(flpe_eligible):
+        raise ValueError('bias augmentation requires at least one genuine FLPE row')
+    flpe_rows = np.flatnonzero(flpe_eligible)
 
     rho = float(correlation_rho)
     if not 0.0 <= rho < 1.0:
@@ -998,27 +1045,58 @@ def adjust_lsq_bias_correlated_sparse(
             )
     robust_eligible &= ~fixed_weight
 
+    use_correlation = rho > 0.0
+    if use_correlation and not np.any(flpe_eligible):
+        raise ValueError('correlation augmentation requires genuine FLPE rows')
+
     if correlation_groups is None:
-        group_index = np.zeros(n_reaches, dtype=int)
+        raw_groups = np.zeros(n_reaches, dtype=int)
     else:
         raw_groups = np.asarray(correlation_groups).ravel()
         if raw_groups.size != n_reaches:
             raise ValueError(
                 'correlation_groups must have one entry per discharge reach'
             )
-        _, group_index = np.unique(raw_groups, return_inverse=True)
-        group_index = np.asarray(group_index, dtype=int)
 
-    use_correlation = rho > 0.0
-    n_correlation_groups = (
-        int(np.max(group_index)) + 1 if use_correlation and group_index.size else 0
-    )
+    # A Prior/Fill reach receives no latent correlation effect. Group indices
+    # are therefore compacted over genuine FLPE rows only; -1 marks ineligible
+    # reach rows in result diagnostics.
+    group_index = np.full(n_reaches, -1, dtype=int)
+    if use_correlation:
+        _, eligible_inverse = np.unique(
+            raw_groups[flpe_eligible], return_inverse=True
+        )
+        group_index[flpe_eligible] = np.asarray(eligible_inverse, dtype=int)
+        n_correlation_groups = int(np.max(eligible_inverse)) + 1
+    else:
+        n_correlation_groups = 0
     n_bias = 1 if bias_enabled else 0
     bias_index = n_physical if bias_enabled else None
     effect_start = n_physical + n_bias
     n_augmented = effect_start + n_correlation_groups
 
     theta_floor = max(float(theta_floor), 1.0e-6)
+    fallback_thresh = float(change_thresh)
+    component_thresholds = {
+        'physical_rms': float(
+            fallback_thresh if physical_rms_thresh is None else physical_rms_thresh
+        ),
+        'physical_p95': float(
+            fallback_thresh if physical_p95_thresh is None else physical_p95_thresh
+        ),
+        'bias': float(fallback_thresh if bias_thresh is None else bias_thresh),
+        'effect': float(
+            fallback_thresh if effect_thresh is None else effect_thresh
+        ),
+        'robust': float(
+            fallback_thresh if robust_thresh is None else robust_thresh
+        ),
+    }
+    if any(
+        not np.isfinite(value) or value <= 0
+        for value in component_thresholds.values()
+    ):
+        raise ValueError('all augmented convergence thresholds must be positive')
     robust_damping = float(np.clip(robust_damping, 0.0, 1.0))
     oscillation_damping = float(oscillation_damping)
     if not 0.0 < oscillation_damping <= 1.0:
@@ -1033,6 +1111,12 @@ def adjust_lsq_bias_correlated_sparse(
         raise ValueError(
             'minimum_step_relaxation must satisfy 0 < value <= 1'
         )
+    relaxation_recovery = float(relaxation_recovery)
+    if relaxation_recovery < 1.0 or not np.isfinite(relaxation_recovery):
+        raise ValueError('relaxation_recovery must be finite and >= 1')
+    relaxation_recovery_patience = int(relaxation_recovery_patience)
+    if relaxation_recovery_patience < 1:
+        raise ValueError('relaxation_recovery_patience must be >= 1')
     effect_bound = max(float(correlation_effect_bound), 1.0)
 
     if x0 is None:
@@ -1107,6 +1191,8 @@ def adjust_lsq_bias_correlated_sparse(
     previous_step_direction = None
     step_relaxation = 1.0
     oscillation_events = 0
+    relaxation_recoveries = 0
+    stable_relaxation_iterations = 0
 
     def assemble_state(
         physical: np.ndarray,
@@ -1127,7 +1213,8 @@ def adjust_lsq_bias_correlated_sparse(
     ) -> Tuple[np.ndarray, np.ndarray]:
         theta = np.asarray(A_obs @ physical).ravel()
         if bias_enabled:
-            theta[:n_reaches] = (1.0 + bias_value) * physical[:n_reaches]
+            theta[:n_reaches] = physical[:n_reaches]
+            theta[flpe_rows] *= 1.0 + bias_value
         else:
             theta[:n_reaches] = physical[:n_reaches]
 
@@ -1138,7 +1225,7 @@ def adjust_lsq_bias_correlated_sparse(
 
         sigma_independent = sigma.copy()
         if use_correlation:
-            sigma_independent[:n_reaches] *= np.sqrt(1.0 - rho)
+            sigma_independent[flpe_rows] *= np.sqrt(1.0 - rho)
         return sigma, sigma_independent
 
     def prediction(
@@ -1150,12 +1237,12 @@ def adjust_lsq_bias_correlated_sparse(
         fitted = np.asarray(A_obs @ physical).ravel()
         fitted[:n_reaches] = physical[:n_reaches]
         if bias_enabled:
-            fitted[:n_reaches] *= 1.0 + bias_value
+            fitted[flpe_rows] *= 1.0 + bias_value
         if n_correlation_groups:
-            fitted[:n_reaches] += (
-                sigma[:n_reaches]
+            fitted[flpe_rows] += (
+                sigma[flpe_rows]
                 * np.sqrt(rho)
-                * correlation_effects[group_index]
+                * correlation_effects[group_index[flpe_rows]]
             )
         return fitted
 
@@ -1168,7 +1255,7 @@ def adjust_lsq_bias_correlated_sparse(
 
         J_x = A_obs.tolil(copy=True)
         if bias_enabled:
-            for row in range(n_reaches):
+            for row in flpe_rows:
                 J_x.data[row] = [
                     (1.0 + bias) * value for value in J_x.data[row]
                 ]
@@ -1178,8 +1265,8 @@ def adjust_lsq_bias_correlated_sparse(
         if bias_enabled:
             J_bias = sp.csr_matrix(
                 (
-                    x_physical[:n_reaches],
-                    (np.arange(n_reaches), np.zeros(n_reaches, dtype=int)),
+                    x_physical[flpe_rows],
+                    (flpe_rows, np.zeros(flpe_rows.size, dtype=int)),
                 ),
                 shape=(n_obs, 1),
             )
@@ -1187,8 +1274,8 @@ def adjust_lsq_bias_correlated_sparse(
         if n_correlation_groups:
             J_effect = sp.csr_matrix(
                 (
-                    sigma_marginal[:n_reaches] * np.sqrt(rho),
-                    (np.arange(n_reaches), group_index),
+                    sigma_marginal[flpe_rows] * np.sqrt(rho),
+                    (flpe_rows, group_index[flpe_rows]),
                 ),
                 shape=(n_obs, n_correlation_groups),
             )
@@ -1281,13 +1368,16 @@ def adjust_lsq_bias_correlated_sparse(
         raw_physical_scale = np.maximum(
             np.abs(z_candidate[:n_physical]), theta_floor
         )
-        raw_physical_delta = float(
-            np.sqrt(
-                np.mean(
-                    (raw_step[:n_physical] / raw_physical_scale) ** 2
-                )
-            )
+        raw_physical_relative = np.abs(
+            raw_step[:n_physical] / raw_physical_scale
         )
+        raw_physical_delta = float(
+            np.sqrt(np.mean(raw_physical_relative ** 2))
+        )
+        raw_physical_p95_delta = float(
+            np.percentile(raw_physical_relative, 95)
+        )
+        raw_physical_max_delta = float(np.max(raw_physical_relative))
         raw_bias_delta = (
             abs(float(raw_step[bias_index])) if bias_enabled else 0.0
         )
@@ -1303,6 +1393,7 @@ def adjust_lsq_bias_correlated_sparse(
         )
         direction_cosine = np.nan
         oscillation_detected = False
+        relaxation_recovered = False
         if previous_step_direction is not None and raw_direction_norm > _EPS:
             previous_norm = float(np.linalg.norm(previous_step_direction))
             if previous_norm > _EPS:
@@ -1313,10 +1404,23 @@ def adjust_lsq_bias_correlated_sparse(
                 if direction_cosine <= oscillation_direction_threshold:
                     oscillation_detected = True
                     oscillation_events += 1
+                    stable_relaxation_iterations = 0
                     step_relaxation = max(
                         minimum_step_relaxation,
                         step_relaxation * oscillation_damping,
                     )
+
+        if not oscillation_detected and step_relaxation < 1.0:
+            stable_relaxation_iterations += 1
+            if stable_relaxation_iterations >= relaxation_recovery_patience:
+                recovered = min(1.0, step_relaxation * relaxation_recovery)
+                relaxation_recovered = recovered > step_relaxation
+                step_relaxation = recovered
+                stable_relaxation_iterations = 0
+                if relaxation_recovered:
+                    relaxation_recoveries += 1
+        elif step_relaxation >= 1.0:
+            stable_relaxation_iterations = 0
 
         z_next = z_current + step_relaxation * raw_step
         z_next = np.minimum(np.maximum(z_next, augmented_lb), augmented_ub)
@@ -1338,9 +1442,10 @@ def adjust_lsq_bias_correlated_sparse(
         )
 
         physical_scale = np.maximum(np.abs(x_next), theta_floor)
-        physical_delta = float(
-            np.sqrt(np.mean(((x_next - x_physical) / physical_scale) ** 2))
-        )
+        physical_relative = np.abs((x_next - x_physical) / physical_scale)
+        physical_delta = float(np.sqrt(np.mean(physical_relative ** 2)))
+        physical_p95_delta = float(np.percentile(physical_relative, 95))
+        physical_max_delta = float(np.max(physical_relative))
         bias_delta = abs(bias_next - bias) if bias_enabled else 0.0
         effect_delta = (
             float(np.sqrt(np.mean((effects_next - effects) ** 2)))
@@ -1407,12 +1512,20 @@ def adjust_lsq_bias_correlated_sparse(
             'outer': outer,
             'delta': iteration_delta,
             'physical_delta': physical_delta,
+            'physical_p95_delta': physical_p95_delta,
+            'physical_max_delta': physical_max_delta,
             'bias_delta': bias_delta,
             'effect_delta': effect_delta,
             'raw_delta': raw_iteration_delta,
+            'raw_physical_delta': raw_physical_delta,
+            'raw_physical_p95_delta': raw_physical_p95_delta,
+            'raw_physical_max_delta': raw_physical_max_delta,
+            'raw_bias_delta': raw_bias_delta,
+            'raw_effect_delta': raw_effect_delta,
             'direction_cosine': direction_cosine,
             'oscillation_detected': oscillation_detected,
             'step_relaxation': step_relaxation,
+            'relaxation_recovered': relaxation_recovered,
             'robust_delta': robust_delta,
             'So': So,
             'chi2_stat': chi2_stat,
@@ -1429,6 +1542,9 @@ def adjust_lsq_bias_correlated_sparse(
             print(
                 '      [bias-correlation] '
                 f'iter={outer + 1}, delta={iteration_delta:.6g}, '
+                f'physical_rms={physical_delta:.6g}, '
+                f'physical_p95={physical_p95_delta:.6g}, '
+                f'raw={raw_iteration_delta:.6g}, robust={robust_delta:.6g}, '
                 f'bias={bias:.6g}, So={So:.6g}, '
                 f'downweighted={diagnostic["n_downweighted"]}, '
                 f'rho={rho:.3g}, relaxation={step_relaxation:.3g}, '
@@ -1443,10 +1559,33 @@ def adjust_lsq_bias_correlated_sparse(
         final_design = J_fit
         final_weights = weights_fit
 
+        # A relaxed step is not allowed to manufacture convergence: each state
+        # component must pass for both the raw candidate and the applied step.
+        physical_converged = (
+            physical_delta < component_thresholds['physical_rms']
+            and raw_physical_delta < component_thresholds['physical_rms']
+            and physical_p95_delta < component_thresholds['physical_p95']
+            and raw_physical_p95_delta < component_thresholds['physical_p95']
+        )
+        bias_converged = (
+            bias_delta < component_thresholds['bias']
+            and raw_bias_delta < component_thresholds['bias']
+        )
+        effect_converged = (
+            effect_delta < component_thresholds['effect']
+            and raw_effect_delta < component_thresholds['effect']
+        )
+        robust_converged = robust_delta < component_thresholds['robust']
+        diagnostic['physical_converged'] = physical_converged
+        diagnostic['bias_converged'] = bias_converged
+        diagnostic['effect_converged'] = effect_converged
+        diagnostic['robust_converged'] = robust_converged
+
         if (
-            iteration_delta < change_thresh
-            and raw_iteration_delta < change_thresh
-            and robust_delta < change_thresh
+            physical_converged
+            and bias_converged
+            and effect_converged
+            and robust_converged
         ):
             converged = True
             break
@@ -1470,7 +1609,7 @@ def adjust_lsq_bias_correlated_sparse(
 
     W_return = _clip_weight_vector(1.0 / final_sigma_marginal, w_max)
     convergence_label = (
-        'forced_converged' if oscillation_events else 'converged'
+        'converged_after_relaxation' if oscillation_events else 'converged_naturally'
     )
     result = SparseSFOIResult(
         x=np.asarray(x_physical, dtype=float).ravel(),
@@ -1500,8 +1639,13 @@ def adjust_lsq_bias_correlated_sparse(
     result.correlation_effects = np.asarray(effects, dtype=float)
     result.robust_factor = np.asarray(robust_factor, dtype=float)
     result.oscillation_events = int(oscillation_events)
+    result.relaxation_recoveries = int(relaxation_recoveries)
     result.step_relaxation = float(step_relaxation)
-    result.flpe_prediction = (1.0 + bias) * x_physical[:n_reaches]
+    result.flpe_eligible_mask = np.asarray(flpe_eligible, dtype=bool)
+    result.convergence_thresholds = dict(component_thresholds)
+    result.flpe_prediction = x_physical[:n_reaches].copy()
+    if bias_enabled:
+        result.flpe_prediction[flpe_rows] *= 1.0 + bias
     return result
 
 

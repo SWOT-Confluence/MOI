@@ -232,7 +232,7 @@ def test_augmented_result_damps_period_two_oscillation_to_convergence(monkeypatc
 
     assert result.converged
     assert result.status.startswith(
-        'success_bias_correlated_forced_converged_'
+        'success_bias_correlated_converged_after_relaxation_'
     )
     assert result.outer_iterations == 3
     assert result.x == pytest.approx([1.0], abs=1.0e-12)
@@ -242,6 +242,137 @@ def test_augmented_result_damps_period_two_oscillation_to_convergence(monkeypatc
     assert result.diagnostics[1]['oscillation_detected']
     assert result.diagnostics[1]['direction_cosine'] == pytest.approx(-1.0)
     assert result.diagnostics[-1]['robust_delta'] == 0.0
+
+
+def test_bias_and_correlation_apply_only_to_genuine_flpe_rows():
+    true_q = np.array([100.0, 200.0])
+    planted_bias = 0.20
+    A = _identity_prior_with_gages(2, 0, [0, 1])
+    observations = np.array(
+        [
+            (1.0 + planted_bias) * true_q[0],
+            true_q[1],  # SoS prior: deliberately not bias augmented.
+            true_q[0],
+            true_q[1],
+        ]
+    )
+    cov = np.array([0.20, 0.60, 0.005, 0.005])
+    fixed = np.array([False, False, True, True])
+
+    result = adjust_lsq_bias_correlated_sparse(
+        A_obs=A,
+        L=observations,
+        cov=cov,
+        n_reaches=2,
+        n_regions=0,
+        flpe_eligible_mask=np.array([True, False]),
+        correlation_groups=np.array([0, 0]),
+        correlation_rho=0.20,
+        bias_enabled=True,
+        bias_prior_std=10.0,
+        x0=np.array([120.0, 200.0]),
+        lb=np.zeros(2),
+        maxiter=40,
+        change_thresh=1.0e-7,
+        fixed_weight_mask=fixed,
+        robust_eligible_mask=~fixed,
+    )
+
+    assert result.converged
+    assert result.bias == pytest.approx(planted_bias, abs=1.0e-3)
+    assert result.x == pytest.approx(true_q, rel=2.0e-4, abs=2.0e-2)
+    np.testing.assert_array_equal(result.flpe_eligible_mask, [True, False])
+    np.testing.assert_array_equal(result.correlation_groups, [0, -1])
+    assert result.flpe_prediction[1] == pytest.approx(result.x[1])
+
+
+def test_physical_p95_threshold_prevents_hidden_local_nonconvergence(monkeypatch):
+    def one_local_change(
+        A_obs,
+        L,
+        W,
+        A_eq=None,
+        b_eq=None,
+        lb=None,
+        ub=None,
+        x0=None,
+        verbose=False,
+    ):
+        candidate = np.asarray(x0, dtype=float).copy()
+        candidate[0] += 5.0
+        return candidate, 'success_mock_optimal'
+
+    monkeypatch.setattr(sfoi_math_core, '_solve_wls_sparse', one_local_change)
+    n_reaches = 10
+    result = adjust_lsq_bias_correlated_sparse(
+        A_obs=sp.eye(n_reaches, format='csr'),
+        L=np.full(n_reaches, 100.0),
+        cov=np.full(n_reaches, 0.20),
+        n_reaches=n_reaches,
+        n_regions=0,
+        correlation_rho=0.0,
+        bias_enabled=False,
+        x0=np.full(n_reaches, 100.0),
+        maxiter=1,
+        physical_rms_thresh=0.02,
+        physical_p95_thresh=0.01,
+        bias_thresh=0.01,
+        effect_thresh=0.01,
+        robust_thresh=0.01,
+        fixed_weight_mask=np.ones(n_reaches, dtype=bool),
+        robust_eligible_mask=np.zeros(n_reaches, dtype=bool),
+    )
+
+    assert result.diagnostics[-1]['physical_delta'] < 0.02
+    assert result.diagnostics[-1]['physical_p95_delta'] > 0.01
+    assert not result.converged
+
+
+def test_relaxation_recovers_after_stable_directions(monkeypatch):
+    call = {'count': 0}
+
+    def reversing_then_stable(
+        A_obs,
+        L,
+        W,
+        A_eq=None,
+        b_eq=None,
+        lb=None,
+        ub=None,
+        x0=None,
+        verbose=False,
+    ):
+        steps = [1.0, -1.0, -0.1, -0.1, -0.1]
+        step = steps[call['count']]
+        call['count'] += 1
+        return np.asarray(x0, dtype=float) + step, 'success_mock_optimal'
+
+    monkeypatch.setattr(
+        sfoi_math_core, '_solve_wls_sparse', reversing_then_stable
+    )
+    result = adjust_lsq_bias_correlated_sparse(
+        A_obs=sp.eye(1, format='csr'),
+        L=np.array([1.0]),
+        cov=np.array([0.20]),
+        n_reaches=1,
+        n_regions=0,
+        correlation_rho=0.0,
+        bias_enabled=False,
+        x0=np.array([1.0]),
+        lb=np.array([0.0]),
+        maxiter=5,
+        change_thresh=1.0e-12,
+        relaxation_recovery=1.25,
+        relaxation_recovery_patience=3,
+        fixed_weight_mask=np.array([True]),
+        robust_eligible_mask=np.array([False]),
+    )
+
+    assert not result.converged
+    assert result.oscillation_events == 1
+    assert result.relaxation_recoveries == 1
+    assert result.step_relaxation == pytest.approx(0.625)
+    assert result.diagnostics[-1]['relaxation_recovered']
 
 
 def test_pipeline_rejects_nonconverged_augmented_result():

@@ -1,5 +1,6 @@
 import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import scipy.sparse as sp
@@ -31,6 +32,152 @@ def test_augmented_features_require_a_calibration_gage():
     assert integrator._augmented_solver_features('Mean', 0) == (False, False)
     assert integrator._augmented_solver_features('Mean', 1) == (True, True)
     assert integrator._augmented_solver_features('q33', 1) == (False, False)
+
+
+def test_augmented_features_require_a_genuine_flpe_row():
+    integrator = object.__new__(Integrate)
+    integrator.Branch = 'constrained'
+    integrator.params_dict = {
+        'SFOI_Bias_Augmentation': True,
+        'SFOI_Correlation_Enabled': True,
+        'SFOI_Bias_Flow_Levels': ('Mean',),
+    }
+
+    assert integrator._augmented_solver_features('Mean', 1, 0) == (False, False)
+    assert integrator._augmented_solver_features('Mean', 1, 1) == (True, True)
+
+
+def test_identical_prior_only_algorithms_reuse_one_solver_result(monkeypatch):
+    solver_calls = {'count': 0}
+
+    def ordinary_solver(**kwargs):
+        solver_calls['count'] += 1
+        return SimpleNamespace(
+            x=np.array([100.0]),
+            P=np.array([1.0]),
+            W=np.array([1.0]),
+            V=np.array([0.0]),
+            So=1.0,
+            index=np.array([True]),
+            delta=[0.0],
+            status='success_converged',
+            outer_iterations=1,
+            inner_iterations=1,
+            diagnostics=[],
+            converged=True,
+        )
+
+    monkeypatch.setattr('moi.Integrate.adjust_lsq_mult_sparse', ordinary_solver)
+    monkeypatch.setattr(
+        'moi.Integrate.estimate_q_uncertainty_rel',
+        lambda *args, **kwargs: np.array([0.6]),
+    )
+
+    integrator = object.__new__(Integrate)
+    integrator.alg_dict = {
+        alg: {'1': {'integrator': {}}} for alg in ('hivdi', 'sad')
+    }
+    integrator.basin_dict = {'reach_ids_all': ['1']}
+    integrator.params_dict = {}
+    integrator.Branch = 'constrained'
+    integrator.VerboseFlag = False
+    integrator.junctions_valid = True
+    integrator.GoodFLPE = {}
+    integrator.reach_epsilons = {}
+    integrator.gage_diagnostics = {}
+    integrator.integ_dict = {
+        'bias_correction': {},
+        'gage_constraints': {},
+        'solver_reuse': {},
+    }
+    prior_problem = {
+        'A_obs': sp.eye(1, format='csr'),
+        'L_obs': np.array([100.0]),
+        'cov_obs': np.array([0.6]),
+        'A_sfoi': sp.eye(1, format='csr'),
+        'L_sfoi': np.array([100.0]),
+        'cov_sfoi': np.array([0.6]),
+        'A_eq': sp.csr_matrix((0, 1)),
+        'b_eq': np.array([]),
+        'lb': np.array([0.0]),
+        'ub': None,
+        'x0': np.array([100.0]),
+        'K_regions': 0,
+        'reach_regions': np.array([0]),
+    }
+    integrator.initialize_integration_vars = (
+        lambda alg, flow, previous, n: (
+            np.array([100.0]),
+            np.array([60.0]),
+            True,
+            np.array([1000.0]),
+            ['Prior'],
+            np.array([False]),
+        )
+    )
+    integrator.build_soft_sfoi_system = (
+        lambda n, qbar, sigq, facc, conversion: prior_problem
+    )
+    integrator.build_gage_observation_rows = lambda problem, flow: {
+        'A': sp.csr_matrix((0, 1)),
+        'L': np.array([]),
+        'cov': np.array([]),
+        'reach_ids': [],
+        'station_ids': [],
+    }
+    integrator._print_initial_state = lambda *args, **kwargs: None
+    integrator._print_reach_results = lambda *args, **kwargs: None
+    integrator.compute_mass_conservation_metrics = lambda *args, **kwargs: {'1': 0.0}
+    previous = {
+        'hivdi': np.array([np.nan]),
+        'sad': np.array([np.nan]),
+    }
+
+    integrator.integrator_optimization_calcs(0, 1, 'Mean', previous)
+
+    assert solver_calls['count'] == 1
+    assert integrator.integ_dict['solver_reuse']['Mean']['sad'] == 'hivdi'
+    assert integrator.alg_dict['hivdi']['1']['integrator']['qbar'] == 100.0
+    assert integrator.alg_dict['sad']['1']['integrator']['qbar'] == 100.0
+
+
+def test_missing_algorithm_data_preserves_prior_provenance():
+    integrator = object.__new__(Integrate)
+    integrator.alg_dict = {
+        'hivdi': {
+            '1': {'s1-flpe-exists': True, 'q': np.array([120.0, 120.0])},
+            '2': {'s1-flpe-exists': False, 'q': np.nan},
+        }
+    }
+    integrator.sos_dict = {
+        '1': {'Qbar': 100.0, 'q33': 90.0},
+        '2': {'Qbar': 200.0, 'q33': 180.0},
+    }
+    integrator.basin_dict = {'reach_ids_all': ['1', '2']}
+    integrator.sword_dict = {'reach_id': np.array([1, 2], dtype=np.int64)}
+    integrator.params_dict = {
+        'FLPE_Uncertainty': 0.67,
+        'Prior_Uncertainty': 0.60,
+        'Fill_Uncertainty': 1.0,
+    }
+    integrator.GoodFLPE = {}
+    integrator.pull_sword_attributes_for_reach = lambda index: {'facc': 1000.0}
+    integrator.get_pre_mean_q()
+
+    qbar, sigq, ok, _, source, real_mask = (
+        integrator.initialize_integration_vars(
+            'hivdi',
+            'Mean',
+            {'hivdi': np.array([np.nan, np.nan])},
+            2,
+        )
+    )
+
+    np.testing.assert_allclose(qbar, [120.0, 200.0])
+    assert source == ['FLPE', 'Prior']
+    np.testing.assert_array_equal(real_mask, [True, False])
+    assert sigq[1] == 120.0
+    assert ok
 
 
 def test_filled_array_handles_masked_integer_netcdf_values():
