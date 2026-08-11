@@ -254,6 +254,10 @@ def main():
             input_obj = get_all_sword_reach_in_basin(input_obj, False)
             svs_loaded = False
 
+            print('hello world! exiting...')
+            sys.exit(1)
+
+
             try:
                 input_obj.extract_swot()
                 input_obj.extract_sos()
