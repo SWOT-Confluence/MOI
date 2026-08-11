@@ -101,6 +101,8 @@ def set_moi_params():
         'quit_before_flpe': False,
         'apply_patches': False,
         'write_fill_only': False,
+        # parameters to handle Corridors data
+        'UseCORRIDORS': False,  
     }
 
 
@@ -188,6 +190,17 @@ def main():
         help='Disable the systematic FLPE bias state.',
     )
     parser.add_argument(
+        '--use-corridors',
+        action='store_true',
+        help='Enable the integration of CORRIDORS data.'
+    )
+    parser.add_argument(
+        '--corridors-dir',
+        type=Path,
+        default=Path('./corridors/'),
+        help='Directory containing multiple CSV files for CORRIDORS data.'
+    )
+    parser.add_argument(
         '-b',
         '--branch',
         type=str,
@@ -254,8 +267,8 @@ def main():
             input_obj = get_all_sword_reach_in_basin(input_obj, False)
             svs_loaded = False
 
-            print('hello world! exiting...')
-            sys.exit(1)
+            #print('hello world! exiting...')
+            #sys.exit(1)
 
 
             try:
@@ -304,6 +317,17 @@ def main():
                 print(f"[{basin_id}] SKIP: Essential data missing ({str(e)})")
                 sys.exit(1)
 
+            # Optionally extract CORRIDORS data
+            corridors_dict = None
+            if params_dict.get('UseCORRIDORS') and args.branch == 'constrained':
+                if args.corridors_dir and args.corridors_dir.is_dir():
+                    print(f"[{basin_id}] Extracting CORRIDORS Data...")
+                    from moi.Corridors import Corridors
+                    corridors_obj = Corridors(args.corridors_dir, args.verbose)
+                    corridors_dict = corridors_obj.integrate_corridors_data(input_obj)
+                else:
+                    warnings.warn("UseCORRIDORS is true, but no valid --corridors-dir was provided. Proceeding without CORRIDORS.")
+
             # ---------------------------------------------------------
             # 2. INTEGRATION
             # ---------------------------------------------------------
@@ -321,6 +345,7 @@ def main():
                 # An explicit (even empty) SVS selection must not be refilled
                 # from SoS, because that could reintroduce validation gages.
                 gage_dict=getattr(input_obj, 'gage_dict', {}) if svs_loaded else None,
+                corridors_dict=corridors_dict, 
             )
 
             try:

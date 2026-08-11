@@ -1,0 +1,32 @@
+Bootstrap: docker
+From: ghcr.io/swot-confluence/moi:4.0.0
+
+%files
+    requirements.txt /app/requirements.txt
+    deploy/deploy-ecr.sh /app/deploy/deploy-ecr.sh
+    deploy/deploy.sh /app/deploy/deploy.sh
+    moi/Input.py /app/moi/Input.py
+    moi/Integrate.py /app/moi/Integrate.py
+    moi/Output.py /app/moi/Output.py
+    moi/sfoi_math_core.py /app/moi/sfoi_math_core.py
+    run_MOI.py /app/run_MOI.py
+    tests/test_Input.py /app/tests/test_Input.py
+    tests/test_bias_correlation.py /app/tests/test_bias_correlation.py
+    tests/test_bifurcation_correction.py /app/tests/test_bifurcation_correction.py
+    tests/test_data/reaches.json /app/tests/test_data/reaches.json
+    tests/test_gage_constraints.py /app/tests/test_gage_constraints.py
+    tests/test_output_diagnostics.py /app/tests/test_output_diagnostics.py
+    tests/test_sword_v17c_input.py /app/tests/test_sword_v17c_input.py
+    tests/test_time_str_output.py /app/tests/test_time_str_output.py
+
+%post
+    set -eu
+    echo "=== moi: building image ==="
+    echo "=== moi: installing requirements ==="
+    python3 -m pip install --no-cache-dir --break-system-packages -r /app/requirements.txt
+
+%runscript
+    exec /app/env/bin/python3 /app/run_MOI.py "$@"
+
+%environment
+    export PYTHONUNBUFFERED=1
