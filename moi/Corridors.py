@@ -31,13 +31,14 @@ class Corridors:
         if self.verbose:
             print(f"  -> Scanning for CORRIDORS CSV files in: {self.corridors_dir}")
              
-        # grab csv file, and exclude the translation file
+        # grab csv file, and exclude the translation file: klugey
         csv_files = list(self.corridors_dir.glob("*.csv"))
         trans_fname='SWORD_v16_v17_translation_reach.csv'
-        csv_files=[f for f in csv_files if f.name != trans_fname] 
+        trans_file=None
         for f in csv_files:
-            if f.name=trans_name:
+            if f.name=trans_fname:
                 trans_file=f
+        csv_files=[f for f in csv_files if f.name != trans_fname] 
 
         # read corridors data
         if not csv_files:
