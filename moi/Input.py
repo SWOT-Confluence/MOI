@@ -80,6 +80,13 @@ class Input:
     @staticmethod
     def default_calval_file():
         """Return the basin-stratified Cal/Val CSV shipped with MOI."""
+
+        # 1. Check if the file is in the current execution directory (Apptainer mount)
+        cwd_path = Path.cwd() / 'CalValSeparation_basin_stratified_v2.csv'
+        if cwd_path.exists():
+            return cwd_path 
+
+        # 2. Fall back to the absolute /app/ installation directory
         return (
             Path(__file__).resolve().parents[1]
             / 'CalValSeparation_basin_stratified_v2.csv'
