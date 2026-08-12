@@ -5,6 +5,7 @@ From: ghcr.io/swot-confluence/moi:4.0.0
     requirements.txt /app/requirements.txt
     deploy/deploy-ecr.sh /app/deploy/deploy-ecr.sh
     deploy/deploy.sh /app/deploy/deploy.sh
+    moi/Corridors.py /app/moi/Corridors.py
     moi/Input.py /app/moi/Input.py
     moi/Integrate.py /app/moi/Integrate.py
     moi/Output.py /app/moi/Output.py
@@ -18,6 +19,7 @@ From: ghcr.io/swot-confluence/moi:4.0.0
     tests/test_output_diagnostics.py /app/tests/test_output_diagnostics.py
     tests/test_sword_v17c_input.py /app/tests/test_sword_v17c_input.py
     tests/test_time_str_output.py /app/tests/test_time_str_output.py
+    CalValSeparation_basin_stratified_v2.csv /app/
 
 %post
     set -eu
