@@ -5,6 +5,7 @@ From: ghcr.io/swot-confluence/moi:4.0.0
     requirements.txt /app/requirements.txt
     deploy/deploy-ecr.sh /app/deploy/deploy-ecr.sh
     deploy/deploy.sh /app/deploy/deploy.sh
+    moi/Corridors.py /app/moi/Corridors.py
     moi/Input.py /app/moi/Input.py
     moi/Integrate.py /app/moi/Integrate.py
     moi/Output.py /app/moi/Output.py

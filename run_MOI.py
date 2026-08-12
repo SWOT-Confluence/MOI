@@ -237,6 +237,10 @@ def main():
             log.write(f"Starting SFOI Pipeline Index {index_to_run}, Basin {basin_id}\n")
 
             params_dict = set_moi_params()
+
+            if args.use_corridors:
+                params_dict['UseCORRIDORS'] = True
+
             if args.correlation_rho is not None:
                 if not 0.0 <= args.correlation_rho < 1.0:
                     raise ValueError('--correlation-rho must satisfy 0 <= rho < 1')
