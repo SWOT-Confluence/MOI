@@ -414,6 +414,16 @@ class Input:
             )
         return self.gage_dict
 
+    def merge_corridors_and_gages(self,corridors_dict):
+        '''
+            Combine corridors field data stored as dictionaries with 
+            gage_dict object defined in extract_svs
+        '''
+
+        for rid in corridors_dict:
+            self.gage_dict[rid]=corridors_dict[rid]
+
+
     def extract_sos(self):
         """Extracts and stores SoS data in sos_dict.
         
@@ -518,7 +528,6 @@ class Input:
                 n_not_found+=1
 
         sos_dataset.close()
-
 
     def extract_sword(self):
         """Extracts and stores SWORD data in sword_dict. (v15/v16/v17 Compatible)"""
@@ -727,6 +736,7 @@ class Input:
                         "s1-flpe-exists": False,
                         "qbar": np.nan
                         }
+
 
     def __extract_valid(self, r_id, bb_file, hv_file, mo_file, sd_file, mm_file, sv_file):
         """ Extract valid data from the output of each reach-level FLPE alg.

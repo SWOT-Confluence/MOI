@@ -11,7 +11,7 @@ import warnings
 from moi.Input import Input
 from moi.Integrate import Integrate
 from moi.Output import Output
-
+from moi.Corridors import Corridors
 
 def get_basin_data(basin_json, index_to_run):
     """Extract basin data by index and return a normalized dictionary."""
@@ -212,13 +212,16 @@ def main():
     index_to_run = resolve_index(args.index)
 
     # Path Configuration
-    input_dir = Path("/mnt/data/input")
-    flpe_dir = Path("/mnt/data/flpe")
+    #input_dir = Path("/mnt/data/input")
+    #flpe_dir = Path("/mnt/data/flpe")
+    input_dir=Path('/fs/ess/PAS1926/mike/noatak/confluence_run10/run10_mnt/input')
+    flpe_dir=Path('/fs/ess/PAS1926/mike/noatak/confluence_run10/run10_mnt/flpe')
     basin_json = input_dir / args.basinjson
     sword_dir = input_dir / "sword"
 
     # Output Directories
-    output_dir = Path("/mnt/data/output")
+    #output_dir = Path("/mnt/data/output")
+    output_dir=Path('/fs/ess/PAS1926/mike/noatak/confluence_run10/run10_mnt/moi')
     output_dir.mkdir(parents=True, exist_ok=True)
 
     basin_data = get_basin_data(basin_json, index_to_run)
@@ -326,9 +329,14 @@ def main():
             if params_dict.get('UseCORRIDORS') and args.branch == 'constrained':
                 if args.corridors_dir and args.corridors_dir.is_dir():
                     print(f"[{basin_id}] Extracting CORRIDORS Data...")
-                    from moi.Corridors import Corridors
-                    corridors_obj = Corridors(args.corridors_dir, args.verbose)
-                    corridors_dict = corridors_obj.integrate_corridors_data(input_obj)
+                    corridors_obj = Corridors(
+                            args.corridors_dir, 
+                            input_obj.basin_dict,
+                            input_obj.obs_dict,
+                            verbose=args.verbose
+                            )
+                    corridors_dict = corridors_obj.integrate_corridors_data()
+                    input_obj.merge_corridors_and_gages(corridors_dict)
                 else:
                     warnings.warn("UseCORRIDORS is true, but no valid --corridors-dir was provided. Proceeding without CORRIDORS.")
 
