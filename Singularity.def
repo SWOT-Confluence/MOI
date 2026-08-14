@@ -6,6 +6,10 @@ From: ghcr.io/swot-confluence/moi:4.0.0
     deploy/deploy-ecr.sh /app/deploy/deploy-ecr.sh
     deploy/deploy.sh /app/deploy/deploy.sh
     moi/Corridors.py /app/moi/Corridors.py
+    moi/Domain.py /app/moi/Domain.py
+    moi/ErrorStats.py /app/moi/ErrorStats.py
+    moi/FlowLawCalibration.py /app/moi/FlowLawCalibration.py
+    moi/FlowLaws.py /app/moi/FlowLaws.py
     moi/Input.py /app/moi/Input.py
     moi/Integrate.py /app/moi/Integrate.py
     moi/Output.py /app/moi/Output.py
