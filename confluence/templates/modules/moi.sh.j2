@@ -11,10 +11,14 @@ for (( idx=START_INDEX; idx<=END_INDEX; idx++ )); do
     {{ container_cmd.bind }} {{ mnt_dir }}/input:/mnt/data/input \
     {{ container_cmd.bind }} {{ mnt_dir }}/flpe:/mnt/data/flpe \
     {{ container_cmd.bind }} {{ mnt_dir }}/moi:/mnt/data/output \
+    {{ container_cmd.bind }} {{ module_dir }}/CalValSeparation_basin_stratified_v2.csv:/app/CalValSeparation_basin_stratified_v2.csv \
+    {{ container_cmd.bind }} {{ module_dir }}/corridors:/app/corridors:ro \
     {{ optional_binds | join(' \\\n    ') }} \
     {{ sif_dir }}/moi.sif \
     -j basin.json \
     -v \
     -b {{ module.basin_type }} \
+    --use-corridors \
+    --corridors-dir /app/corridors \
     -i ${idx}
 done
