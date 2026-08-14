@@ -37,6 +37,7 @@ modules_to_run:
 
 repo_branches:
   setfinder: "tedlanghorst:main"
+  busboi: "BUSBOI_main"
   validation: "post_UAT"
   consensus: "tedlanghorst:main"
   output: "post_UAT"

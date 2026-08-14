@@ -29,7 +29,8 @@ modules_to_rebuild:
 
 repo_branches:
   setfinder: "tedlanghorst:main"
-  momma: "tedlanghorst:dev"
+  busboi: "BUSBOI_main"
+  momma: "post_UAT"
   validation: "post_UAT"
   consensus: "tedlanghorst:main"
   output: "post_UAT"
