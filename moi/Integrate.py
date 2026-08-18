@@ -1240,7 +1240,9 @@ class Integrate:
             self.alg_dict['metroman'][reach]['integrator']['na'] = res.x[0]
             self.alg_dict['metroman'][reach]['integrator']['x1'] = res.x[1]
             self.alg_dict['metroman'][reach]['integrator']['a0'] = res.x[2]
-            self.alg_dict['metroman'][reach]['integrator']['q'] = self.metroman_flowlaw(res.x, self.obs_dict[reach])
+            #self.alg_dict['metroman'][reach]['integrator']['q'] = self.metroman_flowlaw(res.x, self.obs_dict[reach])
+            self.alg_dict['metroman'][reach]['integrator']['q'] = self.alg_dict['metroman'][reach]['q'] *\
+                    self.alg_dict['metroman'][reach]['integrator']['qbar']/ self.alg_dict['metroman'][reach]['qbar']
 
         if self.VerboseFlag: print('CALCULATING MOMMA FLPs')
         for reach in self.alg_dict['momma']:
