@@ -380,6 +380,9 @@ def create_sifs(
 
 
 def _get_modules_to_build(cfg: Config):
+    if cfg.no_build:
+        return set()
+
     # set to removed duplicates after removing modifiers (e.g. expanded and non_expanded setfinder)
     modules = set([strip_modifiers(mod) for mod in cfg.modules_to_run])
 

@@ -105,6 +105,7 @@ class Config(BaseModel):
     modules_to_run: list[str]
 
     rebuild_all_modules: bool
+    no_build: bool = False # Mainly for testing script generation without apptainer installed locally.
     modules_to_rebuild: list[str] = Field(default_factory=list)
 
     repo_branches: dict[str, str] = Field(default_factory=dict)

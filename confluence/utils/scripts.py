@@ -76,8 +76,6 @@ def _get_optional_binds(cfg: Config, bind_cmd: str):
     binds = []
     if cfg.swot_input_bind_dir:
         binds.append(f"{bind_cmd} {cfg.swot_input_bind_dir}:/mnt/data/input/swot:ro")
-    if cfg.flpe_output_bind_dir: 
-        binds.append(f"{bind_cmd} {cfg.flpe_output_bind_dir}:/mnt/data/flpe:ro")
     if cfg.priors_bind_dir:
         binds.append(f"{bind_cmd} {cfg.priors_bind_dir}:/mnt/data/input/sos:ro")
     if cfg.sword_bind_dir:
@@ -96,6 +94,8 @@ def create_module_scripts(cfg: Config):
     platform_dict = _get_platform_dict(cfg.container_platform)
     optional_binds = _get_optional_binds(cfg, platform_dict["bind"])
 
+    flpe_bind_dir = cfg.flpe_output_bind_dir if cfg.flpe_output_bind_dir else cfg.dirs["mnt"] / "flpe"
+
     print("\n\nWriting module scripts.")
     for module_name in cfg.modules_to_run:
         template_args = cfg.module_templates[module_name]
@@ -107,6 +107,7 @@ def create_module_scripts(cfg: Config):
             optional_binds=optional_binds,
             mnt_dir=cfg.dirs["mnt"],
             sif_dir=cfg.dirs["sif"],
+            flpe_bind_dir=flpe_bind_dir,
             module_dir=cfg.dirs["modules"] / get_repo_name(module_name).lower(),
             sword_version=cfg.sword_version,
             module=template_args.module_args,
