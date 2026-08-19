@@ -162,8 +162,8 @@ class Corridors:
 
         flow_law_cal=FlowLawCalibration(D,np.array(reachdf['Q_(m^3/s_daily)']),flow_law)
         flow_law_cal.CalibrateReach(verbose=False,suppress_warnings=True)
-        if self.verbose:
-            flow_law_cal.Performance.ShowKeyErrorMetrics()
+        #if self.verbose:
+        #    flow_law_cal.Performance.ShowKeyErrorMetrics()
 
         return flow_law_cal
 
