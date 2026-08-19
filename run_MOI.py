@@ -214,14 +214,14 @@ def main():
     # Path Configuration
     input_dir = Path("/mnt/data/input")
     flpe_dir = Path("/mnt/data/flpe")
-    #input_dir=Path('/fs/ess/PAS1926/mike/noatak/confluence_run12/run12_mnt/input')
-    #flpe_dir=Path('/fs/ess/PAS1926/mike/noatak/confluence_run12/run12_mnt/flpe')
+    #input_dir=Path('/fs/ess/PAS1926/mike/noatak/confluence_run13/run13_mnt/input')
+    #flpe_dir=Path('/fs/ess/PAS1926/mike/noatak/confluence_run13/run13_mnt/flpe')
     basin_json = input_dir / args.basinjson
     sword_dir = input_dir / "sword"
 
     # Output Directories
     output_dir = Path("/mnt/data/output")
-    #output_dir=Path('/fs/ess/PAS1926/mike/noatak/confluence_run12/run12_mnt/moi')
+    #output_dir=Path('/fs/ess/PAS1926/mike/noatak/confluence_run13/run13_mnt/moi')
     output_dir.mkdir(parents=True, exist_ok=True)
 
     basin_data = get_basin_data(basin_json, index_to_run)
@@ -273,10 +273,6 @@ def main():
             input_obj.extract_sword()
             input_obj = get_all_sword_reach_in_basin(input_obj, False)
             svs_loaded = False
-
-            #print('hello world! exiting...')
-            #sys.exit(1)
-
 
             try:
                 input_obj.extract_swot()

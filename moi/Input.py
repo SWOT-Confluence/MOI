@@ -893,7 +893,19 @@ class Input:
                  "a0" : mm["average"]["A0hat"][:].filled(np.nan)
             }
             mm.close()
+            #print('reaches in obs_dict',self.obs_dict.keys())
+            #print('reaches in alg_dict',self.alg_dict['metroman'].keys())
+            if str(r_id) in self.obs_dict and r_id in self.alg_dict['metroman']:
+                #print('removing bad data for reach ',r_id)
+                iDelete=self.obs_dict[str(r_id)]['iDelete']
+                self.alg_dict['metroman'][r_id]['q'] = np.delete(self.alg_dict['metroman'][r_id]['q'], iDelete, 0)
             #print('MetroMan file found. ')
+            #if int(r_id)==81340100011:
+            #    print('Input.py, after removing bad data. shape for q reach 81340100011 is',
+            #            np.shape(self.alg_dict['metroman'][r_id]['q'][:]))
+            #    print('Input.py, after removing bad data. q for reach 81340100011 is',
+            #            self.alg_dict['metroman'][r_id]['q'][:])
+            #    sys.exit()
         else:
             self.alg_dict["metroman"][r_id] = { 
                 "s1-flpe-exists" : False ,
