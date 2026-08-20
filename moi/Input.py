@@ -661,12 +661,12 @@ class Input:
             swot_dataset.close()
 
             # select observations that are NOT equal to the fill value
-            iDelete = np.where(np.isnan(self.obs_dict[reach]['h']) | \
-                               np.isnan(self.obs_dict[reach]['w']) | \
-                               np.isnan(self.obs_dict[reach]['S']) | \
-                               np.isnan(self.obs_dict[reach]['dA'])| \
-                               (self.obs_dict[reach]['reach_q'] > 1) | \
-                               (self.obs_dict[reach]['xovr_cal_q'] > 1) )
+            iDelete = np.where(
+    		np.isnan(self.obs_dict[reach]['h']) |
+    		np.isnan(self.obs_dict[reach]['w']) |
+    		np.isnan(self.obs_dict[reach]['S']) |
+    		np.isnan(self.obs_dict[reach]['dA'])
+		)
 
             self.obs_dict[reach]['h'] = np.delete(self.obs_dict[reach]['h'], iDelete, 0)
             self.obs_dict[reach]['w'] = np.delete(self.obs_dict[reach]['w'], iDelete, 0)
