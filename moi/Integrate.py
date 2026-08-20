@@ -1397,7 +1397,34 @@ class Integrate:
           # if self.VerboseFlag: print('creating junction list')
           self.CreateJunctionList()       
 
-          FlowLevels = ['Mean', 'q33'] 
+          FlowLevels = self.params_dict.get(
+              'SFOI_Flow_Levels', ('Mean', 'q33')
+          )
+          if isinstance(FlowLevels, str):
+              FlowLevels = [
+                  value.strip()
+                  for value in FlowLevels.split(',')
+                  if value.strip()
+              ]
+          else:
+              FlowLevels = list(FlowLevels)
+          allowed_flow_levels = {'Mean', 'q33'}
+          invalid_flow_levels = set(FlowLevels).difference(allowed_flow_levels)
+          if not FlowLevels or invalid_flow_levels:
+              raise ValueError(
+                  'SFOI_Flow_Levels must contain Mean and/or q33; received '
+                  f'{FlowLevels!r}'
+              )
+
+          compute_flps = bool(
+              self.params_dict.get('SFOI_Compute_FLPs', True)
+          )
+          if compute_flps and set(FlowLevels) != allowed_flow_levels:
+              raise ValueError(
+                  'Final parameter estimation requires both Mean and q33. '
+                  'Set SFOI_Compute_FLPs=False for a Mean-only run.'
+              )
+
           m = len(self.junctions)
           for i, junction in enumerate(self.junctions): junction['row_num'] = i    
           n = len(self.basin_dict['reach_ids_all'])
@@ -1423,6 +1450,9 @@ class Integrate:
           if self.params_dict.get('quit_before_flpe', False):
               sys.exit('done with integration... exiting')
 
-          if self.VerboseFlag:
-              print('Computing all FLPs (Final Parameter Estimation)')
-          self.compute_FLPs()
+          if compute_flps:
+              if self.VerboseFlag:
+                  print('Computing all FLPs (Final Parameter Estimation)')
+              self.compute_FLPs()
+          elif self.VerboseFlag:
+              print('Skipping final FLP estimation by configuration')

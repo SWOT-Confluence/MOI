@@ -383,6 +383,13 @@ class Output:
 
     def write_sword_output(self, branch):
         """Make a new copy of the SWORD file, and write the Confluence estimates into the file."""
+        if not bool(self.params_dict.get('write_sword_output', False)):
+            print(
+                'Skipping SWORD output because params_dict["write_sword_output"] '
+                'is False.'
+            )
+            return None
+
         sword_src_file = self.sword_dir.joinpath(self.basin_dict['sword'])
         
         if self.out_dir == Path('/mnt/data/output'):

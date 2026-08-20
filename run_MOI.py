@@ -98,9 +98,16 @@ def set_moi_params():
         'rho': 0.7,
         'niter': 1,
         'method': 'linear',
+        # Full production runs solve both summary-flow levels and then estimate
+        # final flow-law parameters. Analysis workflows may override these.
+        'SFOI_Flow_Levels': ('Mean', 'q33'),
+        'SFOI_Compute_FLPs': True,
         'quit_before_flpe': False,
         'apply_patches': False,
         'write_fill_only': False,
+        # Temporarily skip the expensive copy/update of the basin SWORD file.
+        # Set this to True explicitly when a production SWORD export is needed.
+        'write_sword_output': False,
     }
 
 
