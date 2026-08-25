@@ -766,7 +766,8 @@ class Input:
             try:
                 q = np.array(bb["q"]["q"][:].filled(np.nan))
             except Exception:
-                q = np.nan
+                #q = np.nan
+                q = np.full( ntreach, np.nan),
 
             try:
                 r = np.array(bb["r"]["mean"][:].filled(np.nan))
