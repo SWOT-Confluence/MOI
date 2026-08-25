@@ -5,3 +5,4 @@ moi/.DS_Store
 .terraform
 # macOS metadata
 .DS_Store
+.ipynb_checkpoints
