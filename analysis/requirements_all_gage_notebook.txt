@@ -1,0 +1,6 @@
+-r ../requirements.txt
+
+# Notebook-only dependencies.  The MOI solvers (cvxpy, osqp, scs) are listed
+# in the repository requirements file above.
+matplotlib
+ipykernel

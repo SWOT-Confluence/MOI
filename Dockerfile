@@ -16,6 +16,7 @@ RUN /app/env/bin/pip install -r /app/requirements.txt
 FROM stage2 as stage3
 COPY ./moi /app/moi/
 COPY ./sos_read /app/sos_read/
+COPY ./CalValSeparation_basin_stratified_v2.csv /app/CalValSeparation_basin_stratified_v2.csv
 
 # Stage 4 - Execute algorithm
 FROM stage3 as stage4

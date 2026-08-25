@@ -1,10 +1,17 @@
 # Standard imports
 from glob import glob
 from pathlib import Path
+import csv
+import datetime
+import json
 import warnings
 import os
 import sys
-import geopandas as gpd
+
+try:
+    import geopandas as gpd
+except ImportError:  # Optional unless a GeoPackage SWORD input is used.
+    gpd = None
 
 # Third-party imports
 from netCDF4 import Dataset,chartostring
@@ -62,11 +69,350 @@ class Input:
         self.basin_dict = basin_data
         self.alg_dir = alg_dir
         self.sos_dict = {}
+        self.gage_dict = {}
+        self.calval_groups = {}
         self.sos_dir = sos_dir
         self.sword_dir = sword_dir
         self.swot_dir = swot_dir
         self.branch = branch
         self.VerboseFlag = verbose
+
+    @staticmethod
+    def default_calval_file():
+        """Return the basin-stratified Cal/Val CSV shipped with MOI."""
+        return (
+            Path(__file__).resolve().parents[1]
+            / 'CalValSeparation_basin_stratified_v2.csv'
+        )
+
+    @staticmethod
+    def _filled_array(values, fill=np.nan):
+        """Return a normal ndarray from a NetCDF variable or masked array."""
+        if hasattr(values, 'filled'):
+            if np.issubdtype(np.asarray(values).dtype, np.integer):
+                try:
+                    if np.isnan(fill):
+                        fill = 0
+                except TypeError:
+                    pass
+            values = values.filled(fill)
+        return np.asarray(values)
+
+    @staticmethod
+    def _decode_time_strings(values, expected_size=None):
+        """Decode a SWOT ``time_str`` variable into one string per time step."""
+        raw = np.asarray(values)
+        if hasattr(values, 'filled'):
+            fill = b' ' if raw.dtype.kind == 'S' else ' '
+            raw = np.asarray(values.filled(fill))
+
+        # SWOT time strings are normally a two-dimensional S1 character array.
+        # netCDF4.chartostring preserves the leading time dimension and joins
+        # the trailing character dimension. VLEN strings arrive as 1-D values.
+        if raw.ndim >= 2 and raw.dtype.kind in ('S', 'U'):
+            try:
+                raw = np.asarray(chartostring(raw))
+            except (AttributeError, TypeError, ValueError):
+                pass
+        elif (
+            raw.ndim == 1
+            and expected_size == 1
+            and raw.size != 1
+            and raw.dtype.kind in ('S', 'U')
+        ):
+            raw = raw.reshape(1, -1)
+
+        def decode_one(value):
+            pieces = np.asarray(value).ravel() if isinstance(value, np.ndarray) else [value]
+            decoded = []
+            for piece in pieces:
+                if isinstance(piece, (bytes, np.bytes_)):
+                    decoded.append(bytes(piece).decode('utf-8', errors='replace'))
+                else:
+                    decoded.append(str(piece))
+            return ''.join(decoded).rstrip('\x00 ')
+
+        if raw.ndim == 0:
+            decoded = np.asarray([decode_one(raw.item())], dtype=str)
+        elif raw.ndim == 1:
+            decoded = np.asarray([decode_one(value) for value in raw], dtype=str)
+        else:
+            decoded = np.asarray([decode_one(row) for row in raw], dtype=str)
+
+        if expected_size is not None and decoded.size != int(expected_size):
+            raise ValueError(
+                'SWOT time_str length does not match nt: '
+                f'{decoded.size} != {int(expected_size)}'
+            )
+        return decoded
+
+    @staticmethod
+    def _time_strings_from_seconds(times):
+        """Build UTC ISO strings when an older SWOT file lacks ``time_str``."""
+        epoch = datetime.datetime(2000, 1, 1)
+        decoded = []
+        for seconds in np.asarray(times, dtype=float).ravel():
+            if not np.isfinite(seconds):
+                decoded.append('')
+                continue
+            try:
+                value = epoch + datetime.timedelta(seconds=float(seconds))
+                decoded.append(value.strftime('%Y-%m-%dT%H:%M:%SZ'))
+            except (OverflowError, ValueError):
+                decoded.append('')
+        return np.asarray(decoded, dtype=str)
+
+    @staticmethod
+    def _read_reach_id_json(path):
+        """Read a JSON list/dict of reach IDs into a normalized string set."""
+        if path is None:
+            return set()
+        with open(path, 'r') as stream:
+            data = json.load(stream)
+        values = list(data.values()) if isinstance(data, dict) else data
+        if not isinstance(values, (list, tuple, set)):
+            raise ValueError(f'Reach-ID JSON must contain a list or dictionary: {path}')
+        return {str(int(value)) for value in values}
+
+    @staticmethod
+    def _read_calval_groups(
+        path,
+        reach_id_col='reach_id_v17b',
+        group_col='group',
+    ):
+        """Read reach-level calibration/validation assignments from CSV."""
+        path = Path(path)
+        if not path.is_file():
+            raise FileNotFoundError(f'Calibration/validation CSV not found: {path}')
+
+        with path.open('r', newline='', encoding='utf-8-sig') as stream:
+            reader = csv.DictReader(stream)
+            if not reader.fieldnames:
+                raise ValueError(f'Calibration/validation CSV has no header: {path}')
+
+            field_lookup = {
+                str(field).strip().lower(): field
+                for field in reader.fieldnames
+                if field is not None
+            }
+            requested_reach_col = str(reach_id_col).strip().lower()
+            reach_candidates = [
+                requested_reach_col,
+                'reach_id_v17c',
+                'reach_id_v17b',
+                'reach_id_v17',
+                'reach_id',
+            ]
+            reach_field = next(
+                (field_lookup[name] for name in reach_candidates if name in field_lookup),
+                None,
+            )
+            group_field = field_lookup.get(str(group_col).strip().lower())
+            if reach_field is None or group_field is None:
+                raise ValueError(
+                    f'Calibration/validation CSV must contain {reach_id_col!r} '
+                    f'(or a compatible reach-ID column) and {group_col!r}: {path}'
+                )
+
+            groups = {}
+            for line_number, row in enumerate(reader, start=2):
+                raw_reach = row.get(reach_field)
+                raw_group = row.get(group_field)
+                if raw_reach is None or not str(raw_reach).strip():
+                    continue
+                try:
+                    reach = str(int(str(raw_reach).strip()))
+                except ValueError as exc:
+                    raise ValueError(
+                        f'Invalid reach ID {raw_reach!r} on line {line_number} of {path}'
+                    ) from exc
+
+                group = '' if raw_group is None else str(raw_group).strip().lower()
+                if not group:
+                    raise ValueError(
+                        f'Missing calibration/validation group for reach {reach} '
+                        f'on line {line_number} of {path}'
+                    )
+                if reach in groups and groups[reach] != group:
+                    raise ValueError(
+                        f'Conflicting groups for reach {reach} in {path}: '
+                        f'{groups[reach]!r} and {group!r}'
+                    )
+                groups[reach] = group
+
+        if not groups:
+            raise ValueError(f'Calibration/validation CSV contains no reach assignments: {path}')
+        return groups
+
+    @staticmethod
+    def _station_id(svs_dataset, station_index):
+        """Decode the SVS station identifier across known string layouts."""
+        try:
+            station_id = svs_dataset['station_id']
+            if station_id.ndim == 3:
+                chars = station_id[:, station_index, 0]
+            elif station_id.ndim == 2:
+                chars = station_id[:, station_index]
+            else:
+                chars = station_id[station_index]
+            if hasattr(chars, 'filled'):
+                chars = chars.filled(b' ')
+            pieces = []
+            for value in np.asarray(chars).ravel():
+                if isinstance(value, bytes):
+                    pieces.append(value)
+                else:
+                    pieces.append(str(value).encode('utf-8'))
+            return b''.join(pieces).decode('utf-8', errors='ignore').strip()
+        except Exception:
+            try:
+                return str(svs_dataset['station'][station_index])
+            except Exception:
+                return str(station_index)
+
+    @staticmethod
+    def _svs_ordinal_dates(svs_dataset):
+        """Convert the shared SVS date_ymd coordinate to ordinal days."""
+        date_ymd = Input._filled_array(svs_dataset['date_ymd'][:])
+        if date_ymd.ndim != 2:
+            raise ValueError('SVS date_ymd must be a two-dimensional array')
+        if date_ymd.shape[0] == 3:
+            years, months, days = date_ymd
+        elif date_ymd.shape[1] == 3:
+            years, months, days = date_ymd.T
+        else:
+            raise ValueError('SVS date_ymd must have one dimension of length 3')
+
+        ordinals = np.full(years.size, -9999, dtype=np.int64)
+        for i, (year, month, day) in enumerate(zip(years, months, days)):
+            try:
+                ordinals[i] = datetime.date(int(year), int(month), int(day)).toordinal()
+            except (TypeError, ValueError, OverflowError):
+                pass
+        return ordinals
+
+    @staticmethod
+    def _resolve_svs_reach_id_variable(svs_dataset, requested):
+        candidates = [requested, 'reach_id_v17c', 'reach_id_v17b', 'reach_id_v17', 'reach_id']
+        for name in candidates:
+            if name and name in svs_dataset.variables:
+                return name
+        available = ', '.join(sorted(name for name in svs_dataset.variables if 'reach_id' in name))
+        raise KeyError(
+            f'No compatible SVS reach-ID variable found. Requested {requested!r}; '
+            f'available reach-ID variables: {available or "none"}'
+        )
+
+    def extract_svs(
+        self,
+        svs_file,
+        reach_id_col='reach_id_v17b',
+        include_reach_ids=None,
+        exclude_reach_ids=None,
+        calval_file=None,
+        calval_reach_id_col='reach_id_v17b',
+        calibration_group='calibration',
+    ):
+        """Extract SVS gage time series for reaches in the current basin.
+
+        SVS gages are stored separately from FLPE/SoS observations so that the
+        integrator can append them as independent soft constraints rather than
+        replacing the FLPE observation at a gaged reach. When a Cal/Val CSV is
+        supplied, only reaches assigned to the calibration group are eligible.
+        """
+        svs_file = Path(svs_file)
+        if not svs_file.is_file():
+            raise FileNotFoundError(f'SVS file not found: {svs_file}')
+
+        include = self._read_reach_id_json(include_reach_ids) if include_reach_ids else set()
+        exclude = self._read_reach_id_json(exclude_reach_ids) if exclude_reach_ids else set()
+        basin_reaches = {str(int(reach)) for reach in self.basin_dict['reach_ids_all']}
+        self.calval_groups = {}
+        if calval_file is not None:
+            self.calval_groups = self._read_calval_groups(
+                calval_file,
+                reach_id_col=calval_reach_id_col,
+            )
+            calibration_group = str(calibration_group).strip().lower()
+            calibration_reaches = {
+                reach
+                for reach, group in self.calval_groups.items()
+                if group == calibration_group
+            }
+            if not calibration_reaches:
+                raise ValueError(
+                    f'No reaches assigned to group {calibration_group!r} in {calval_file}'
+                )
+            basin_reaches &= calibration_reaches
+        if include:
+            basin_reaches &= include
+        basin_reaches -= exclude
+
+        self.gage_dict = {}
+        with Dataset(svs_file, 'r') as svs_dataset:
+            reach_var_name = self._resolve_svs_reach_id_variable(svs_dataset, reach_id_col)
+            svs_reaches = self._filled_array(svs_dataset[reach_var_name][:])
+            if svs_reaches.ndim == 1:
+                svs_reaches = svs_reaches[:, None]
+            if svs_reaches.ndim != 2:
+                raise ValueError(f'SVS {reach_var_name} must be one- or two-dimensional')
+
+            q_all = self._filled_array(svs_dataset['Q'][:])
+            if q_all.ndim != 2:
+                raise ValueError('SVS Q must be a station-by-time array')
+            if q_all.shape[0] != svs_reaches.shape[0] and q_all.shape[1] == svs_reaches.shape[0]:
+                q_all = q_all.T
+            if q_all.shape[0] != svs_reaches.shape[0]:
+                raise ValueError('SVS Q station dimension does not match reach-ID station dimension')
+
+            ordinal_dates = self._svs_ordinal_dates(svs_dataset)
+            if q_all.shape[1] != ordinal_dates.size:
+                raise ValueError('SVS Q time dimension does not match date_ymd')
+
+            for reach in sorted(basin_reaches):
+                reach_value = int(reach)
+                station_indices = np.where(np.any(svs_reaches == reach_value, axis=1))[0]
+                if station_indices.size == 0:
+                    continue
+
+                valid_counts = []
+                for station_index in station_indices:
+                    q = np.asarray(q_all[station_index], dtype=float)
+                    valid_counts.append(np.count_nonzero(np.isfinite(q) & (q > 0)))
+                station_index = int(station_indices[int(np.argmax(valid_counts))])
+
+                q = np.asarray(q_all[station_index], dtype=float)
+                valid = np.isfinite(q) & (q > 0) & (ordinal_dates > 0)
+                if not np.any(valid):
+                    continue
+
+                self.gage_dict[reach] = {
+                    'source': 'SVS',
+                    'station_id': self._station_id(svs_dataset, station_index),
+                    'station_index': station_index,
+                    'reach_id_variable': reach_var_name,
+                    't': ordinal_dates[valid].copy(),
+                    'Q': q[valid].copy(),
+                }
+                if self.calval_groups:
+                    self.gage_dict[reach]['group'] = self.calval_groups[reach]
+
+        if self.VerboseFlag:
+            group_message = ''
+            if self.calval_groups:
+                n_calibration = sum(
+                    group == str(calibration_group).strip().lower()
+                    for group in self.calval_groups.values()
+                )
+                group_message = (
+                    f'; Cal/Val CSV contains {n_calibration} calibration reaches '
+                    f'out of {len(self.calval_groups)} classified reaches'
+                )
+            print(
+                f'Loaded {len(self.gage_dict)} SVS gages for the basin '
+                f'using {reach_var_name} from {svs_file}{group_message}'
+            )
+        return self.gage_dict
 
     def extract_sos(self):
         """Extracts and stores SoS data in sos_dict.
@@ -196,6 +542,22 @@ class Input:
         for field in reachfields:
             self.sword_dict[field] = sword_dataset['reaches/' + field][:]
 
+        # SWORD v17c marks reaches whose flow accumulation was changed by the
+        # denoise_v3 correction.  The fill value (-9999) means "unchanged from
+        # v17b", not invalid, so retain it as provenance rather than filtering
+        # those reaches out.  Older SWORD versions do not have this variable.
+        reaches_group = sword_dataset['reaches']
+        if 'facc_quality' in reaches_group.variables:
+            self.sword_dict['facc_quality'] = self._filled_array(
+                reaches_group['facc_quality'][:],
+                fill=-9999,
+            ).astype(np.int32)
+
+        self.sword_dict['facc'] = self._filled_array(
+            self.sword_dict['facc'],
+            fill=np.nan,
+        ).astype(float)
+
         try:
             self.sword_dict['swot_orbits'] = sword_dataset['reaches/swot_orbits'][:]
         except Exception:
@@ -212,6 +574,8 @@ class Input:
     def extract_sword_gpkg(self):
         swordfile = self.sword_dir.joinpath(self.basin_dict['sword']) 
 
+        if gpd is None:
+            raise RuntimeError('geopandas is required to read a SWORD GeoPackage')
         try:
             gdf = gpd.read_file(swordfile)
         except Exception as e:
@@ -222,10 +586,15 @@ class Input:
         self.sword_dict['num_reaches'] = len(gdf)
 
         self.sword_dict['reach_id'] = gdf['reach_id'].values
-        self.sword_dict['facc'] = gdf['facc'].values
+        self.sword_dict['facc'] = gdf['facc'].to_numpy(dtype=float, na_value=np.nan)
         self.sword_dict['n_rch_up'] = gdf['n_rch_up'].values
         self.sword_dict['n_rch_down'] = gdf['n_rch_down'].values
         self.sword_dict['swot_obs'] = gdf['swot_obs'].values
+
+        if 'facc_quality' in gdf.columns:
+            self.sword_dict['facc_quality'] = (
+                gdf['facc_quality'].fillna(-9999).astype(np.int32).values
+            )
 
         self.sword_dict['width'] = gdf['width'].fillna(0).values 
 
@@ -271,6 +640,20 @@ class Input:
             self.obs_dict[reach]['S'] = swot_dataset["reach/slope2"][0:nt].filled(np.nan)
             self.obs_dict[reach]['dA'] = swot_dataset["reach/d_x_area"][0:nt].filled(np.nan)
             self.obs_dict[reach]['t'] = swot_dataset["reach/time"][0:nt].filled(np.nan)
+            reach_group = swot_dataset['reach']
+            if 'time_str' in reach_group.variables:
+                self.obs_dict[reach]['time_str'] = self._decode_time_strings(
+                    reach_group['time_str'][0:nt],
+                    expected_size=nt,
+                )
+                self.obs_dict[reach]['time_str_source'] = 'SWOT reach/time_str'
+            else:
+                self.obs_dict[reach]['time_str'] = self._time_strings_from_seconds(
+                    self.obs_dict[reach]['t']
+                )
+                self.obs_dict[reach]['time_str_source'] = (
+                    'derived from SWOT reach/time'
+                )
 
             self.obs_dict[reach]['reach_q'] = swot_dataset["reach/reach_q"][0:nt].filled(np.nan)
             self.obs_dict[reach]['xovr_cal_q'] = swot_dataset["reach/xovr_cal_q"][0:nt].filled(np.nan)
@@ -278,12 +661,12 @@ class Input:
             swot_dataset.close()
 
             # select observations that are NOT equal to the fill value
-            iDelete = np.where(np.isnan(self.obs_dict[reach]['h']) | \
-                               np.isnan(self.obs_dict[reach]['w']) | \
-                               np.isnan(self.obs_dict[reach]['S']) | \
-                               np.isnan(self.obs_dict[reach]['dA'])| \
-                               (self.obs_dict[reach]['reach_q'] > 1) | \
-                               (self.obs_dict[reach]['xovr_cal_q'] > 1) )
+            iDelete = np.where(
+    		np.isnan(self.obs_dict[reach]['h']) |
+    		np.isnan(self.obs_dict[reach]['w']) |
+    		np.isnan(self.obs_dict[reach]['S']) |
+    		np.isnan(self.obs_dict[reach]['dA'])
+		)
 
             self.obs_dict[reach]['h'] = np.delete(self.obs_dict[reach]['h'], iDelete, 0)
             self.obs_dict[reach]['w'] = np.delete(self.obs_dict[reach]['w'], iDelete, 0)
@@ -294,8 +677,11 @@ class Input:
             self.obs_dict[reach]['iDelete'] = iDelete
 
             Smin = 1.7e-5
-            self.obs_dict[reach]['S'][self.obs_dict[reach]['S'] < Smin] = \
-                np.putmask(self.obs_dict[reach]['S'], self.obs_dict[reach]['S'] < Smin, Smin)
+            np.putmask(
+                self.obs_dict[reach]['S'],
+                self.obs_dict[reach]['S'] < Smin,
+                Smin,
+            )
 
             shape_iDelete = np.shape(iDelete)
             nDelete = shape_iDelete[1]
@@ -607,15 +993,33 @@ class Input:
             boolean indicating if result is logged
         """
 
-        q = gb[group][pre][:].filled(np.nan)
-        # chain2 = gb[group][f"{pre}2"][:].filled(np.nan)
-        # chain3 = gb[group][f"{pre}3"][:].filled(np.nan)
-
-        # chains = np.vstack((chain1, chain2, chain3))
+        variables = gb[group].variables
+        if pre in variables:
+            q = variables[pre][:]
+            q = q.filled(np.nan) if hasattr(q, 'filled') else np.asarray(q)
+        else:
+            chain_names = [
+                f'{pre}{chain_number}'
+                for chain_number in range(1, 4)
+                if f'{pre}{chain_number}' in variables
+            ]
+            if not chain_names:
+                raise KeyError(
+                    f'No variable {pre!r} or chain variables {pre!r}1..3 '
+                    f'in NetCDF group {group!r}'
+                )
+            chains = []
+            for name in chain_names:
+                values = variables[name][:]
+                if hasattr(values, 'filled'):
+                    values = values.filled(np.nan)
+                chains.append(np.asarray(values, dtype=float))
+            q = np.vstack(chains)
 
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", category=RuntimeWarning)
+            mean_q = np.nanmean(q, axis=0) if np.ndim(q) > 1 else np.asarray(q)
             if logged:
-                return np.exp(np.nanmean(q, axis=0))
+                return np.exp(mean_q)
             else:
-                return np.nanmean(q, axis=0)
+                return mean_q

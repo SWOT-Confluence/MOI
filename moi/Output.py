@@ -4,6 +4,7 @@ from pathlib import Path
 import time
 import random
 import os, sys
+import warnings
 
 # Third-party imports
 from netCDF4 import Dataset
@@ -47,6 +48,117 @@ class Output:
         self.obs_dict = obs_dict
         self.sword_dir = sword_dir
         self.params_dict = params_dict
+
+    def _write_bias_correlation_diagnostics(self, out):
+        """Persist basin-scale augmentation diagnostics in each reach file."""
+        all_diagnostics = self.stage_estimate.get('bias_correction', {})
+        if not all_diagnostics:
+            return
+
+        root = out.createGroup('moi_bias_correlation')
+        for algorithm, flow_diagnostics in all_diagnostics.items():
+            algorithm_group = root.createGroup(str(algorithm))
+            for flow_level, diagnostic in flow_diagnostics.items():
+                prefix = str(flow_level).lower()
+                values = {
+                    f'{prefix}_bias_fraction': diagnostic.get(
+                        'estimated_bias_fraction', np.nan
+                    ),
+                    f'{prefix}_bias_std_fraction': diagnostic.get(
+                        'bias_std_fraction', np.nan
+                    ),
+                    f'{prefix}_correlation_rho': diagnostic.get(
+                        'correlation_rho', np.nan
+                    ),
+                    f'{prefix}_last_delta': diagnostic.get(
+                        'last_delta', np.nan
+                    ),
+                    f'{prefix}_last_physical_rms_delta': diagnostic.get(
+                        'last_physical_rms_delta', np.nan
+                    ),
+                    f'{prefix}_last_physical_p95_delta': diagnostic.get(
+                        'last_physical_p95_delta', np.nan
+                    ),
+                    f'{prefix}_last_raw_delta': diagnostic.get(
+                        'last_raw_delta', np.nan
+                    ),
+                    f'{prefix}_last_robust_delta': diagnostic.get(
+                        'last_robust_delta', np.nan
+                    ),
+                    f'{prefix}_final_reduced_chi_square': diagnostic.get(
+                        'final_So', np.nan
+                    ),
+                }
+                for variable_name, value in values.items():
+                    variable = algorithm_group.createVariable(variable_name, 'f8')
+                    variable.assignValue(float(value))
+
+                algorithm_group.setncattr(
+                    f'{prefix}_bias_enabled',
+                    int(bool(diagnostic.get('enabled', False))),
+                )
+                algorithm_group.setncattr(
+                    f'{prefix}_solver_status',
+                    str(diagnostic.get('status', 'unknown')),
+                )
+                algorithm_group.setncattr(
+                    f'{prefix}_converged',
+                    int(bool(diagnostic.get('converged', False))),
+                )
+                algorithm_group.setncattr(
+                    f'{prefix}_outer_iterations',
+                    int(diagnostic.get('outer_iterations', 0)),
+                )
+                algorithm_group.setncattr(
+                    f'{prefix}_n_real_flpe_rows',
+                    int(diagnostic.get('n_real_flpe_rows', 0)),
+                )
+                algorithm_group.setncattr(
+                    f'{prefix}_oscillation_events',
+                    int(diagnostic.get('oscillation_events', 0)),
+                )
+                algorithm_group.setncattr(
+                    f'{prefix}_relaxation_recoveries',
+                    int(diagnostic.get('relaxation_recoveries', 0)),
+                )
+                thresholds = diagnostic.get('convergence_thresholds', {})
+                for threshold_name, threshold_value in thresholds.items():
+                    algorithm_group.setncattr(
+                        f'{prefix}_{threshold_name}_threshold',
+                        float(threshold_value),
+                    )
+                effects = diagnostic.get('correlation_effects', [])
+                algorithm_group.setncattr(
+                    f'{prefix}_correlation_effects',
+                    ','.join(f'{float(value):.12g}' for value in effects),
+                )
+
+    def _write_time_strings(self, out, reach):
+        """Write root-level SWOT time strings aligned with the restored nt axis."""
+        nt = len(out.dimensions['nt'])
+        values = self.obs_dict.get(str(reach), {}).get('time_str')
+        if values is None:
+            warnings.warn(
+                f'Reach {reach} has no time_str metadata; writing empty strings.',
+                RuntimeWarning,
+            )
+            values = np.full(nt, '', dtype=str)
+        else:
+            values = np.asarray(values, dtype=str).ravel()
+
+        if values.size != nt:
+            raise ValueError(
+                f'Reach {reach} time_str length does not match output nt: '
+                f'{values.size} != {nt}'
+            )
+
+        time_str = out.createVariable('time_str', str, ('nt',))
+        time_str.long_name = 'SWOT reach time string in UTC.'
+        time_str.source = self.obs_dict.get(str(reach), {}).get(
+            'time_str_source',
+            'unavailable',
+        )
+        time_str[:] = values
         
     def write_output(self):
         """Write data stored to NetCDF files for each reach"""
@@ -81,6 +193,7 @@ class Output:
                 out_file = self.out_dir / f"{reach}_integrator.nc"
                 out = Dataset(out_file, 'w', format="NETCDF4")
                 out.production_date = datetime.now().strftime('%d-%b-%Y %H:%M:%S')
+                self._write_bias_correlation_diagnostics(out)
 
                 # 1 busboi
                 gb = out.createGroup("busboi")
@@ -142,11 +255,13 @@ class Output:
              out_file = self.out_dir / f"{reach}_integrator.nc"
              out = Dataset(out_file, 'w', format="NETCDF4")
              out.production_date = datetime.now().strftime('%d-%b-%Y %H:%M:%S')
+             self._write_bias_correlation_diagnostics(out)
 
              out.createDimension("nt", self.obs_dict[reach]['nt'])
              nt = out.createVariable("nt", "i4", ("nt",))
              nt.units = "time steps"
              nt[:] = range(self.obs_dict[reach]['nt'])
+             self._write_time_strings(out, reach)
 
              # 1 busboi
              gb = out.createGroup("busboi")
@@ -165,6 +280,8 @@ class Output:
              gb_qbar_s2[:] = np.nan_to_num(self.alg_dict['busboi'][reach]['integrator']['qbar'], copy=True, nan=fillvalue)
              gb_sbQ = gb.createVariable("sbQ_rel", "f8", fill_value=fillvalue)
              gb_sbQ[:] = np.nan_to_num(self.alg_dict['busboi'][reach]['integrator']['sbQ_rel'], copy=True, nan=fillvalue)
+             gb_nrmse = gb.createVariable("flp_fit_nrmse", "f8", fill_value=fillvalue)
+             gb_nrmse[:] = np.nan_to_num(self.alg_dict['busboi'][reach]['integrator'].get('flp_fit_nrmse', np.nan), copy=True, nan=fillvalue)
 
              # 2 hivdi
              hv = out.createGroup("hivdi")
@@ -185,6 +302,8 @@ class Output:
              hv_qbar_s2[:] = np.nan_to_num(self.alg_dict['hivdi'][reach]['integrator']['qbar'], copy=True, nan=fillvalue)
              hv_sbQ = hv.createVariable("sbQ_rel", "f8", fill_value=fillvalue)
              hv_sbQ[:] = np.nan_to_num(self.alg_dict['hivdi'][reach]['integrator']['sbQ_rel'], copy=True, nan=fillvalue)
+             hv_nrmse = hv.createVariable("flp_fit_nrmse", "f8", fill_value=fillvalue)
+             hv_nrmse[:] = np.nan_to_num(self.alg_dict['hivdi'][reach]['integrator'].get('flp_fit_nrmse', np.nan), copy=True, nan=fillvalue)
 
              # 3 metroman
              mm = out.createGroup("metroman")
@@ -207,6 +326,8 @@ class Output:
              mm_q33[:] = np.nan_to_num(self.alg_dict['metroman'][reach]['integrator']['q33'], copy=True, nan=fillvalue)
              mm_sbQ = mm.createVariable("sbQ_rel", "f8", fill_value=fillvalue)
              mm_sbQ[:] = np.nan_to_num(self.alg_dict['metroman'][reach]['integrator']['sbQ_rel'], copy=True, nan=fillvalue)
+             mm_nrmse = mm.createVariable("flp_fit_nrmse", "f8", fill_value=fillvalue)
+             mm_nrmse[:] = np.nan_to_num(self.alg_dict['metroman'][reach]['integrator'].get('flp_fit_nrmse', np.nan), copy=True, nan=fillvalue)
 
              # 4 momma
              mo = out.createGroup("momma")
@@ -227,6 +348,8 @@ class Output:
              mo_qbar_s2[:] = np.nan_to_num(self.alg_dict['momma'][reach]['integrator']['qbar'], copy=True, nan=fillvalue)
              mo_sbQ = mo.createVariable("sbQ_rel", "f8", fill_value=fillvalue)
              mo_sbQ[:] = np.nan_to_num(self.alg_dict['momma'][reach]['integrator']['sbQ_rel'], copy=True, nan=fillvalue)
+             mo_nrmse = mo.createVariable("flp_fit_nrmse", "f8", fill_value=fillvalue)
+             mo_nrmse[:] = np.nan_to_num(self.alg_dict['momma'][reach]['integrator'].get('flp_fit_nrmse', np.nan), copy=True, nan=fillvalue)
 
              # 5 sad
              sd = out.createGroup("sad")
@@ -245,6 +368,8 @@ class Output:
              sd_qbar_s2[:] = np.nan_to_num(self.alg_dict['sad'][reach]['integrator']['qbar'], copy=True, nan=fillvalue)
              sd_sbQ = sd.createVariable("sbQ_rel", "f8", fill_value=fillvalue)
              sd_sbQ[:] = np.nan_to_num(self.alg_dict['sad'][reach]['integrator']['sbQ_rel'], copy=True, nan=fillvalue)
+             sd_nrmse = sd.createVariable("flp_fit_nrmse", "f8", fill_value=fillvalue)
+             sd_nrmse[:] = np.nan_to_num(self.alg_dict['sad'][reach]['integrator'].get('flp_fit_nrmse', np.nan), copy=True, nan=fillvalue)
 
              # 6 sic4dvar
              sic = out.createGroup("sic4dvar")
@@ -263,6 +388,8 @@ class Output:
              sic_qbar_s2[:] = np.nan_to_num(self.alg_dict['sic4dvar'][reach]['integrator']['qbar'], copy=True, nan=fillvalue)
              sic_sbQ = sic.createVariable("sbQ_rel", "f8", fill_value=fillvalue)
              sic_sbQ[:] = np.nan_to_num(self.alg_dict['sic4dvar'][reach]['integrator']['sbQ_rel'], copy=True, nan=fillvalue)
+             sic_nrmse = sic.createVariable("flp_fit_nrmse", "f8", fill_value=fillvalue)
+             sic_nrmse[:] = np.nan_to_num(self.alg_dict['sic4dvar'][reach]['integrator'].get('flp_fit_nrmse', np.nan), copy=True, nan=fillvalue)
 
              out.close()
 
@@ -296,7 +423,12 @@ class Output:
         try:
             reaches = sword_dataset['reaches']['reach_id'][:]
             for reach in self.basin_dict['reach_ids']:
-                reach_ind = np.where(reaches == reach)
+                reach_ind = np.where(reaches == np.int64(reach))
+                if reach_ind[0].size != 1:
+                    raise RuntimeError(
+                        f'Expected one SWORD match for reach {reach}, '
+                        f'found {reach_ind[0].size}'
+                    )
                 try:
                     # 1) BAM branch (using busboi outputs)
                     sword_dataset['reaches']['discharge_models'][branch]['BAM']['Abar'][reach_ind] = \
@@ -352,7 +484,7 @@ class Output:
                 except Exception as e:
                     print(reach, 'data not found for sword...', e)
         except Exception as e:
-            print('Error during sword writing...', e)
+            raise RuntimeError(f'Error during SWORD writing: {e}') from e
         finally:
             if sword_dataset:
                 sword_dataset.close()
