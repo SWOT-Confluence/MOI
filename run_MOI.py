@@ -382,7 +382,7 @@ def main():
                     params_dict,
                 )
                 output_obj.write_output()
-                #output_obj.write_sword_output(args.branch)
+                output_obj.write_sword_output(args.branch)
                 print(f"[{basin_id}] ✓ NetCDF export complete.")
 
     except Exception:
