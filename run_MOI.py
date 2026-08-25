@@ -98,6 +98,10 @@ def set_moi_params():
         'rho': 0.7,
         'niter': 1,
         'method': 'linear',
+        # 'rescale': keep the FLPE hydrograph's shape and shift its level to
+        # the integrated mean.  'flowlaw': regenerate it from the refitted
+        # flow-law parameters (previous behaviour, kept for reproducibility).
+        'Integrator_Hydrograph_Method': 'rescale',
         'quit_before_flpe': False,
         'apply_patches': False,
         'write_fill_only': False,

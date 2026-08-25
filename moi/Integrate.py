@@ -1166,6 +1166,101 @@ class Integrate:
         qsic4dvar=np.reshape(qsic4dvar,(1,len(d_x_area)))
         return qsic4dvar
 
+    def calc_integrator_hydrographs(self):
+        """Build the integrator hydrograph for every observed reach/algorithm.
+
+        The hydrograph is the reach-scale FLPE hydrograph with its level shifted
+        to the integrated mean, q = q_FLPE * (qbar_integrator / qbar_FLPE), so
+        the FLPE algorithm's temporal shape survives integration.  Regenerating
+        it from the refitted flow-law parameters -- the previous behaviour, kept
+        as 'flowlaw' -- discards that shape, because the FLP fit only ever
+        constrained two moments of the series.
+
+        Arrays are (1, obs_dict[reach]['nt']), i.e. on the valid-timestep grid,
+        exactly like the flow-law hydrographs they replace.  write_output()
+        re-inserts the deleted timesteps, so nothing downstream changes.
+
+        Reaches this cannot serve keep q_source == 'flowlaw' and are filled in
+        by compute_FLPs() from the refitted flow law, as before.
+        """
+        use_rescale = self.params_dict.get(
+            'Integrator_Hydrograph_Method', 'rescale'
+        ) == 'rescale'
+        n_rescaled = 0
+        n_flowlaw = 0
+
+        for alg in self.alg_dict:
+            for reach in self.alg_dict[alg]:
+                integ = self.alg_dict[alg][reach].setdefault('integrator', {})
+                integ['q_source'] = 'flowlaw'
+                if not use_rescale:
+                    continue
+                q = self.rescaled_flpe_hydrograph(alg, reach)
+                if q is None:
+                    n_flowlaw += 1
+                    continue
+                integ['q'] = q
+                integ['q_source'] = 'rescaled'
+                n_rescaled += 1
+
+        if self.VerboseFlag:
+            print(f'  {n_rescaled} hydrographs rescaled from FLPE, '
+                  f'{n_flowlaw} left to the flow law')
+
+    def rescaled_flpe_hydrograph(self, alg, reach):
+        """FLPE hydrograph rescaled to the integrated mean, or None."""
+        if reach not in self.basin_dict['reach_ids']:
+            return None
+        obs = self.obs_dict.get(reach)
+        if not obs:
+            return None
+        nt_valid = int(obs['nt'])
+        if nt_valid < 1:
+            return None
+
+        reach_data = self.alg_dict[alg][reach]
+
+        # get_pre_mean_q() substitutes the SoS prior into reach_data['qbar']
+        # when the algorithm produced nothing.  Rescaling by that is meaningless
+        # -- the numerator would be an all-NaN placeholder anyway.
+        if reach_data.get('qbar_source') != 'FLPE':
+            return None
+
+        qbar_int = reach_data.get('integrator', {}).get('qbar', np.nan)
+        if not np.isfinite(qbar_int):
+            return None
+
+        q = np.asarray(reach_data.get('q', np.nan), dtype=float).ravel()
+
+        # FLPE writes results on the full SWOT record; extract_swot() dropped
+        # the timesteps with fill geometry, so drop the same ones here.
+        nDelete = int(np.shape(obs['iDelete'])[1])
+        if q.size == nt_valid + nDelete and nDelete > 0:
+            q = np.delete(q, np.reshape(obs['iDelete'], (-1,)))
+        if q.size != nt_valid or not np.any(np.isfinite(q)):
+            return None
+
+        # Normalise by the mean of the timesteps actually written out, not by
+        # reach_data['qbar'] (the mean over the full record), so that
+        # nanmean(q_out) == qbar_integrator exactly.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            qbar_flpe = np.nanmean(q)
+        if not (np.isfinite(qbar_flpe) and qbar_flpe > 0.):
+            return None
+
+        # The rescale factor is deliberately not clamped.  A wild factor is a
+        # real disagreement between FLPE and the integrator, and it should show
+        # up in flp_fit_nrmse rather than be silently absorbed.
+        return np.reshape(q * (qbar_int / qbar_flpe), (1, nt_valid))
+
+    def integrator_hydrograph(self, alg, reach, q_flowlaw):
+        """Hydrograph to keep for one reach/algorithm after the FLP refit."""
+        integ = self.alg_dict[alg][reach].get('integrator', {})
+        if integ.get('q_source') == 'rescaled':
+            return integ['q']
+        return q_flowlaw
+
     def compute_FLPs(self):         
         if self.VerboseFlag: print('CALCULATING BUSBOI surrogate FLPs')
         for reach in self.alg_dict['busboi']:
@@ -1194,7 +1289,8 @@ class Integrate:
             
             self.alg_dict['busboi'][reach]['integrator']['n'] = param_est[0]
             self.alg_dict['busboi'][reach]['integrator']['a0'] = param_est[1]
-            self.alg_dict['busboi'][reach]['integrator']['q'] = self.bam_flowlaw(param_est, self.obs_dict[reach])
+            self.alg_dict['busboi'][reach]['integrator']['q'] = self.integrator_hydrograph(
+                'busboi', reach, self.bam_flowlaw(param_est, self.obs_dict[reach]))
 
         if self.VerboseFlag: print('CALCULATING HiVDI FLPs')
         for reach in self.alg_dict['hivdi']:
@@ -1216,7 +1312,8 @@ class Integrate:
             self.alg_dict['hivdi'][reach]['integrator']['alpha'] = res.x[0]
             self.alg_dict['hivdi'][reach]['integrator']['beta'] = res.x[1]
             self.alg_dict['hivdi'][reach]['integrator']['Abar'] = res.x[2]
-            self.alg_dict['hivdi'][reach]['integrator']['q'] = self.hivdi_flowlaw(res.x, self.obs_dict[reach])
+            self.alg_dict['hivdi'][reach]['integrator']['q'] = self.integrator_hydrograph(
+                'hivdi', reach, self.hivdi_flowlaw(res.x, self.obs_dict[reach]))
 
         if self.VerboseFlag: print('CALCULATING MetroMan FLPs')
         for reach in self.alg_dict['metroman']:
@@ -1238,7 +1335,8 @@ class Integrate:
             self.alg_dict['metroman'][reach]['integrator']['na'] = res.x[0]
             self.alg_dict['metroman'][reach]['integrator']['x1'] = res.x[1]
             self.alg_dict['metroman'][reach]['integrator']['a0'] = res.x[2]
-            self.alg_dict['metroman'][reach]['integrator']['q'] = self.metroman_flowlaw(res.x, self.obs_dict[reach])
+            self.alg_dict['metroman'][reach]['integrator']['q'] = self.integrator_hydrograph(
+                'metroman', reach, self.metroman_flowlaw(res.x, self.obs_dict[reach]))
 
         if self.VerboseFlag: print('CALCULATING MOMMA FLPs')
         for reach in self.alg_dict['momma']:
@@ -1269,7 +1367,8 @@ class Integrate:
             self.alg_dict['momma'][reach]['integrator']['B'] = param_est[0]
             self.alg_dict['momma'][reach]['integrator']['H'] = param_est[1]
             self.alg_dict['momma'][reach]['integrator']['Save'] = aux_var
-            self.alg_dict['momma'][reach]['integrator']['q'] = self.momma_flowlaw(param_est, self.obs_dict[reach], aux_var)
+            self.alg_dict['momma'][reach]['integrator']['q'] = self.integrator_hydrograph(
+                'momma', reach, self.momma_flowlaw(param_est, self.obs_dict[reach], aux_var))
 
         if self.VerboseFlag: print('CALCULATING SAD FLPs')
         for reach in self.alg_dict['sad']:
@@ -1290,7 +1389,8 @@ class Integrate:
             
             self.alg_dict['sad'][reach]['integrator']['n'] = res.x[0]
             self.alg_dict['sad'][reach]['integrator']['a0'] = res.x[1]
-            self.alg_dict['sad'][reach]['integrator']['q'] = self.sad_flowlaw(res.x, self.obs_dict[reach])
+            self.alg_dict['sad'][reach]['integrator']['q'] = self.integrator_hydrograph(
+                'sad', reach, self.sad_flowlaw(res.x, self.obs_dict[reach]))
 
         if self.VerboseFlag: print('CALCULATING SIC4DVar FLPs')
         for reach in self.alg_dict['sic4dvar']:
@@ -1310,7 +1410,8 @@ class Integrate:
             
             self.alg_dict['sic4dvar'][reach]['integrator']['n'] = res.x[0]
             self.alg_dict['sic4dvar'][reach]['integrator']['a0'] = res.x[1]
-            self.alg_dict['sic4dvar'][reach]['integrator']['q'] = self.sic4dvar_flowlaw(res.x, self.obs_dict[reach])
+            self.alg_dict['sic4dvar'][reach]['integrator']['q'] = self.integrator_hydrograph(
+                'sic4dvar', reach, self.sic4dvar_flowlaw(res.x, self.obs_dict[reach]))
     
         # if self.VerboseFlag: print('Enforcing strict array shapes for Output.py compatibility...')
         for alg in self.alg_dict:
@@ -1419,6 +1520,10 @@ class Integrate:
                   if self.VerboseFlag:
                       print(f'  Running driver iteration {i+1} / {n_outer_driver}')
                   residuals = self.integrator_optimization_calcs(m, n, FlowLevel, residuals)
+
+          if self.VerboseFlag:
+              print('Calculating integrator hydrographs')
+          self.calc_integrator_hydrographs()
 
           if self.params_dict.get('quit_before_flpe', False):
               sys.exit('done with integration... exiting')
