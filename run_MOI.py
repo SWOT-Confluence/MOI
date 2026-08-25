@@ -212,16 +212,16 @@ def main():
     index_to_run = resolve_index(args.index)
 
     # Path Configuration
-    #input_dir = Path("/mnt/data/input")
-    #flpe_dir = Path("/mnt/data/flpe")
-    input_dir=Path('/fs/ess/PAS1926/mike/noatak/confluence_run17dev/run17dev_mnt/input')
-    flpe_dir=Path('/fs/ess/PAS1926/mike/noatak/confluence_run17dev/run17dev_mnt/flpe')
+    input_dir = Path("/mnt/data/input")
+    flpe_dir = Path("/mnt/data/flpe")
+    #input_dir=Path('/fs/ess/PAS1926/mike/noatak/confluence_run17dev/run17dev_mnt/input')
+    #flpe_dir=Path('/fs/ess/PAS1926/mike/noatak/confluence_run17dev/run17dev_mnt/flpe')
     basin_json = input_dir / args.basinjson
     sword_dir = input_dir / "sword"
 
     # Output Directories
-    #output_dir = Path("/mnt/data/output")
-    output_dir=Path('/fs/ess/PAS1926/mike/noatak/confluence_run17dev/run17dev_mnt/moi')
+    output_dir = Path("/mnt/data/output")
+    #output_dir=Path('/fs/ess/PAS1926/mike/noatak/confluence_run17dev/run17dev_mnt/moi')
     output_dir.mkdir(parents=True, exist_ok=True)
 
     basin_data = get_basin_data(basin_json, index_to_run)
