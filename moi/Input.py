@@ -414,6 +414,16 @@ class Input:
             )
         return self.gage_dict
 
+    def merge_corridors_and_gages(self,corridors_dict):
+        '''
+            Combine corridors field data stored as dictionaries with 
+            gage_dict object defined in extract_svs
+        '''
+
+        for rid in corridors_dict:
+            self.gage_dict[rid]=corridors_dict[rid]
+
+
     def extract_sos(self):
         """Extracts and stores SoS data in sos_dict.
         
@@ -518,7 +528,6 @@ class Input:
                 n_not_found+=1
 
         sos_dataset.close()
-
 
     def extract_sword(self):
         """Extracts and stores SWORD data in sword_dict. (v15/v16/v17 Compatible)"""
@@ -728,6 +737,7 @@ class Input:
                         "qbar": np.nan
                         }
 
+
     def __extract_valid(self, r_id, bb_file, hv_file, mo_file, sd_file, mm_file, sv_file):
         """ Extract valid data from the output of each reach-level FLPE alg.
         Parameters
@@ -748,13 +758,16 @@ class Input:
             Path to SIC4DVar results file
         """
 
+        ntreach= self.obs_dict[r_id]['nt']+np.shape(self.obs_dict[r_id]['iDelete'])[1]
+
         # busboi
         if bb_file.exists():
             bb = Dataset(bb_file, 'r', format="NETCDF4")
             try:
                 q = np.array(bb["q"]["q"][:].filled(np.nan))
             except Exception:
-                q = np.nan
+                #q = np.nan
+                q = np.full( ntreach, np.nan)
 
             try:
                 r = np.array(bb["r"]["mean"][:].filled(np.nan))
@@ -795,7 +808,8 @@ class Input:
         else:
             self.alg_dict["busboi"][r_id] = { 
                 "s1-flpe-exists" : False ,
-                "q" : np.nan,
+                #"q" : np.nan,
+                "q" : np.full( ntreach, np.nan),
                 "r" : np.nan,
                 "bed" : np.nan,
                 "chainage" : np.nan,
@@ -820,7 +834,8 @@ class Input:
         else:
             self.alg_dict["hivdi"][r_id] = { 
                 "s1-flpe-exists" : False ,
-                "q" : np.nan,
+#                "q" : np.nan,
+                "q" : np.full( ntreach, np.nan),
                 "alpha" : np.nan,
                 "beta" : np.nan,
                 "qbar" : self.sos_dict[str(r_id)]['Qbar'],
@@ -843,7 +858,8 @@ class Input:
         else:
             self.alg_dict["momma"][r_id] = { 
                 "s1-flpe-exists" : False ,
-                "q" : np.nan,
+                #"q" : np.nan,
+                "q" : np.full( ntreach, np.nan),
                 "B" : np.nan,
                 "H" : np.nan,
                 "Save" : np.nan,
@@ -864,7 +880,8 @@ class Input:
         else:
             self.alg_dict["sad"][r_id] = { 
                 "s1-flpe-exists" : False ,
-                "q" : np.nan,
+                #"q" : np.nan,
+                "q" : np.full( ntreach, np.nan),
                 "n" : np.nan,
                 "a0" : np.nan,
                 "qbar" : self.sos_dict[str(r_id)]['Qbar'],
@@ -874,7 +891,6 @@ class Input:
         # metroman    
         if mm_file.exists():
             mm = Dataset(mm_file, 'r', format="NETCDF4")
-            # index = np.where(mm["reach_id"][:] == int(r_id))
             self.alg_dict["metroman"][r_id] = {
                  "s1-flpe-exists": True,
                  "q" : mm["average"]["allq"][:].filled(np.nan),
@@ -883,11 +899,11 @@ class Input:
                  "a0" : mm["average"]["A0hat"][:].filled(np.nan)
             }
             mm.close()
-            #print('MetroMan file found. ')
         else:
             self.alg_dict["metroman"][r_id] = { 
                 "s1-flpe-exists" : False ,
-                "q" : np.nan,
+                #"q" : np.nan,
+                "q" : np.full( ntreach, np.nan),
                 "na" : np.nan,
                 "x1" : np.nan,
                 "a0" : np.nan,
@@ -913,7 +929,8 @@ class Input:
             self.alg_dict["sic4dvar"][r_id] = { 
                 "s1-flpe-exists" : False ,
                 "q_mm": np.nan,
-                "q": np.nan,
+                #"q": np.nan,
+                "q" : np.full( ntreach, np.nan),
                 "n" : np.nan,
                 "a0" : np.nan,
                 "qbar" : self.sos_dict[str(r_id)]['Qbar'],

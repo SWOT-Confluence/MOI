@@ -11,7 +11,7 @@ import warnings
 from moi.Input import Input
 from moi.Integrate import Integrate
 from moi.Output import Output
-
+from moi.Corridors import Corridors
 
 def get_basin_data(basin_json, index_to_run):
     """Extract basin data by index and return a normalized dictionary."""
@@ -101,6 +101,8 @@ def set_moi_params():
         'quit_before_flpe': False,
         'apply_patches': False,
         'write_fill_only': False,
+        # parameters to handle Corridors data
+        'UseCORRIDORS': False,  
     }
 
 
@@ -188,6 +190,17 @@ def main():
         help='Disable the systematic FLPE bias state.',
     )
     parser.add_argument(
+        '--use-corridors',
+        action='store_true',
+        help='Enable the integration of CORRIDORS data.'
+    )
+    parser.add_argument(
+        '--corridors-dir',
+        type=Path,
+        default=Path('./corridors/'),
+        help='Directory containing multiple CSV files for CORRIDORS data.'
+    )
+    parser.add_argument(
         '-b',
         '--branch',
         type=str,
@@ -201,11 +214,14 @@ def main():
     # Path Configuration
     input_dir = Path("/mnt/data/input")
     flpe_dir = Path("/mnt/data/flpe")
+    #input_dir=Path('/fs/ess/PAS1926/mike/noatak/confluence_run17dev/run17dev_mnt/input')
+    #flpe_dir=Path('/fs/ess/PAS1926/mike/noatak/confluence_run17dev/run17dev_mnt/flpe')
     basin_json = input_dir / args.basinjson
     sword_dir = input_dir / "sword"
 
     # Output Directories
     output_dir = Path("/mnt/data/output")
+    #output_dir=Path('/fs/ess/PAS1926/mike/noatak/confluence_run17dev/run17dev_mnt/moi')
     output_dir.mkdir(parents=True, exist_ok=True)
 
     basin_data = get_basin_data(basin_json, index_to_run)
@@ -224,6 +240,10 @@ def main():
             log.write(f"Starting SFOI Pipeline Index {index_to_run}, Basin {basin_id}\n")
 
             params_dict = set_moi_params()
+
+            if args.use_corridors:
+                params_dict['UseCORRIDORS'] = True
+
             if args.correlation_rho is not None:
                 if not 0.0 <= args.correlation_rho < 1.0:
                     raise ValueError('--correlation-rho must satisfy 0 <= rho < 1')
@@ -300,6 +320,22 @@ def main():
                 print(f"[{basin_id}] SKIP: Essential data missing ({str(e)})")
                 sys.exit(1)
 
+            # Optionally extract CORRIDORS data
+            corridors_dict = None
+            if params_dict.get('UseCORRIDORS') and args.branch == 'constrained':
+                if args.corridors_dir and args.corridors_dir.is_dir():
+                    print(f"[{basin_id}] Extracting CORRIDORS Data...")
+                    corridors_obj = Corridors(
+                            args.corridors_dir, 
+                            input_obj.basin_dict,
+                            input_obj.obs_dict,
+                            verbose=args.verbose
+                            )
+                    corridors_dict = corridors_obj.integrate_corridors_data()
+                    input_obj.merge_corridors_and_gages(corridors_dict)
+                else:
+                    warnings.warn("UseCORRIDORS is true, but no valid --corridors-dir was provided. Proceeding without CORRIDORS.")
+
             # ---------------------------------------------------------
             # 2. INTEGRATION
             # ---------------------------------------------------------
@@ -317,6 +353,7 @@ def main():
                 # An explicit (even empty) SVS selection must not be refilled
                 # from SoS, because that could reintroduce validation gages.
                 gage_dict=getattr(input_obj, 'gage_dict', {}) if svs_loaded else None,
+                corridors_dict=corridors_dict, 
             )
 
             try:

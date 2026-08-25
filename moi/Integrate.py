@@ -34,6 +34,7 @@ class Integrate:
         Branch,
         VerboseFlag,
         gage_dict=None,
+        corridors_dict=None,
     ):
         self.alg_dict = alg_dict
         self.basin_dict = basin_dict
@@ -43,6 +44,7 @@ class Integrate:
         self.sos_dict = sos_dict
         self._use_sos_gage_fallback = gage_dict is None
         self.gage_dict = {} if gage_dict is None else dict(gage_dict)
+        self.corridors_dict = {} if corridors_dict is None else dict(corridors_dict) 
         self.Branch = Branch
         self.VerboseFlag = VerboseFlag
         self.junctions = []
@@ -1194,7 +1196,7 @@ class Integrate:
             
             self.alg_dict['busboi'][reach]['integrator']['n'] = param_est[0]
             self.alg_dict['busboi'][reach]['integrator']['a0'] = param_est[1]
-            self.alg_dict['busboi'][reach]['integrator']['q'] = self.bam_flowlaw(param_est, self.obs_dict[reach])
+            #self.alg_dict['busboi'][reach]['integrator']['q'] = self.bam_flowlaw(param_est, self.obs_dict[reach])
 
         if self.VerboseFlag: print('CALCULATING HiVDI FLPs')
         for reach in self.alg_dict['hivdi']:
@@ -1216,7 +1218,7 @@ class Integrate:
             self.alg_dict['hivdi'][reach]['integrator']['alpha'] = res.x[0]
             self.alg_dict['hivdi'][reach]['integrator']['beta'] = res.x[1]
             self.alg_dict['hivdi'][reach]['integrator']['Abar'] = res.x[2]
-            self.alg_dict['hivdi'][reach]['integrator']['q'] = self.hivdi_flowlaw(res.x, self.obs_dict[reach])
+            #self.alg_dict['hivdi'][reach]['integrator']['q'] = self.hivdi_flowlaw(res.x, self.obs_dict[reach])
 
         if self.VerboseFlag: print('CALCULATING MetroMan FLPs')
         for reach in self.alg_dict['metroman']:
@@ -1238,7 +1240,7 @@ class Integrate:
             self.alg_dict['metroman'][reach]['integrator']['na'] = res.x[0]
             self.alg_dict['metroman'][reach]['integrator']['x1'] = res.x[1]
             self.alg_dict['metroman'][reach]['integrator']['a0'] = res.x[2]
-            self.alg_dict['metroman'][reach]['integrator']['q'] = self.metroman_flowlaw(res.x, self.obs_dict[reach])
+            #self.alg_dict['metroman'][reach]['integrator']['q'] = self.metroman_flowlaw(res.x, self.obs_dict[reach])
 
         if self.VerboseFlag: print('CALCULATING MOMMA FLPs')
         for reach in self.alg_dict['momma']:
@@ -1269,7 +1271,7 @@ class Integrate:
             self.alg_dict['momma'][reach]['integrator']['B'] = param_est[0]
             self.alg_dict['momma'][reach]['integrator']['H'] = param_est[1]
             self.alg_dict['momma'][reach]['integrator']['Save'] = aux_var
-            self.alg_dict['momma'][reach]['integrator']['q'] = self.momma_flowlaw(param_est, self.obs_dict[reach], aux_var)
+            #self.alg_dict['momma'][reach]['integrator']['q'] = self.momma_flowlaw(param_est, self.obs_dict[reach], aux_var)
 
         if self.VerboseFlag: print('CALCULATING SAD FLPs')
         for reach in self.alg_dict['sad']:
@@ -1290,7 +1292,7 @@ class Integrate:
             
             self.alg_dict['sad'][reach]['integrator']['n'] = res.x[0]
             self.alg_dict['sad'][reach]['integrator']['a0'] = res.x[1]
-            self.alg_dict['sad'][reach]['integrator']['q'] = self.sad_flowlaw(res.x, self.obs_dict[reach])
+            #self.alg_dict['sad'][reach]['integrator']['q'] = self.sad_flowlaw(res.x, self.obs_dict[reach])
 
         if self.VerboseFlag: print('CALCULATING SIC4DVar FLPs')
         for reach in self.alg_dict['sic4dvar']:
@@ -1310,8 +1312,12 @@ class Integrate:
             
             self.alg_dict['sic4dvar'][reach]['integrator']['n'] = res.x[0]
             self.alg_dict['sic4dvar'][reach]['integrator']['a0'] = res.x[1]
-            self.alg_dict['sic4dvar'][reach]['integrator']['q'] = self.sic4dvar_flowlaw(res.x, self.obs_dict[reach])
+            #self.alg_dict['sic4dvar'][reach]['integrator']['q'] = self.sic4dvar_flowlaw(res.x, self.obs_dict[reach])
     
+        '''
+          The check below is made obsolete by the new way integrator hydrographs are handled. 
+          Remove this block after further testing
+
         # if self.VerboseFlag: print('Enforcing strict array shapes for Output.py compatibility...')
         for alg in self.alg_dict:
             for reach in self.basin_dict['reach_ids_all']:
@@ -1330,7 +1336,17 @@ class Integrate:
                             new_q[0, :copy_len] = q_arr[0, :copy_len]
                                 
                             self.alg_dict[alg][reach]['integrator']['q'] = new_q
+        '''
     
+    def calc_integrator_hydrographs(self):
+        for alg in self.alg_dict:
+            for reach in self.alg_dict[alg]:
+                try: datagood = (self.obs_dict[reach]['nt'] > 0 and self.alg_dict[alg][reach]['q'].size > 0) 
+                except Exception: datagood = False
+                if reach not in self.basin_dict['reach_ids'] or not datagood: continue
+                qalgo= np.reshape(self.alg_dict[alg][reach]['q'],(1,len(self.alg_dict[alg][reach]['q'])))
+                self.alg_dict[alg][reach]['integrator']['q'] = qalgo * \
+                    self.alg_dict[alg][reach]['integrator']['qbar']/ self.alg_dict[alg][reach]['qbar'] 
 
     def build_soft_sfoi_system(self, n, Qbar, sigQ, facc, u_conversion):
         """Build sparse paper-style SFOI system.
@@ -1419,6 +1435,10 @@ class Integrate:
                   if self.VerboseFlag:
                       print(f'  Running driver iteration {i+1} / {n_outer_driver}')
                   residuals = self.integrator_optimization_calcs(m, n, FlowLevel, residuals)
+
+          if self.VerboseFlag:
+              print('Calculating integrator hydrographs')
+          self.calc_integrator_hydrographs()
 
           if self.params_dict.get('quit_before_flpe', False):
               sys.exit('done with integration... exiting')

@@ -247,9 +247,9 @@ class Output:
              iInsert = np.reshape(iInsert,[nDelete,]) 
              self.obs_dict[reach]['nt'] += nDelete
 
-             for algo in ['busboi', 'hivdi', 'metroman', 'momma', 'sad', 'sic4dvar']:
-                 self.alg_dict[algo][reach]['integrator']['q'] = np.insert(
-                     self.alg_dict[algo][reach]['integrator']['q'], iInsert, fillvalue, 1)
+             #for algo in ['busboi', 'hivdi', 'metroman', 'momma', 'sad', 'sic4dvar']:
+             #    self.alg_dict[algo][reach]['integrator']['q'] = np.insert(
+             #        self.alg_dict[algo][reach]['integrator']['q'], iInsert, fillvalue, 1)
 
              # NetCDF file creation for observed reaches
              out_file = self.out_dir / f"{reach}_integrator.nc"
