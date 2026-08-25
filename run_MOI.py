@@ -102,6 +102,9 @@ def set_moi_params():
         # the integrated mean.  'flowlaw': regenerate it from the refitted
         # flow-law parameters (previous behaviour, kept for reproducibility).
         'Integrator_Hydrograph_Method': 'rescale',
+        # 'series': fit the flow-law parameters to the integrator hydrograph.
+        # 'moments': match qbar and q33 only (previous behaviour).
+        'FLP_Fit_Method': 'series',
         'quit_before_flpe': False,
         'apply_patches': False,
         'write_fill_only': False,
@@ -192,6 +195,29 @@ def main():
         help='Disable the systematic FLPE bias state.',
     )
     parser.add_argument(
+        '--integrator-hydrograph',
+        type=str,
+        default=None,
+        choices=['rescale', 'flowlaw'],
+        help=(
+            'How the integrator hydrograph is built. rescale: keep the FLPE '
+            "hydrograph's shape and shift its level to the integrated mean. "
+            'flowlaw: regenerate it from the refitted flow-law parameters '
+            '(behaviour before the rescale change).'
+        ),
+    )
+    parser.add_argument(
+        '--flp-fit',
+        type=str,
+        default=None,
+        choices=['series', 'moments'],
+        help=(
+            'How final flow-law parameters are fitted. series: least squares '
+            'against the integrator hydrograph. moments: match qbar and q33 '
+            'only (behaviour before the series fit change).'
+        ),
+    )
+    parser.add_argument(
         '-b',
         '--branch',
         type=str,
@@ -240,6 +266,10 @@ def main():
                 params_dict['SFOI_Correlation_Enabled'] = False
             if args.disable_bias_augmentation:
                 params_dict['SFOI_Bias_Augmentation'] = False
+            if args.integrator_hydrograph is not None:
+                params_dict['Integrator_Hydrograph_Method'] = args.integrator_hydrograph
+            if args.flp_fit is not None:
+                params_dict['FLP_Fit_Method'] = args.flp_fit
 
             # ---------------------------------------------------------
             # 1. INPUT EXTRACTION

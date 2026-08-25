@@ -1166,6 +1166,99 @@ class Integrate:
         qsic4dvar=np.reshape(qsic4dvar,(1,len(d_x_area)))
         return qsic4dvar
 
+    def flp_fit_target(self, alg, reach):
+        """Series the FLP refit should reproduce, or None to fall back."""
+        integ = self.alg_dict[alg][reach].get('integrator', {})
+        if integ.get('q_source') != 'rescaled':
+            return None
+        q = np.asarray(integ.get('q'), dtype=float).ravel()
+        return q if q.size > 0 else None
+
+    @staticmethod
+    def momma_shape_penalty(params):
+        """Keep MOMMA's bankfull depth away from zero, as momma_objfun does."""
+        Db = params[1] - params[0]
+        if Db < 0.1:
+            return 10.
+        if Db < 0.2:
+            return 2.
+        return 1.
+
+    def flp_series_objfun(self, params, obs, flowlaw, q_target, extra=(), penalty=None):
+        """Least squares of the flow law against the integrator hydrograph.
+
+        Linear space, deliberately: it is the space the moment-matching
+        objective it replaces worked in, so results stay directly comparable
+        while we iterate.  The point of the change is conditioning -- fitting
+        2-3 parameters to the whole series makes the problem over-determined
+        instead of exactly- or under-determined, which is where the moment fit
+        lost precision.
+        """
+        try:
+            q = np.asarray(flowlaw(params, obs, *extra), dtype=float).ravel()
+        except Exception:
+            return 1e12
+        if q.size != q_target.size:
+            return 1e12
+        r = q - q_target
+        good = np.isfinite(r)
+        if not np.any(good):
+            return 1e12
+        y = float(np.mean(r[good] ** 2))
+        if penalty is not None:
+            y *= penalty(params)
+        return y
+
+    def flp_objective(self, alg, reach, flowlaw, moment_objfun, moment_args,
+                      extra=(), penalty=None):
+        """(fun, args) for optimize.minimize.
+
+        Fit the flow law to the integrator hydrograph where we have one; fall
+        back to the old qbar/q33 moment match where we do not, or wherever
+        FLP_Fit_Method is set to 'moments'.  Combined with
+        Integrator_Hydrograph_Method, that lets one build reproduce every
+        combination of old and new behaviour without a rebuild.
+        """
+        if self.params_dict.get('FLP_Fit_Method', 'series') != 'series':
+            return moment_objfun, moment_args
+        q_target = self.flp_fit_target(alg, reach)
+        if q_target is None:
+            return moment_objfun, moment_args
+        return (self.flp_series_objfun,
+                (self.obs_dict[reach], flowlaw, q_target, extra, penalty))
+
+    def flp_fit_diagnostic(self, alg, reach, params, flowlaw, extra=()):
+        """Store how well the refitted flow law reproduces the hydrograph.
+
+        nRMSE against the stored hydrograph, normalised by its mean.  Left as
+        NaN when there was no series to fit, so a fill value in the output also
+        marks a reach that fell back to the flow-law hydrograph.
+        """
+        integ = self.alg_dict[alg][reach].setdefault('integrator', {})
+        integ.setdefault('flp_fit_nrmse', np.nan)
+        q_target = self.flp_fit_target(alg, reach)
+        if q_target is None:
+            return
+        try:
+            q = np.asarray(
+                flowlaw(params, self.obs_dict[reach], *extra), dtype=float
+            ).ravel()
+        except Exception:
+            return
+        if q.size != q_target.size:
+            return
+        r = q - q_target
+        good = np.isfinite(r)
+        if not np.any(good):
+            return
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            denom = np.nanmean(q_target[good])
+            if np.isfinite(denom) and denom > 0.:
+                integ['flp_fit_nrmse'] = float(
+                    np.sqrt(np.mean(r[good] ** 2)) / denom
+                )
+
     def calc_integrator_hydrographs(self):
         """Build the integrator hydrograph for every observed reach/algorithm.
 
@@ -1278,8 +1371,12 @@ class Integrate:
             qbar = self.alg_dict['busboi'][reach]['integrator']['qbar'] 
             q33 = self.alg_dict['busboi'][reach]['integrator'].get('q33', np.nan) 
 
+            objfun, objargs = self.flp_objective(
+                'busboi', reach, self.bam_flowlaw,
+                self.bam_objfun, (self.obs_dict[reach], qbar, q33))
+
             try:
-                res = optimize.minimize(fun=self.bam_objfun, x0=init_params, args=(self.obs_dict[reach], qbar, q33), bounds=param_bounds)
+                res = optimize.minimize(fun=objfun, x0=init_params, args=objargs, bounds=param_bounds)
                 if res.success:
                     param_est = res.x
                 else:
@@ -1291,6 +1388,7 @@ class Integrate:
             self.alg_dict['busboi'][reach]['integrator']['a0'] = param_est[1]
             self.alg_dict['busboi'][reach]['integrator']['q'] = self.integrator_hydrograph(
                 'busboi', reach, self.bam_flowlaw(param_est, self.obs_dict[reach]))
+            self.flp_fit_diagnostic('busboi', reach, param_est, self.bam_flowlaw)
 
         if self.VerboseFlag: print('CALCULATING HiVDI FLPs')
         for reach in self.alg_dict['hivdi']:
@@ -1307,13 +1405,17 @@ class Integrate:
             param_bounds = ((0.001, np.inf), (-1e1, 1.e1), (Abar_min, np.inf))
             qbar = self.alg_dict['hivdi'][reach]['integrator']['qbar']
             q33 = self.alg_dict['hivdi'][reach]['integrator'].get('q33', np.nan) 
-            res = optimize.minimize(fun=self.hivdi_objfun, x0=init_params, args=(self.obs_dict[reach], qbar, q33), bounds=param_bounds)
+            objfun, objargs = self.flp_objective(
+                'hivdi', reach, self.hivdi_flowlaw,
+                self.hivdi_objfun, (self.obs_dict[reach], qbar, q33))
+            res = optimize.minimize(fun=objfun, x0=init_params, args=objargs, bounds=param_bounds)
             
             self.alg_dict['hivdi'][reach]['integrator']['alpha'] = res.x[0]
             self.alg_dict['hivdi'][reach]['integrator']['beta'] = res.x[1]
             self.alg_dict['hivdi'][reach]['integrator']['Abar'] = res.x[2]
             self.alg_dict['hivdi'][reach]['integrator']['q'] = self.integrator_hydrograph(
                 'hivdi', reach, self.hivdi_flowlaw(res.x, self.obs_dict[reach]))
+            self.flp_fit_diagnostic('hivdi', reach, res.x, self.hivdi_flowlaw)
 
         if self.VerboseFlag: print('CALCULATING MetroMan FLPs')
         for reach in self.alg_dict['metroman']:
@@ -1330,13 +1432,17 @@ class Integrate:
             param_bounds = ((0.001, np.inf), (-1e1, 1e1), (Abar_min, np.inf))
             qbar = self.alg_dict['metroman'][reach]['integrator']['qbar']
             q33 = self.alg_dict['metroman'][reach]['integrator'].get('q33', np.nan)
-            res = optimize.minimize(fun=self.metroman_objfun, x0=init_params, args=(self.obs_dict[reach], qbar, q33), bounds=param_bounds)
+            objfun, objargs = self.flp_objective(
+                'metroman', reach, self.metroman_flowlaw,
+                self.metroman_objfun, (self.obs_dict[reach], qbar, q33))
+            res = optimize.minimize(fun=objfun, x0=init_params, args=objargs, bounds=param_bounds)
             
             self.alg_dict['metroman'][reach]['integrator']['na'] = res.x[0]
             self.alg_dict['metroman'][reach]['integrator']['x1'] = res.x[1]
             self.alg_dict['metroman'][reach]['integrator']['a0'] = res.x[2]
             self.alg_dict['metroman'][reach]['integrator']['q'] = self.integrator_hydrograph(
                 'metroman', reach, self.metroman_flowlaw(res.x, self.obs_dict[reach]))
+            self.flp_fit_diagnostic('metroman', reach, res.x, self.metroman_flowlaw)
 
         if self.VerboseFlag: print('CALCULATING MOMMA FLPs')
         for reach in self.alg_dict['momma']:
@@ -1358,7 +1464,12 @@ class Integrate:
             qbar = self.alg_dict['momma'][reach]['integrator']['qbar']
             q33 = self.alg_dict['momma'][reach]['integrator'].get('q33', np.nan) 
 
-            try: res = optimize.minimize(fun=self.momma_objfun, x0=init_params, args=(self.obs_dict[reach], qbar, q33, aux_var), bounds=param_bounds)
+            objfun, objargs = self.flp_objective(
+                'momma', reach, self.momma_flowlaw,
+                self.momma_objfun, (self.obs_dict[reach], qbar, q33, aux_var),
+                extra=(aux_var,), penalty=self.momma_shape_penalty)
+
+            try: res = optimize.minimize(fun=objfun, x0=init_params, args=objargs, bounds=param_bounds)
             except Exception: res = lambda: None; res.success = False
 
             if not res.success: param_est = (self.alg_dict['momma'][reach].get('B', np.nan), self.alg_dict['momma'][reach].get('H', np.nan))
@@ -1369,6 +1480,7 @@ class Integrate:
             self.alg_dict['momma'][reach]['integrator']['Save'] = aux_var
             self.alg_dict['momma'][reach]['integrator']['q'] = self.integrator_hydrograph(
                 'momma', reach, self.momma_flowlaw(param_est, self.obs_dict[reach], aux_var))
+            self.flp_fit_diagnostic('momma', reach, param_est, self.momma_flowlaw, (aux_var,))
 
         if self.VerboseFlag: print('CALCULATING SAD FLPs')
         for reach in self.alg_dict['sad']:
@@ -1385,12 +1497,16 @@ class Integrate:
             param_bounds = ((0.001, np.inf), (Abar_min, np.inf))
             qbar = self.alg_dict['sad'][reach]['integrator']['qbar']
             q33 = self.alg_dict['sad'][reach]['integrator'].get('q33', np.nan) 
-            res = optimize.minimize(fun=self.sad_objfun, x0=init_params, args=(self.obs_dict[reach], qbar, q33), bounds=param_bounds)
+            objfun, objargs = self.flp_objective(
+                'sad', reach, self.sad_flowlaw,
+                self.sad_objfun, (self.obs_dict[reach], qbar, q33))
+            res = optimize.minimize(fun=objfun, x0=init_params, args=objargs, bounds=param_bounds)
             
             self.alg_dict['sad'][reach]['integrator']['n'] = res.x[0]
             self.alg_dict['sad'][reach]['integrator']['a0'] = res.x[1]
             self.alg_dict['sad'][reach]['integrator']['q'] = self.integrator_hydrograph(
                 'sad', reach, self.sad_flowlaw(res.x, self.obs_dict[reach]))
+            self.flp_fit_diagnostic('sad', reach, res.x, self.sad_flowlaw)
 
         if self.VerboseFlag: print('CALCULATING SIC4DVar FLPs')
         for reach in self.alg_dict['sic4dvar']:
@@ -1406,12 +1522,16 @@ class Integrate:
 
             param_bounds = ((0.001, 10.), (Abar_min, np.inf))
             qbar = self.alg_dict['sic4dvar'][reach]['integrator']['qbar']
-            res = optimize.minimize(fun=self.sic4dvar_objfun, x0=init_params, args=(self.obs_dict[reach], qbar), bounds=param_bounds)
+            objfun, objargs = self.flp_objective(
+                'sic4dvar', reach, self.sic4dvar_flowlaw,
+                self.sic4dvar_objfun, (self.obs_dict[reach], qbar))
+            res = optimize.minimize(fun=objfun, x0=init_params, args=objargs, bounds=param_bounds)
             
             self.alg_dict['sic4dvar'][reach]['integrator']['n'] = res.x[0]
             self.alg_dict['sic4dvar'][reach]['integrator']['a0'] = res.x[1]
             self.alg_dict['sic4dvar'][reach]['integrator']['q'] = self.integrator_hydrograph(
                 'sic4dvar', reach, self.sic4dvar_flowlaw(res.x, self.obs_dict[reach]))
+            self.flp_fit_diagnostic('sic4dvar', reach, res.x, self.sic4dvar_flowlaw)
     
         # if self.VerboseFlag: print('Enforcing strict array shapes for Output.py compatibility...')
         for alg in self.alg_dict:
