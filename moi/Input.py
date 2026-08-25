@@ -758,6 +758,8 @@ class Input:
             Path to SIC4DVar results file
         """
 
+        ntreach= self.obs_dict[r_id]['nt']+np.shape(self.obs_dict[r_id]['iDelete'])[1]
+
         # busboi
         if bb_file.exists():
             bb = Dataset(bb_file, 'r', format="NETCDF4")
@@ -805,7 +807,8 @@ class Input:
         else:
             self.alg_dict["busboi"][r_id] = { 
                 "s1-flpe-exists" : False ,
-                "q" : np.nan,
+                #"q" : np.nan,
+                "q" : np.full( ntreach, np.nan),
                 "r" : np.nan,
                 "bed" : np.nan,
                 "chainage" : np.nan,
@@ -830,7 +833,8 @@ class Input:
         else:
             self.alg_dict["hivdi"][r_id] = { 
                 "s1-flpe-exists" : False ,
-                "q" : np.nan,
+#                "q" : np.nan,
+                "q" : np.full( ntreach, np.nan),
                 "alpha" : np.nan,
                 "beta" : np.nan,
                 "qbar" : self.sos_dict[str(r_id)]['Qbar'],
@@ -853,7 +857,8 @@ class Input:
         else:
             self.alg_dict["momma"][r_id] = { 
                 "s1-flpe-exists" : False ,
-                "q" : np.nan,
+                #"q" : np.nan,
+                "q" : np.full( ntreach, np.nan),
                 "B" : np.nan,
                 "H" : np.nan,
                 "Save" : np.nan,
@@ -874,7 +879,8 @@ class Input:
         else:
             self.alg_dict["sad"][r_id] = { 
                 "s1-flpe-exists" : False ,
-                "q" : np.nan,
+                #"q" : np.nan,
+                "q" : np.full( ntreach, np.nan),
                 "n" : np.nan,
                 "a0" : np.nan,
                 "qbar" : self.sos_dict[str(r_id)]['Qbar'],
@@ -884,7 +890,6 @@ class Input:
         # metroman    
         if mm_file.exists():
             mm = Dataset(mm_file, 'r', format="NETCDF4")
-            # index = np.where(mm["reach_id"][:] == int(r_id))
             self.alg_dict["metroman"][r_id] = {
                  "s1-flpe-exists": True,
                  "q" : mm["average"]["allq"][:].filled(np.nan),
@@ -893,23 +898,11 @@ class Input:
                  "a0" : mm["average"]["A0hat"][:].filled(np.nan)
             }
             mm.close()
-            #print('reaches in obs_dict',self.obs_dict.keys())
-            #print('reaches in alg_dict',self.alg_dict['metroman'].keys())
-            if str(r_id) in self.obs_dict and r_id in self.alg_dict['metroman']:
-                #print('removing bad data for reach ',r_id)
-                iDelete=self.obs_dict[str(r_id)]['iDelete']
-                self.alg_dict['metroman'][r_id]['q'] = np.delete(self.alg_dict['metroman'][r_id]['q'], iDelete, 0)
-            #print('MetroMan file found. ')
-            #if int(r_id)==81340100011:
-            #    print('Input.py, after removing bad data. shape for q reach 81340100011 is',
-            #            np.shape(self.alg_dict['metroman'][r_id]['q'][:]))
-            #    print('Input.py, after removing bad data. q for reach 81340100011 is',
-            #            self.alg_dict['metroman'][r_id]['q'][:])
-            #    sys.exit()
         else:
             self.alg_dict["metroman"][r_id] = { 
                 "s1-flpe-exists" : False ,
-                "q" : np.nan,
+                #"q" : np.nan,
+                "q" : np.full( ntreach, np.nan),
                 "na" : np.nan,
                 "x1" : np.nan,
                 "a0" : np.nan,
@@ -935,7 +928,8 @@ class Input:
             self.alg_dict["sic4dvar"][r_id] = { 
                 "s1-flpe-exists" : False ,
                 "q_mm": np.nan,
-                "q": np.nan,
+                #"q": np.nan,
+                "q" : np.full( ntreach, np.nan),
                 "n" : np.nan,
                 "a0" : np.nan,
                 "qbar" : self.sos_dict[str(r_id)]['Qbar'],
