@@ -56,6 +56,7 @@ class Integrate:
         self.topology_report = {}
         self.flp_fit_report = {}
         self.unconverged_solves = []
+        self.flp_hydrograph_repairs = 0
         
         self.integ_dict = {
             "pre_q_mean": np.array([]),
@@ -1788,11 +1789,17 @@ class Integrate:
         if alg == 'momma':
             integ['Save'] = spec['save']
 
-        q_flowlaw = flp_fit._safe_flowlaw(
-            spec['flowlaw'], outcome.params, obs, spec['extra'])
-        if q_flowlaw is None:
-            q_flowlaw = np.full((1, int(obs.get('nt', 1) or 1)), np.nan)
-        integ['q'] = self.integrator_hydrograph(alg, reach, q_flowlaw)
+        # _safe_flowlaw ravels, because that is what the cost functions want.
+        # What gets STORED has to be (1, nt): Output.write_output re-inserts the
+        # dropped timesteps with np.insert(..., axis=1) and a 1-D array makes
+        # that raise AxisError, losing the output file for the whole basin.
+        nt_valid = int(obs.get('nt', 1) or 1)
+        q_flowlaw = flp_fit.as_row(
+            flp_fit._safe_flowlaw(
+                spec['flowlaw'], outcome.params, obs, spec['extra']),
+            nt_valid)
+        integ['q'] = flp_fit.as_row(
+            self.integrator_hydrograph(alg, reach, q_flowlaw), nt_valid)
 
         integ['flp_fit_nrmse'] = outcome.nrmse_lin
         integ['flp_fit_nrmse_log'] = outcome.nrmse_log
@@ -1859,23 +1866,35 @@ class Integrate:
                     '%s=%d' % (k, v) for k, v in sorted(counts.items())))
 
         # Output.py expects (1, nt) on the valid-timestep grid for every reach.
+        # Always write the normalised array back.  The previous version only
+        # assigned inside the "shape is wrong" branch, so a 1-D array of the
+        # right length was normalised for the comparison and then left 1-D in
+        # the dict -- which is exactly how the AxisError in write_output got in.
+        repairs = 0
         for alg in self.alg_dict:
             for reach in self.basin_dict['reach_ids_all']:
                 if reach in self.obs_dict and 'integrator' in self.alg_dict[alg].get(reach, {}):
                     expected_nt = self.obs_dict[reach].get('nt', 1)
                     if expected_nt < 0: expected_nt = 1
 
-                    q_arr = self.alg_dict[alg][reach]['integrator'].get('q')
+                    integ = self.alg_dict[alg][reach]['integrator']
+                    q_arr = integ.get('q')
+                    if q_arr is None:
+                        continue
 
-                    if q_arr is not None:
-                        q_arr = np.atleast_2d(q_arr)
-                        if q_arr.shape != (1, expected_nt):
-                            new_q = np.full((1, expected_nt), np.nan)
+                    if np.size(q_arr) != expected_nt:
+                        # Truncating or padding a hydrograph is a repair, not a
+                        # detail: count it so a global run can see it happened.
+                        repairs += 1
+                        if self.VerboseFlag:
+                            print('    %s %s: hydrograph had %d values, '
+                                  'expected %d' % (alg, reach, np.size(q_arr),
+                                                   expected_nt))
+                    integ['q'] = flp_fit.as_row(q_arr, expected_nt)
 
-                            copy_len = min(expected_nt, q_arr.shape[1])
-                            new_q[0, :copy_len] = q_arr[0, :copy_len]
-
-                            self.alg_dict[alg][reach]['integrator']['q'] = new_q
+        self.flp_hydrograph_repairs = repairs
+        if self.VerboseFlag and repairs:
+            print('  %d hydrographs repaired to the expected length' % repairs)
 
     def build_soft_sfoi_system(self, n, Qbar, sigQ, facc, u_conversion):
         """Build sparse paper-style SFOI system.
@@ -2003,6 +2022,8 @@ class Integrate:
               'n_unconverged_solves': n_unconverged,
               'flp_fit_status_counts': flp,
               'n_flp_fits_not_good': n_not_good,
+              'n_hydrograph_repairs': int(
+                  getattr(self, 'flp_hydrograph_repairs', 0)),
           }
 
     def print_run_report(self):
@@ -2018,6 +2039,8 @@ class Integrate:
                        len(topo.get('isolated_reaches', [])),
                        len(topo.get('missing_from_sword', []))))
           print('  unconverged solver runs: %d' % report['n_unconverged_solves'])
+          print('  hydrographs repaired to length: %d'
+                % report['n_hydrograph_repairs'])
           for alg, counts in report['flp_fit_status_counts'].items():
               if counts:
                   print('  FLP %-9s %s' % (

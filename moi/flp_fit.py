@@ -667,6 +667,39 @@ def refine_local(flowlaw, obs, target, params, param_bounds, extra=(),
     return params, start_cost
 
 
+def as_row(q, nt, fill=np.nan):
+    """Coerce a hydrograph to the (1, nt) storage shape MOI uses everywhere.
+
+    Every ``Integrate.*_flowlaw`` ends with ``np.reshape(q, (1, nt))``, and the
+    rest of the pipeline quietly depends on that: ``Output.write_output`` calls
+    ``np.insert(q, iInsert, fillvalue, 1)`` to put the dropped timesteps back,
+    which raises ``AxisError`` on a 1-D array and takes the whole basin's output
+    with it.  The contract was never written down anywhere, so it was easy to
+    break by raveling a hydrograph for a cost function and storing the result.
+
+    This is that contract, in one place.  It accepts a scalar, a 1-D series or a
+    (1, nt) row, and pads or truncates to ``nt`` rather than raising -- a
+    malformed hydrograph for one algorithm must not cost the other five their
+    output file.  Callers that care whether a repair happened can compare
+    ``np.size(q)`` against ``nt`` before calling.
+    """
+    # Keep zero valid timesteps as (1, 0).  Output later re-inserts every
+    # dropped timestep; forcing a synthetic value here would make that final
+    # record one sample too long.
+    nt = max(int(nt), 0)
+    out = np.full((1, nt), fill, dtype=float)
+    if q is None:
+        return out
+    try:
+        arr = np.asarray(q, dtype=float).ravel()
+    except (TypeError, ValueError):
+        return out
+    k = min(nt, arr.size)
+    if k:
+        out[0, :k] = arr[:k]
+    return out
+
+
 def _safe_flowlaw(flowlaw, params, obs, extra=()):
     try:
         q = np.asarray(flowlaw(params, obs, *extra), dtype=float).ravel()

@@ -11,7 +11,38 @@ from netCDF4 import Dataset
 import numpy as np
 import shutil
 
-from moi import flp_fit
+
+def _as_row(q, nt, fill=np.nan):
+    """Coerce a hydrograph to the (1, nt) shape write_output needs.
+
+    Deliberately duplicated from ``flp_fit.as_row`` rather than imported.
+    Output.py is the last-mile stage: if anything here fails to import or
+    resolve, an entire basin loses every output file for every algorithm. This
+    module previously had no dependency on ``moi.flp_fit``, and adding one so
+    that five lines of numpy could be shared bought nothing while creating a
+    new way for a partially-deployed tree to fail at runtime -- which is
+    exactly how it did fail.
+
+    ``tests/test_flp_diagnostics_output.py`` pins this against
+    ``flp_fit.as_row`` so the two cannot drift apart silently.
+    """
+    # A reach can have no valid SWOT timesteps after geometry filtering.  The
+    # caller will then re-insert every dropped timestep, so a (1, 0) row is
+    # the only shape that preserves the final record length.
+    nt = max(int(nt), 0)
+    out = np.full((1, nt), fill, dtype=float)
+    if q is None:
+        return out
+    try:
+        arr = np.asarray(q, dtype=float).ravel()
+    except (TypeError, ValueError):
+        # Output is the last mile: a malformed value for one algorithm must
+        # become a visible fill series, not abort all reaches in the basin.
+        return out
+    k = min(nt, arr.size)
+    if k:
+        out[0, :k] = arr[:k]
+    return out
 
 def wait_random(min_seconds=1, max_seconds=10):
     """Wait for a random amount of time between min_seconds and max_seconds."""
@@ -211,6 +242,8 @@ class Output:
         is that a partly-bad basin still produces files, with the bad parts
         marked.  A repair is recorded in ``self.q_shape_repairs`` so it is
         visible rather than silent.
+
+        Note the helper is local to this module on purpose -- see ``_as_row``.
         """
         integ = self.alg_dict[algorithm][reach]['integrator']
         nt_valid = int(self.obs_dict[reach]['nt']) - int(nDelete)
@@ -231,7 +264,7 @@ class Output:
                    'none' if q is None else np.size(q), nt_valid)
             )
 
-        row = flp_fit.as_row(q, nt_valid)
+        row = _as_row(q, nt_valid)
         if nDelete == 0:
             return row
         return np.insert(row, iInsert, fillvalue, axis=1)

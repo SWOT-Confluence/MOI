@@ -228,3 +228,99 @@ def test_one_broken_reach_does_not_take_down_the_algorithm():
         assert 'flp_fit_status' in integrator.alg_dict[alg][good]['integrator'], alg
         assert np.isfinite(
             integrator.alg_dict[alg][good]['integrator']['flp_fit_nrmse']), alg
+
+
+# ---------------------------------------------------------------------------
+# Shape contract
+#
+# Regression tests for the AxisError that took down write_output on basin 1254:
+# Output.write_output does np.insert(q, iInsert, fillvalue, axis=1) to put the
+# dropped timesteps back, which needs q to be (1, nt).  Storing a raveled
+# hydrograph made it 1-D and lost the output file for the whole basin.
+# ---------------------------------------------------------------------------
+
+def test_stored_hydrograph_is_always_a_row():
+    integrator, reach = make_integrator()
+    run(integrator)
+
+    for alg in ALGS:
+        q = integrator.alg_dict[alg][reach]['integrator']['q']
+        assert isinstance(q, np.ndarray), alg
+        assert q.ndim == 2, (alg, np.shape(q))
+        assert q.shape == (1, 40), (alg, q.shape)
+        # The shape np.insert(..., axis=1) needs.
+        assert np.insert(q, [0], -999., axis=1).shape == (1, 41), alg
+
+
+def test_flow_law_sourced_hydrograph_is_also_a_row():
+    """The rescale path always produced (1, nt); the flow-law path did not.
+
+    Only reaches that fall back to the flow-law hydrograph could reach
+    write_output as 1-D, which is why this went unnoticed on the canary basins
+    where nearly everything rescales.
+    """
+    integrator, reach = make_integrator(
+        params={'Integrator_Hydrograph_Method': 'flowlaw'})
+    run(integrator)
+
+    for alg in ALGS:
+        integ = integrator.alg_dict[alg][reach]['integrator']
+        assert integ['q_source'] == 'flowlaw', alg
+        assert np.shape(integ['q']) == (1, 40), (alg, np.shape(integ['q']))
+
+
+def test_moments_objective_hydrograph_is_also_a_row():
+    integrator, reach = make_integrator(
+        params={'FLP_Fit_Method': 'moments',
+                'Integrator_Hydrograph_Method': 'flowlaw'})
+    run(integrator)
+
+    for alg in ALGS:
+        assert np.shape(
+            integrator.alg_dict[alg][reach]['integrator']['q']) == (1, 40), alg
+
+
+def test_as_row_normalises_every_shape_it_can_receive():
+    assert flp_fit.as_row(None, 5).shape == (1, 5)
+    assert np.all(np.isnan(flp_fit.as_row(None, 5)))
+    assert flp_fit.as_row(np.arange(5.), 5).shape == (1, 5)
+    assert flp_fit.as_row(np.arange(5.).reshape(1, 5), 5).shape == (1, 5)
+    # momma_flowlaw returns a bare inf when bankfull collapses onto zero-flow.
+    padded = flp_fit.as_row(np.inf, 4)
+    assert padded.shape == (1, 4)
+    assert np.isinf(padded[0, 0]) and np.isnan(padded[0, 1])
+    # Too long is truncated, too short is padded -- neither raises.
+    assert flp_fit.as_row(np.arange(9.), 4).shape == (1, 4)
+    short = flp_fit.as_row(np.arange(2.), 4)
+    assert short.shape == (1, 4) and np.isnan(short[0, 3])
+    np.testing.assert_array_equal(flp_fit.as_row(np.arange(5.), 5)[0], np.arange(5.))
+    assert flp_fit.as_row(np.array([], dtype=float), 0).shape == (1, 0)
+    assert np.all(np.isnan(flp_fit.as_row('not-a-number', 3)))
+
+
+def test_length_repair_is_counted_not_silent():
+    """A hydrograph that disagrees with the record is repaired AND reported.
+
+    Silently truncating would make a partly-missing series indistinguishable
+    from a complete one, which is the whole thing the diagnostics exist to stop.
+    """
+    integrator, reach = make_integrator()
+    run(integrator)
+    assert integrator.run_report()['n_hydrograph_repairs'] == 0
+
+    # A reach outside basin_dict['reach_ids'] is skipped by the fitter, so
+    # whatever is already in its integrator dict is what the normalisation pass
+    # sees -- the same situation as an algorithm that produced a short series.
+    stray = '88888'
+    for alg in ALGS:
+        integrator.alg_dict[alg][stray] = {'integrator': {'q': np.arange(7.)}}
+    integrator.obs_dict[stray] = make_obs()
+    integrator.basin_dict['reach_ids_all'].append(stray)
+
+    integrator.compute_FLPs()
+
+    assert integrator.run_report()['n_hydrograph_repairs'] == len(ALGS)
+    for alg in ALGS:
+        q = integrator.alg_dict[alg][stray]['integrator']['q']
+        assert q.shape == (1, 40), alg
+        assert np.isnan(q[0, 7])

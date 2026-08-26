@@ -129,6 +129,72 @@ If the floor comes back near 0.15, the residual is mostly irreducible and the
 remaining effort belongs in `d_x_area` quality and the rescale transform, not in
 the optimiser. Run this before spending more on either.
 
+## The hydrograph shape contract
+
+`integrator['q']` is **always `(1, nt_valid)`** — a row, never a 1-D series,
+for every algorithm and every reach, whether the hydrograph came from the
+rescale path or from the refitted flow law.
+
+This was never written down, but the pipeline depended on it:
+`Output.write_output` re-inserts the timesteps `extract_swot()` dropped with
+`np.insert(q, iInsert, fillvalue, 1)`, which raises `AxisError` on a 1-D array —
+and that raise kills `write_output` for the **entire basin**, all six algorithms
+and every reach, over one malformed hydrograph. It held only by accident,
+because each `*_flowlaw` happens to end with `np.reshape(q, (1, nt))`.
+
+It is now explicit in three places:
+
+- `flp_fit.as_row(q, nt)` is the single definition. It accepts a scalar, a 1-D
+  series or a row, pads or truncates to `nt`, and never raises.
+- `compute_FLPs()` stores through it and normalises every reach again at the
+  end, counting any length repair into `run_report()['n_hydrograph_repairs']`.
+- `Output._expand_q_to_full_record()` accepts either shape and repairs a wrong
+  length rather than raising, recording it in `Output.q_shape_repairs`. It uses
+  a **local** `Output._as_row`, deliberately duplicated rather than imported:
+  Output.py is the last-mile stage, where a failed import or attribute lookup
+  costs an entire basin every output file. It had no dependency on
+  `moi.flp_fit` before, and adding one so that five lines of numpy could be
+  shared created a new way for a partially-deployed tree to fail — which is
+  exactly how commit `423d9d0` failed, shipping an updated `Output.py` against
+  a `flp_fit.py` left behind. `tests/test_flp_diagnostics_output.py` pins the
+  two implementations together so the duplication cannot drift.
+
+Repairing rather than raising is deliberate. Raising here would be the same
+failure with a friendlier message: the point of writing output is that a
+partly-bad basin still produces files, with the bad parts marked. Repairs are
+counted and warned about, so they are visible rather than silent.
+
+If you add a code path that writes `integrator['q']`, route it through
+`as_row()`. `tests/test_compute_flps.py` has the regression tests.
+
+## Before you build an image
+
+```
+bash tools/preflight.sh          # checks HEAD
+bash tools/preflight.sh <ref>    # checks any commit
+```
+
+The Dockerfile copies `./moi`, `./sos_read`, `./run_MOI.py` and the CalVal CSV
+from the build context, so what matters is the **committed** tree, not the
+working tree. `preflight.sh` extracts the commit into a temp directory and
+checks it there:
+
+- warns if files the image copies have uncommitted changes;
+- byte-compiles everything;
+- statically resolves cross-module attribute references — module `X` calling
+  `Y.thing()` where the committed `Y` has no `thing`. This is a static check, so
+  it needs neither netCDF4 nor scipy and runs anywhere;
+- runs the tests that need no netCDF4, if pytest is available.
+
+Run against `423d9d0` it reports:
+
+```
+moi/Output.py:234  flp_fit.as_row does not exist in moi/flp_fit.py
+```
+
+which is the whole of that failure, found in under a second and without a
+cluster job.
+
 ## Tests
 
 - `tests/test_flp_fit.py` — closed-form scale vs numerical optimum, determinism,
