@@ -11,6 +11,7 @@ import pandas as pd
 from scipy import optimize
 import scipy.sparse as sp
 
+from moi import flp_fit
 from moi.sfoi_math_core import (
     adjust_lsq_bias_correlated_sparse,
     adjust_lsq_mult_sparse,
@@ -50,6 +51,11 @@ class Integrate:
         self.mass_diag_static = None
         self.reach_epsilons = {}
         self.gage_diagnostics = {}
+        # Run-level reports.  A global run needs to be able to say which basins
+        # went wrong and how, without anyone re-reading stdout for a traceback.
+        self.topology_report = {}
+        self.flp_fit_report = {}
+        self.unconverged_solves = []
         
         self.integ_dict = {
             "pre_q_mean": np.array([]),
@@ -300,6 +306,23 @@ class Integrate:
                  sword_data_reach[key] = self.sword_dict[key][0:sword_data_reach['swot_obs'], k]
          return sword_data_reach
 
+    def _sword_index(self, reach):
+         """Row of this reach in the SWORD tables, or None if it is absent.
+
+         ``np.argwhere(...)[0, 0]`` raises IndexError on a reach the SWORD file
+         does not contain, which killed the whole basin -- every algorithm, both
+         flow levels -- over one bad link.  A missing reach is a data problem
+         worth reporting loudly; it is not worth losing the other 600 reaches
+         for.
+         """
+         try:
+             hits = np.argwhere(self.sword_dict['reach_id'] == np.int64(reach))
+         except Exception:
+             return None
+         if hits.size == 0:
+             return None
+         return int(hits[0, 0])
+
     def ChecksPriorToAddingJunction(self, junction_to_check):
          AlreadyExists = False
          for junction in self.junctions:
@@ -317,11 +340,34 @@ class Integrate:
     def CreateJunctionList(self):
          self.junctions = list()
          self.junctions_valid = True
+         missing_from_sword = []
+         bifurcating = []
+         dangling = []
+         isolated = []
 
          for reach in self.basin_dict['reach_ids_all']:
              reach = np.int64(reach)
-             k = np.argwhere(self.sword_dict['reach_id'] == reach)[0, 0]
+             k = self._sword_index(reach)
+             if k is None:
+                 missing_from_sword.append(str(reach))
+                 self.junctions_valid = False
+                 continue
              sword_data_reach = self.pull_sword_attributes_for_reach(k) 
+
+             # Topology pre-check, gathered while we are already walking the
+             # network.  These are the shapes that make a basin hard to solve;
+             # naming them up front beats inferring them from a solver failure.
+             n_up = int(sword_data_reach['n_rch_up'])
+             n_dn = int(sword_data_reach['n_rch_down'])
+             if n_dn > 1:
+                 bifurcating.append(str(reach))
+             if n_up == 0 and n_dn == 0:
+                 isolated.append(str(reach))
+             for neighbour in (list(sword_data_reach['rch_id_up'][:n_up])
+                               + list(sword_data_reach['rch_id_dn'][:n_dn])):
+                 if neighbour and str(neighbour) not in self.basin_dict['reach_ids_all']:
+                     dangling.append(str(reach))
+                     break
 
              # Upstream
              junction_up = {'originating_reach_id': reach, 'upflows': list()}
@@ -333,7 +379,11 @@ class Integrate:
                  if not any(junction_up['upflows']):
                     self.junctions_valid = False
                     continue
-                 kup = np.argwhere(self.sword_dict['reach_id'] == junction_up['upflows'][0])[0, 0]
+                 kup = self._sword_index(junction_up['upflows'][0])
+                 if kup is None:
+                     missing_from_sword.append(str(junction_up['upflows'][0]))
+                     self.junctions_valid = False
+                     continue
                  sword_data_reach_up = self.pull_sword_attributes_for_reach(kup)
                  for j in range(sword_data_reach_up['n_rch_down']):
                      junction_up['downflows'].append(sword_data_reach_up['rch_id_dn'][j])
@@ -351,13 +401,38 @@ class Integrate:
                  if not any(junction_dn['downflows']):
                     self.junctions_valid = False
                     continue
-                 kdn = np.argwhere(self.sword_dict['reach_id'] == junction_dn['downflows'][0])[0, 0]
+                 kdn = self._sword_index(junction_dn['downflows'][0])
+                 if kdn is None:
+                     missing_from_sword.append(str(junction_dn['downflows'][0]))
+                     self.junctions_valid = False
+                     continue
                  sword_data_reach_dn = self.pull_sword_attributes_for_reach(kdn)
                  for j in range(sword_data_reach_dn['n_rch_up']):
                      junction_dn['upflows'].append(sword_data_reach_dn['rch_id_up'][j])
                  AlreadyExists, AllReachesInReachFile = self.ChecksPriorToAddingJunction(junction_dn)
                  if not AlreadyExists and AllReachesInReachFile:
                      self.junctions.append(junction_dn) 
+
+         self.topology_report = {
+             'n_reaches': len(self.basin_dict['reach_ids_all']),
+             'n_junctions': len(self.junctions),
+             'junctions_valid': bool(self.junctions_valid),
+             'missing_from_sword': sorted(set(missing_from_sword)),
+             'bifurcating_reaches': sorted(set(bifurcating)),
+             'dangling_reaches': sorted(set(dangling)),
+             'isolated_reaches': sorted(set(isolated)),
+         }
+         if self.VerboseFlag:
+             r = self.topology_report
+             print('  topology: %d reaches, %d junctions, %d bifurcating, '
+                   '%d dangling, %d isolated, %d missing from SWORD'
+                   % (r['n_reaches'], r['n_junctions'],
+                      len(r['bifurcating_reaches']), len(r['dangling_reaches']),
+                      len(r['isolated_reaches']), len(r['missing_from_sword'])))
+             if r['missing_from_sword']:
+                 print('    missing from SWORD: '
+                       + ', '.join(r['missing_from_sword'][:10])
+                       + (' ...' if len(r['missing_from_sword']) > 10 else ''))
 
 
     def calcG(self, m, n):
@@ -469,6 +544,65 @@ class Integrate:
 
 
 
+    def _flpe_relative_uncertainty(self, alg, reach, facc_value):
+        """Relative uncertainty to weight one FLPE estimate by in the solve.
+
+        Three models, selected by ``SFOI_Uncertainty_Model``:
+
+        ``step`` (default)
+            The historical three-way split on drainage area: 20% above
+            5000 km2, 35% above 500, 75% below.  Kept as the default so this
+            change cannot move ``qbar_basinScale`` until someone asks it to --
+            the canary matrix's zero-drift gate depends on that.
+
+        ``continuous``
+            ``sigma_rel = a * facc**-b``, clipped.  The defaults ``a=1.584``,
+            ``b=0.243`` are the power law through the two step boundaries
+            (0.20 at facc=5000, 0.35 at facc=500), so it reproduces the step
+            model's intent without its discontinuities -- two neighbouring
+            reaches at 4999 and 5001 km2 currently get weights differing by a
+            factor of nearly two for no physical reason.  These constants are
+            placeholders until they are calibrated against gaged-reach
+            residuals; the canary runs already contain the data to do that.
+
+        ``SFOI_Use_Algorithm_Uncertainty`` additionally prefers an uncertainty
+        the algorithm reported for itself, when one is present.  MetroMan
+        carries a posterior covariance and BUSBOI an MCMC spread, both of which
+        say more about a specific reach than drainage area does.  Input.py does
+        not read either yet, so this path is inert until it populates
+        ``alg_dict[alg][reach]['qbar_sigma_rel']`` -- deliberately, rather than
+        guessing at upstream variable names that have not been checked.
+        """
+        if self.params_dict.get('SFOI_Use_Algorithm_Uncertainty', False):
+            reported = self.alg_dict.get(alg, {}).get(reach, {}).get(
+                'qbar_sigma_rel', np.nan)
+            try:
+                reported = float(reported)
+            except (TypeError, ValueError):
+                reported = np.nan
+            if np.isfinite(reported) and 0. < reported < 5.:
+                return float(np.clip(
+                    reported,
+                    self.params_dict.get('SFOI_Uncertainty_Min', 0.10),
+                    self.params_dict.get('SFOI_Uncertainty_Max', 1.00),
+                ))
+
+        if self.params_dict.get('SFOI_Uncertainty_Model', 'step') == 'continuous':
+            a = float(self.params_dict.get('SFOI_Uncertainty_A', 1.584))
+            b = float(self.params_dict.get('SFOI_Uncertainty_B', 0.243))
+            lo = float(self.params_dict.get('SFOI_Uncertainty_Min', 0.15))
+            hi = float(self.params_dict.get('SFOI_Uncertainty_Max', 0.90))
+            if np.isfinite(facc_value) and facc_value > 0.:
+                with np.errstate(all='ignore'):
+                    return float(np.clip(a * facc_value ** (-b), lo, hi))
+            return hi
+
+        if facc_value > 5000:
+            return 0.20
+        if facc_value > 500:
+            return 0.35
+        return 0.75
+
     def initialize_integration_vars(self, alg, FlowLevel, PreviousResiduals, n):
         Qbar = np.full(n, np.nan, dtype=float)
         sigQ = np.full(n, np.nan, dtype=float)
@@ -487,8 +621,14 @@ class Integrate:
         sos_key = 'Qbar' if FlowLevel == 'Mean' else 'q33'
 
         for i, reach in enumerate(self.basin_dict['reach_ids_all']):
-            k = np.argwhere(self.sword_dict['reach_id'] == np.int64(reach))[0, 0]
-            facc[i] = self.pull_sword_attributes_for_reach(k)['facc']
+            k = self._sword_index(reach)
+            # A reach missing from SWORD has no drainage area; leave it NaN and
+            # let the fill pass below substitute the basin median, rather than
+            # raising IndexError and losing every reach in the basin.
+            facc[i] = (
+                self.pull_sword_attributes_for_reach(k)['facc']
+                if k is not None else np.nan
+            )
             reach_data = self.alg_dict[alg].get(reach, {})
             value = reach_data.get(value_key, np.nan)
             if np.ma.is_masked(value):
@@ -509,7 +649,12 @@ class Integrate:
             # Screen only genuine FLPE estimates. If one fails, fall back to
             # the named SoS prior and preserve that provenance explicitly.
             if source == 'FLPE':
-                nstdev = 10.0
+                # An FLPE estimate this far from the SoS climatology is not an
+                # estimate, it is a failure wearing an estimate's variable name.
+                # 10 sigma is extremely permissive -- the canary run found a
+                # reach exporting 2.27e4 x the integrated mean and this gate let
+                # it through -- so it is now a parameter rather than a literal.
+                nstdev = float(self.params_dict.get('FLPE_Outlier_Nstdev', 10.0))
                 if (
                     not np.isfinite(value)
                     or (
@@ -529,12 +674,7 @@ class Integrate:
             datasource.append(source if np.isfinite(value) else 'None')
 
             if source == 'FLPE' and np.isfinite(value):
-                if facc[i] > 5000:
-                    dynamic_unc = 0.20
-                elif facc[i] > 500:
-                    dynamic_unc = 0.35
-                else:
-                    dynamic_unc = 0.75
+                dynamic_unc = self._flpe_relative_uncertainty(alg, reach, facc[i])
 
                 if (
                     self.params_dict.get('use_previous_residual_weighting', False)
@@ -557,7 +697,15 @@ class Integrate:
         if not np.isfinite(runoff_avg):
             runoff_avg = 315.36
 
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', category=RuntimeWarning)
+            facc_median = float(np.nanmedian(facc))
+        if not np.isfinite(facc_median) or facc_median <= 0.:
+            facc_median = 1000.0
+
         for i in range(n):
+            if not np.isfinite(facc[i]) or facc[i] <= 0.:
+                facc[i] = facc_median
             if not np.isfinite(Qbar[i]):
                 Qbar[i] = runoff_avg * facc[i] * 1000**2 / 86400 / 365
                 sigQ[i] = Qbar[i] * self.params_dict.get('Fill_Uncertainty', 1.0)
@@ -891,6 +1039,29 @@ class Integrate:
                         (bias_enabled or correlation_enabled)
                     ):
                         self._require_converged_augmented_result(result)
+
+                    # The augmented solver refuses to hand back an unconverged
+                    # result; the plain one did not, so a solve that merely ran
+                    # out of iterations still produced finite values that looked
+                    # like a normal answer.  Record it always.  Gate on it only
+                    # when asked, so the first global run can measure how many
+                    # basins this affects before it starts rejecting them.
+                    if not bool(getattr(result, 'converged', True)):
+                        note = {
+                            'algorithm': alg,
+                            'flow_level': FlowLevel,
+                            'status': str(getattr(result, 'status', 'unknown')),
+                        }
+                        self.unconverged_solves.append(note)
+                        if self.VerboseFlag:
+                            print('    WARNING: %s %s solver did not converge '
+                                  '(%s)' % (alg, FlowLevel, note['status']))
+                        if self.params_dict.get(
+                            'SFOI_Require_Plain_Convergence', False
+                        ):
+                            raise RuntimeError(
+                                'plain solver did not converge: %s' % note['status']
+                            )
 
                     x_hat_saved = result.x
                     if x_hat_saved is not None and np.all(np.isfinite(x_hat_saved[:n])):
@@ -1342,10 +1513,39 @@ class Integrate:
         if not (np.isfinite(qbar_flpe) and qbar_flpe > 0.):
             return None
 
+        integ = reach_data.setdefault('integrator', {})
+
         # The rescale factor is deliberately not clamped.  A wild factor is a
         # real disagreement between FLPE and the integrator, and it should show
         # up in flp_fit_nrmse rather than be silently absorbed.
-        return np.reshape(q * (qbar_int / qbar_flpe), (1, nt_valid))
+        factor = qbar_int / qbar_flpe
+
+        method = self.params_dict.get('Rescale_Transform', 'mean')
+        if method == 'powerlaw':
+            # A single multiplicative shift matches the mean exactly and leaves
+            # the spread untouched, so it cannot correct an FLPE hydrograph
+            # whose variability disagrees with the integrator.  q' = a*q**b
+            # spends one shape parameter to honour q33 as well.  When the two
+            # targets admit no solution in range, fall back rather than force
+            # one -- a forced fit is a silently wrong hydrograph.
+            q33_int = integ.get('q33', np.nan)
+            solved = flp_fit.powerlaw_rescale(q, qbar_int, q33_int)
+            if solved is not None:
+                a, b = solved
+                with np.errstate(all='ignore'):
+                    q_out = a * np.power(q, b)
+                if np.any(np.isfinite(q_out)):
+                    integ['rescale_method'] = 'powerlaw'
+                    integ['rescale_a'] = float(a)
+                    integ['rescale_b'] = float(b)
+                    integ['rescale_factor'] = float(factor)
+                    return np.reshape(q_out, (1, nt_valid))
+
+        integ['rescale_method'] = 'mean'
+        integ['rescale_a'] = float(factor)
+        integ['rescale_b'] = 1.0
+        integ['rescale_factor'] = float(factor)
+        return np.reshape(q * factor, (1, nt_valid))
 
     def integrator_hydrograph(self, alg, reach, q_flowlaw):
         """Hydrograph to keep for one reach/algorithm after the FLP refit."""
@@ -1354,204 +1554,328 @@ class Integrate:
             return integ['q']
         return q_flowlaw
 
-    def compute_FLPs(self):         
-        if self.VerboseFlag: print('CALCULATING BUSBOI surrogate FLPs')
-        for reach in self.alg_dict['busboi']:
-            try: datagood = (self.obs_dict[reach]['nt'] > 0 and self.obs_dict[reach]['dA'].size > 0)
-            except Exception: datagood = False
-            if reach not in self.basin_dict['reach_ids'] or not datagood: continue
-            
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                nhat = np.nanmean(self.alg_dict['busboi'][reach].get('n', np.nan))
-                Abar_min = -min(self.obs_dict[reach]['dA']) + 1
-                init_params = (nhat, np.nanmean(self.alg_dict['busboi'][reach].get('a0', np.nan))) if not np.isnan(nhat) else (0.03, Abar_min+10.)
-                
-            param_bounds = ((0.001, np.inf), (Abar_min, np.inf))
-            qbar = self.alg_dict['busboi'][reach]['integrator']['qbar'] 
-            q33 = self.alg_dict['busboi'][reach]['integrator'].get('q33', np.nan) 
+    # ------------------------------------------------------------------
+    # Flow-law parameter refit
+    #
+    # One code path for all six algorithms, replacing six near-identical
+    # copies of the same loop.  The copies had drifted: busboi and momma
+    # wrapped the solve in try/except and checked res.success, while hivdi,
+    # metroman, sad and sic4dvar used res.x unconditionally -- so on those
+    # four a stalled or failed optimiser exported its parameters as though
+    # they were a converged fit, with nothing downstream able to tell.
+    # ------------------------------------------------------------------
 
-            objfun, objargs = self.flp_objective(
-                'busboi', reach, self.bam_flowlaw,
-                self.bam_objfun, (self.obs_dict[reach], qbar, q33))
+    FLP_ALGORITHMS = ('busboi', 'hivdi', 'metroman', 'momma', 'sad', 'sic4dvar')
 
+    # Output key names for each algorithm's parameter vector, in the order the
+    # corresponding *_flowlaw method expects them.
+    FLP_PARAM_KEYS = {
+        'busboi': ('n', 'a0'),
+        'hivdi': ('alpha', 'beta', 'Abar'),
+        'metroman': ('na', 'x1', 'a0'),
+        'momma': ('B', 'H'),
+        'sad': ('n', 'a0'),
+        'sic4dvar': ('n', 'a0'),
+    }
+
+    def _flp_prior_mean(self, alg, reach, key, default=np.nan):
+        """Reach-scale FLPE value for one parameter, as a plain float."""
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
             try:
-                res = optimize.minimize(fun=objfun, x0=init_params, args=objargs, bounds=param_bounds)
-                if res.success:
-                    param_est = res.x
-                else:
-                    param_est = init_params
+                value = float(np.nanmean(self.alg_dict[alg][reach].get(key, np.nan)))
             except Exception:
-                param_est = init_params
-            
-            self.alg_dict['busboi'][reach]['integrator']['n'] = param_est[0]
-            self.alg_dict['busboi'][reach]['integrator']['a0'] = param_est[1]
-            self.alg_dict['busboi'][reach]['integrator']['q'] = self.integrator_hydrograph(
-                'busboi', reach, self.bam_flowlaw(param_est, self.obs_dict[reach]))
-            self.flp_fit_diagnostic('busboi', reach, param_est, self.bam_flowlaw)
+                return default
+        return value if np.isfinite(value) else default
 
-        if self.VerboseFlag: print('CALCULATING HiVDI FLPs')
-        for reach in self.alg_dict['hivdi']:
-            try: datagood = (self.obs_dict[reach]['nt'] > 0 and self.obs_dict[reach]['dA'].size > 0)
-            except Exception: datagood = False
-            if reach not in self.basin_dict['reach_ids'] or not datagood: continue
-            
+    def _flp_reach_spec(self, alg, reach):
+        """Bounds, priors and flow law for one reach/algorithm, or None.
+
+        None means this reach is not a candidate at all -- outside the basin,
+        or with no usable geometry.  Every reach that gets a spec gets a
+        result, even if that result is "could not be fitted".
+        """
+        try:
+            datagood = (self.obs_dict[reach]['nt'] > 0
+                        and self.obs_dict[reach]['dA'].size > 0)
+        except Exception:
+            datagood = False
+        if reach not in self.basin_dict['reach_ids'] or not datagood:
+            return None
+
+        obs = self.obs_dict[reach]
+        integ = self.alg_dict[alg][reach].setdefault('integrator', {})
+        qbar = integ.get('qbar', np.nan)
+        q33 = integ.get('q33', np.nan)
+
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            try:
+                a0_min = -min(obs['dA']) + 1
+            except Exception:
+                return None
+
+        if alg == 'busboi':
+            n0 = self._flp_prior_mean(alg, reach, 'n')
+            a00 = self._flp_prior_mean(alg, reach, 'a0')
+            init = (n0, a00) if np.isfinite(n0) else (0.03, a0_min + 10.)
+            return dict(
+                flowlaw=self.bam_flowlaw, moment_objfun=self.bam_objfun,
+                moment_args=(obs, qbar, q33),
+                bounds=((0.001, np.inf), (a0_min, np.inf)),
+                init=init, priors={'a0': a00}, extra=(), penalty=None,
+                a0_min=a0_min, save=None,
+            )
+
+        if alg == 'hivdi':
+            alpha0 = self._flp_prior_mean(alg, reach, 'alpha')
+            beta0 = self._flp_prior_mean(alg, reach, 'beta')
+            a00 = self._flp_prior_mean(alg, reach, 'a0')
+            init = ((alpha0, beta0, a00) if np.isfinite(alpha0)
+                    else (33.3, 1.0, a0_min + 10.))
+            return dict(
+                flowlaw=self.hivdi_flowlaw, moment_objfun=self.hivdi_objfun,
+                moment_args=(obs, qbar, q33),
+                bounds=((0.001, np.inf), (-1e1, 1e1), (a0_min, np.inf)),
+                init=init, priors={'a0': a00, 'beta': beta0}, extra=(),
+                penalty=None, a0_min=a0_min, save=None,
+            )
+
+        if alg == 'metroman':
+            na0 = self._flp_prior_mean(alg, reach, 'na')
+            x10 = self._flp_prior_mean(alg, reach, 'x1')
+            a00 = self._flp_prior_mean(alg, reach, 'a0')
+            init = ((na0, x10, a00) if np.isfinite(na0)
+                    else (0.03, -1., a0_min + 10.))
+            return dict(
+                flowlaw=self.metroman_flowlaw,
+                moment_objfun=self.metroman_objfun,
+                moment_args=(obs, qbar, q33),
+                bounds=((0.001, np.inf), (-1e1, 1e1), (a0_min, np.inf)),
+                init=init, priors={'a0': a00, 'x1': x10}, extra=(),
+                penalty=None, a0_min=a0_min, save=None,
+            )
+
+        if alg == 'momma':
+            B0 = self._flp_prior_mean(alg, reach, 'B')
+            H0 = self._flp_prior_mean(alg, reach, 'H')
             with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                alphaflpe = np.nanmean(self.alg_dict['hivdi'][reach].get('alpha', np.nan))
-                Abar_min = -min(self.obs_dict[reach]['dA']) + 1
-                init_params = (np.nanmean(self.alg_dict['hivdi'][reach].get('alpha', np.nan)), np.nanmean(self.alg_dict['hivdi'][reach].get('beta', np.nan)), np.nanmean(self.alg_dict['hivdi'][reach].get('a0', np.nan))) if not np.isnan(alphaflpe) else (33.3, 1.0, Abar_min+10.)
-                
-            param_bounds = ((0.001, np.inf), (-1e1, 1.e1), (Abar_min, np.inf))
-            qbar = self.alg_dict['hivdi'][reach]['integrator']['qbar']
-            q33 = self.alg_dict['hivdi'][reach]['integrator'].get('q33', np.nan) 
-            objfun, objargs = self.flp_objective(
-                'hivdi', reach, self.hivdi_flowlaw,
-                self.hivdi_objfun, (self.obs_dict[reach], qbar, q33))
-            res = optimize.minimize(fun=objfun, x0=init_params, args=objargs, bounds=param_bounds)
-            
-            self.alg_dict['hivdi'][reach]['integrator']['alpha'] = res.x[0]
-            self.alg_dict['hivdi'][reach]['integrator']['beta'] = res.x[1]
-            self.alg_dict['hivdi'][reach]['integrator']['Abar'] = res.x[2]
-            self.alg_dict['hivdi'][reach]['integrator']['q'] = self.integrator_hydrograph(
-                'hivdi', reach, self.hivdi_flowlaw(res.x, self.obs_dict[reach]))
-            self.flp_fit_diagnostic('hivdi', reach, res.x, self.hivdi_flowlaw)
+                warnings.simplefilter('ignore')
+                b_max = np.min(obs['h']) - 0.1
+                min_h_obs = np.min(obs['h'])
+            init = (B0, H0) if np.isfinite(B0) else (b_max - 1.0, b_max + 1.0)
+            if np.isfinite(init[0]) and min_h_obs - init[0] > 10.:
+                init = (min_h_obs - 10., min_h_obs)
+            save = self.alg_dict['momma'][reach].get('Save', np.nan)
+            try:
+                save = float(save)
+            except Exception:
+                save = np.nan
+            if not np.isfinite(save):
+                save = 20e-5
+            return dict(
+                flowlaw=self.momma_flowlaw, moment_objfun=self.momma_objfun,
+                moment_args=(obs, qbar, q33, save),
+                bounds=((0.1, b_max), (b_max + 0.1, np.inf)),
+                init=init, priors={'B': B0, 'H': H0}, extra=(save,),
+                penalty=self.momma_shape_penalty, a0_min=None, save=save,
+            )
 
-        if self.VerboseFlag: print('CALCULATING MetroMan FLPs')
-        for reach in self.alg_dict['metroman']:
-            try: datagood = (self.obs_dict[reach]['nt'] > 0 and self.obs_dict[reach]['dA'].size > 0)
-            except Exception: datagood = False
-            if reach not in self.basin_dict['reach_ids'] or not datagood: continue
-            
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                naflpe = np.nanmean(self.alg_dict['metroman'][reach].get('na', np.nan))
-                Abar_min = -min(self.obs_dict[reach]['dA']) + 1
-                init_params = (np.nanmean(self.alg_dict['metroman'][reach].get('na', np.nan)), np.nanmean(self.alg_dict['metroman'][reach].get('x1', np.nan)), np.nanmean(self.alg_dict['metroman'][reach].get('a0', np.nan))) if not np.isnan(naflpe) else (0.03, -1., Abar_min+10.)
+        if alg in ('sad', 'sic4dvar'):
+            n0 = self._flp_prior_mean(alg, reach, 'n')
+            a00 = self._flp_prior_mean(alg, reach, 'a0')
+            init = (n0, a00) if np.isfinite(n0) else (0.03, a0_min + 10.)
+            n_hi = 10. if alg == 'sic4dvar' else np.inf
+            flowlaw = (self.sic4dvar_flowlaw if alg == 'sic4dvar'
+                       else self.sad_flowlaw)
+            if alg == 'sic4dvar':
+                moment_objfun, moment_args = self.sic4dvar_objfun, (obs, qbar)
+            else:
+                moment_objfun, moment_args = self.sad_objfun, (obs, qbar, q33)
+            return dict(
+                flowlaw=flowlaw, moment_objfun=moment_objfun,
+                moment_args=moment_args,
+                bounds=((0.001, n_hi), (a0_min, np.inf)),
+                init=init, priors={'a0': a00}, extra=(), penalty=None,
+                a0_min=a0_min, save=None,
+            )
 
-            param_bounds = ((0.001, np.inf), (-1e1, 1e1), (Abar_min, np.inf))
-            qbar = self.alg_dict['metroman'][reach]['integrator']['qbar']
-            q33 = self.alg_dict['metroman'][reach]['integrator'].get('q33', np.nan)
-            objfun, objargs = self.flp_objective(
-                'metroman', reach, self.metroman_flowlaw,
-                self.metroman_objfun, (self.obs_dict[reach], qbar, q33))
-            res = optimize.minimize(fun=objfun, x0=init_params, args=objargs, bounds=param_bounds)
-            
-            self.alg_dict['metroman'][reach]['integrator']['na'] = res.x[0]
-            self.alg_dict['metroman'][reach]['integrator']['x1'] = res.x[1]
-            self.alg_dict['metroman'][reach]['integrator']['a0'] = res.x[2]
-            self.alg_dict['metroman'][reach]['integrator']['q'] = self.integrator_hydrograph(
-                'metroman', reach, self.metroman_flowlaw(res.x, self.obs_dict[reach]))
-            self.flp_fit_diagnostic('metroman', reach, res.x, self.metroman_flowlaw)
+        return None
 
-        if self.VerboseFlag: print('CALCULATING MOMMA FLPs')
-        for reach in self.alg_dict['momma']:
-            try: datagood = (self.obs_dict[reach]['nt'] > 0 and self.obs_dict[reach]['dA'].size > 0)
-            except Exception: datagood = False
-            if reach not in self.basin_dict['reach_ids'] or not datagood: continue
-            
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                Bflpe = np.nanmean(self.alg_dict['momma'][reach].get('B', np.nan))
-                Bmax = np.min(self.obs_dict[reach]['h']) - 0.1
-                init_params = (np.nanmean(self.alg_dict['momma'][reach].get('B', np.nan)), np.nanmean(self.alg_dict['momma'][reach].get('H', np.nan))) if not np.isnan(Bflpe) else (Bmax-1.0, Bmax+1.0)
-                
-            min_H_obs = np.min(self.obs_dict[reach]['h'])
-            if min_H_obs - init_params[0] > 10.: init_params = (min_H_obs - 10., min_H_obs)
-            param_bounds = ((0.1, Bmax), (Bmax+0.1, np.inf))
-            aux_var = self.alg_dict['momma'][reach].get('Save', np.nan)
-            if np.isnan(aux_var): aux_var = 20e-5
-            qbar = self.alg_dict['momma'][reach]['integrator']['qbar']
-            q33 = self.alg_dict['momma'][reach]['integrator'].get('q33', np.nan) 
+    def _legacy_flp_fit(self, alg, reach, spec, target):
+        """Single-start bounded local solve -- the pre-VarPro code path.
 
-            objfun, objargs = self.flp_objective(
-                'momma', reach, self.momma_flowlaw,
-                self.momma_objfun, (self.obs_dict[reach], qbar, q33, aux_var),
-                extra=(aux_var,), penalty=self.momma_shape_penalty)
+        Kept so one build can reproduce the old optimiser for comparison, with
+        one deliberate difference: a solve that fails or raises now falls back
+        to the FLPE prior and says so, instead of exporting whatever the
+        optimiser last held.  That was a bug on four of the six algorithms, not
+        a behaviour worth reproducing faithfully.
+        """
+        obs = self.obs_dict[reach]
+        use_series = (
+            target is not None
+            and self.params_dict.get('FLP_Fit_Method', 'series') == 'series'
+        )
+        if use_series:
+            objfun = self.flp_series_objfun
+            objargs = (obs, spec['flowlaw'], target, spec['extra'],
+                       spec['penalty'])
+        else:
+            objfun = spec['moment_objfun']
+            objargs = spec['moment_args']
 
-            try: res = optimize.minimize(fun=objfun, x0=init_params, args=objargs, bounds=param_bounds)
-            except Exception: res = lambda: None; res.success = False
+        status = flp_fit.FIT_GOOD
+        params = spec['init']
+        try:
+            res = optimize.minimize(fun=objfun, x0=spec['init'], args=objargs,
+                                    bounds=spec['bounds'])
+            if getattr(res, 'success', False):
+                params = tuple(float(v) for v in res.x)
+            else:
+                status = flp_fit.FIT_FALLBACK_PRIOR
+        except Exception:
+            status = flp_fit.FIT_FAILED
 
-            if not res.success: param_est = (self.alg_dict['momma'][reach].get('B', np.nan), self.alg_dict['momma'][reach].get('H', np.nan))
-            else: param_est = res.x
-            
-            self.alg_dict['momma'][reach]['integrator']['B'] = param_est[0]
-            self.alg_dict['momma'][reach]['integrator']['H'] = param_est[1]
-            self.alg_dict['momma'][reach]['integrator']['Save'] = aux_var
-            self.alg_dict['momma'][reach]['integrator']['q'] = self.integrator_hydrograph(
-                'momma', reach, self.momma_flowlaw(param_est, self.obs_dict[reach], aux_var))
-            self.flp_fit_diagnostic('momma', reach, param_est, self.momma_flowlaw, (aux_var,))
+        reference = target if target is not None else np.full(
+            int(obs.get('nt', 0) or 0), np.nan)
+        n_valid = int(np.sum(np.isfinite(np.asarray(reference, dtype=float))))
+        return flp_fit._outcome_from_params(
+            params, status, spec['flowlaw'], obs, np.asarray(reference,
+            dtype=float).ravel(), spec['bounds'], spec['extra'], n_valid, 0,
+            np.nan, 'legacy',
+        )
 
-        if self.VerboseFlag: print('CALCULATING SAD FLPs')
-        for reach in self.alg_dict['sad']:
-            try: datagood = (self.obs_dict[reach]['nt'] > 0 and self.obs_dict[reach]['dA'].size > 0)
-            except Exception: datagood = False
-            if reach not in self.basin_dict['reach_ids'] or not datagood: continue
-            
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                nflpe = np.nanmean(self.alg_dict['sad'][reach].get('n', np.nan))
-                Abar_min = -min(self.obs_dict[reach]['dA']) + 1
-                init_params = (np.nanmean(self.alg_dict['sad'][reach].get('n', np.nan)), np.nanmean(self.alg_dict['sad'][reach].get('a0', np.nan))) if not np.isnan(nflpe) else (0.03, Abar_min+10.)
+    def _fit_one_flp(self, alg, reach, spec, settings):
+        """Fit one reach with whichever optimiser the run selected."""
+        target = self.flp_fit_target(alg, reach)
 
-            param_bounds = ((0.001, np.inf), (Abar_min, np.inf))
-            qbar = self.alg_dict['sad'][reach]['integrator']['qbar']
-            q33 = self.alg_dict['sad'][reach]['integrator'].get('q33', np.nan) 
-            objfun, objargs = self.flp_objective(
-                'sad', reach, self.sad_flowlaw,
-                self.sad_objfun, (self.obs_dict[reach], qbar, q33))
-            res = optimize.minimize(fun=objfun, x0=init_params, args=objargs, bounds=param_bounds)
-            
-            self.alg_dict['sad'][reach]['integrator']['n'] = res.x[0]
-            self.alg_dict['sad'][reach]['integrator']['a0'] = res.x[1]
-            self.alg_dict['sad'][reach]['integrator']['q'] = self.integrator_hydrograph(
-                'sad', reach, self.sad_flowlaw(res.x, self.obs_dict[reach]))
-            self.flp_fit_diagnostic('sad', reach, res.x, self.sad_flowlaw)
+        if (settings['optimizer'] == 'legacy'
+                or target is None
+                or self.params_dict.get('FLP_Fit_Method', 'series') != 'series'):
+            outcome = self._legacy_flp_fit(alg, reach, spec, target)
+            if target is None:
+                outcome.status = (
+                    flp_fit.FIT_NO_SERIES
+                    if outcome.status == flp_fit.FIT_GOOD else outcome.status
+                )
+            return outcome
 
-        if self.VerboseFlag: print('CALCULATING SIC4DVar FLPs')
-        for reach in self.alg_dict['sic4dvar']:
-            try: datagood = (self.obs_dict[reach]['nt'] > 0 and self.obs_dict[reach]['dA'].size > 0)
-            except Exception: datagood = False
-            if reach not in self.basin_dict['reach_ids'] or not datagood: continue
-            
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                nflpe = np.nanmean(self.alg_dict['sic4dvar'][reach].get('n', np.nan))
-                Abar_min = -min(self.obs_dict[reach]['dA']) + 1
-                init_params = (np.nanmean(self.alg_dict['sic4dvar'][reach].get('n', np.nan)), np.nanmean(self.alg_dict['sic4dvar'][reach].get('a0', np.nan))) if not np.isnan(nflpe) else (0.03, Abar_min+10.)
+        return flp_fit.fit_flow_law(
+            alg=alg, obs=self.obs_dict[reach], target=target,
+            priors=spec['priors'], param_bounds=spec['bounds'],
+            flowlaw=spec['flowlaw'], fallback_params=spec['init'],
+            a0_min=spec['a0_min'], save=spec['save'], extra=spec['extra'],
+            space=settings['space'], loss=settings['loss'],
+            weight_mode=settings['weight_mode'],
+            grid_points=settings['grid_points'],
+            exponent_points=settings['exponent_points'],
+            refine=settings['refine'], penalty=spec['penalty'],
+            min_obs=settings['min_obs'],
+        )
 
-            param_bounds = ((0.001, 10.), (Abar_min, np.inf))
-            qbar = self.alg_dict['sic4dvar'][reach]['integrator']['qbar']
-            objfun, objargs = self.flp_objective(
-                'sic4dvar', reach, self.sic4dvar_flowlaw,
-                self.sic4dvar_objfun, (self.obs_dict[reach], qbar))
-            res = optimize.minimize(fun=objfun, x0=init_params, args=objargs, bounds=param_bounds)
-            
-            self.alg_dict['sic4dvar'][reach]['integrator']['n'] = res.x[0]
-            self.alg_dict['sic4dvar'][reach]['integrator']['a0'] = res.x[1]
-            self.alg_dict['sic4dvar'][reach]['integrator']['q'] = self.integrator_hydrograph(
-                'sic4dvar', reach, self.sic4dvar_flowlaw(res.x, self.obs_dict[reach]))
-            self.flp_fit_diagnostic('sic4dvar', reach, res.x, self.sic4dvar_flowlaw)
-    
-        # if self.VerboseFlag: print('Enforcing strict array shapes for Output.py compatibility...')
+    def _store_flp_result(self, alg, reach, spec, outcome):
+        """Write parameters, hydrograph and fit diagnostics for one reach.
+
+        The diagnostics are recorded for every reach and used to gate nothing.
+        That is deliberate: thresholds picked before the global distribution is
+        known are guesses.  Record first, threshold second.
+        """
+        integ = self.alg_dict[alg][reach].setdefault('integrator', {})
+        obs = self.obs_dict[reach]
+
+        for key, value in zip(self.FLP_PARAM_KEYS[alg], outcome.params):
+            integ[key] = value
+        if alg == 'momma':
+            integ['Save'] = spec['save']
+
+        q_flowlaw = flp_fit._safe_flowlaw(
+            spec['flowlaw'], outcome.params, obs, spec['extra'])
+        if q_flowlaw is None:
+            q_flowlaw = np.full((1, int(obs.get('nt', 1) or 1)), np.nan)
+        integ['q'] = self.integrator_hydrograph(alg, reach, q_flowlaw)
+
+        integ['flp_fit_nrmse'] = outcome.nrmse_lin
+        integ['flp_fit_nrmse_log'] = outcome.nrmse_log
+        integ['flp_fit_status'] = outcome.status
+        integ['flp_fit_status_code'] = flp_fit.FIT_STATUS_CODE.get(
+            outcome.status, -1)
+        integ['flp_param_at_bound'] = outcome.param_at_bound
+        integ['flp_n_valid_obs'] = outcome.n_valid_obs
+        integ['flp_grid_evals'] = outcome.n_grid_evals
+        integ['flp_fit_method'] = outcome.method
+        integ['dA_valid_frac'] = flp_fit.da_valid_fraction(obs)
+        # Provenance the solve already tracked but never wrote out, so a
+        # consumer could not tell a real FLPE estimate from a prior fallback.
+        integ['qbar_source'] = self.alg_dict[alg][reach].get('qbar_source', '')
+        integ['q33_source'] = self.alg_dict[alg][reach].get('q33_source', '')
+
+    def compute_FLPs(self):
+        settings = {
+            'optimizer': self.params_dict.get('FLP_Optimizer', 'varpro'),
+            'space': self.params_dict.get('FLP_Fit_Space', 'linear'),
+            'loss': self.params_dict.get('FLP_Fit_Loss', 'l2'),
+            'weight_mode': self.params_dict.get('FLP_Fit_Weighting', 'none'),
+            'grid_points': int(self.params_dict.get('FLP_Grid_Points', 48)),
+            'exponent_points': int(
+                self.params_dict.get('FLP_Exponent_Points', 17)),
+            'refine': bool(self.params_dict.get('FLP_Local_Refine', True)),
+            'min_obs': int(
+                self.params_dict.get('FLP_Min_Valid_Obs',
+                                     flp_fit.MIN_VALID_OBS)),
+        }
+
+        self.flp_fit_report = {}
+
+        for alg in self.FLP_ALGORITHMS:
+            if alg not in self.alg_dict:
+                continue
+            if self.VerboseFlag:
+                print('CALCULATING %s FLPs' % alg)
+            counts = {}
+            for reach in self.alg_dict[alg]:
+                spec = self._flp_reach_spec(alg, reach)
+                if spec is None:
+                    continue
+                try:
+                    outcome = self._fit_one_flp(alg, reach, spec, settings)
+                except Exception as exc:
+                    # A single reach must never be able to take down a basin.
+                    outcome = flp_fit._outcome_from_params(
+                        spec['init'], flp_fit.FIT_FAILED, spec['flowlaw'],
+                        self.obs_dict[reach], np.array([]), spec['bounds'],
+                        spec['extra'], 0, 0, np.nan, 'error')
+                    if self.VerboseFlag:
+                        print('    %s %s: fit failed (%s)' % (alg, reach, exc))
+                try:
+                    self._store_flp_result(alg, reach, spec, outcome)
+                except Exception as exc:
+                    if self.VerboseFlag:
+                        print('    %s %s: store failed (%s)' % (alg, reach, exc))
+                    continue
+                counts[outcome.status] = counts.get(outcome.status, 0) + 1
+            self.flp_fit_report[alg] = counts
+            if self.VerboseFlag and counts:
+                print('    ' + ', '.join(
+                    '%s=%d' % (k, v) for k, v in sorted(counts.items())))
+
+        # Output.py expects (1, nt) on the valid-timestep grid for every reach.
         for alg in self.alg_dict:
             for reach in self.basin_dict['reach_ids_all']:
                 if reach in self.obs_dict and 'integrator' in self.alg_dict[alg].get(reach, {}):
                     expected_nt = self.obs_dict[reach].get('nt', 1)
                     if expected_nt < 0: expected_nt = 1
-                    
+
                     q_arr = self.alg_dict[alg][reach]['integrator'].get('q')
 
                     if q_arr is not None:
                         q_arr = np.atleast_2d(q_arr)
                         if q_arr.shape != (1, expected_nt):
                             new_q = np.full((1, expected_nt), np.nan)
-                            
+
                             copy_len = min(expected_nt, q_arr.shape[1])
                             new_q[0, :copy_len] = q_arr[0, :copy_len]
-                                
+
                             self.alg_dict[alg][reach]['integrator']['q'] = new_q
-    
 
     def build_soft_sfoi_system(self, n, Qbar, sigQ, facc, u_conversion):
         """Build sparse paper-style SFOI system.
@@ -1651,3 +1975,53 @@ class Integrate:
           if self.VerboseFlag:
               print('Computing all FLPs (Final Parameter Estimation)')
           self.compute_FLPs()
+
+          self.print_run_report()
+
+    def run_report(self):
+          """Machine-readable summary of everything that went wrong this run.
+
+          Assembled from the topology pre-check, the solver convergence log and
+          the per-algorithm FLP fit statuses.  A global run needs one place to
+          look to answer "which basins should I not trust", and it needs that
+          answer even when the run itself succeeded.
+          """
+          n_unconverged = len(self.unconverged_solves)
+          flp = {
+              alg: dict(counts)
+              for alg, counts in sorted(self.flp_fit_report.items())
+          }
+          n_not_good = sum(
+              count
+              for counts in self.flp_fit_report.values()
+              for status, count in counts.items()
+              if status != flp_fit.FIT_GOOD
+          )
+          return {
+              'topology': dict(self.topology_report),
+              'unconverged_solves': list(self.unconverged_solves),
+              'n_unconverged_solves': n_unconverged,
+              'flp_fit_status_counts': flp,
+              'n_flp_fits_not_good': n_not_good,
+          }
+
+    def print_run_report(self):
+          report = self.run_report()
+          topo = report['topology']
+          print('\n--- MOI run report ---')
+          if topo:
+              print('  topology: %d reaches / %d junctions; '
+                    'bifurcating=%d dangling=%d isolated=%d missing_sword=%d'
+                    % (topo.get('n_reaches', 0), topo.get('n_junctions', 0),
+                       len(topo.get('bifurcating_reaches', [])),
+                       len(topo.get('dangling_reaches', [])),
+                       len(topo.get('isolated_reaches', [])),
+                       len(topo.get('missing_from_sword', []))))
+          print('  unconverged solver runs: %d' % report['n_unconverged_solves'])
+          for alg, counts in report['flp_fit_status_counts'].items():
+              if counts:
+                  print('  FLP %-9s %s' % (
+                      alg,
+                      ', '.join('%s=%d' % kv for kv in sorted(counts.items()))))
+          print('  FLP fits not marked good: %d' % report['n_flp_fits_not_good'])
+          print('--- end run report ---\n')

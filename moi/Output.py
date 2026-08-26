@@ -160,6 +160,62 @@ class Output:
         )
         time_str[:] = values
         
+    # Diagnostic fields describing HOW the flow-law parameters in this group
+    # were obtained, and how well they reproduce the hydrograph.  Written for
+    # every reach and used to gate nothing: thresholds chosen before the global
+    # distribution is known are guesses, so the first global run should record
+    # the distribution and the thresholds should be set from it afterwards.
+    FLP_DIAGNOSTIC_FIELDS = (
+        # (netCDF name, integrator key, dtype)
+        ('flp_fit_nrmse', 'flp_fit_nrmse', 'f8'),
+        ('flp_fit_nrmse_log', 'flp_fit_nrmse_log', 'f8'),
+        # i8, not i4: the file-wide fill value (-999999999999) does not fit in
+        # a 32-bit integer, so an i4 variable could not represent "missing".
+        ('flp_fit_status_code', 'flp_fit_status_code', 'i8'),
+        ('flp_param_at_bound', 'flp_param_at_bound', 'i8'),
+        ('flp_n_valid_obs', 'flp_n_valid_obs', 'i8'),
+        ('dA_valid_frac', 'dA_valid_frac', 'f8'),
+        ('rescale_factor', 'rescale_factor', 'f8'),
+        ('rescale_exponent', 'rescale_b', 'f8'),
+    )
+
+    # String provenance, written as group attributes rather than variables so
+    # they cost nothing and stay readable with ncdump -h.
+    FLP_DIAGNOSTIC_ATTRS = (
+        ('flp_fit_status', 'flp_fit_status'),
+        ('flp_fit_method', 'flp_fit_method'),
+        ('rescale_method', 'rescale_method'),
+        ('hydrograph_source', 'q_source'),
+        ('qbar_source', 'qbar_source'),
+        ('q33_source', 'q33_source'),
+    )
+
+    def _write_flp_diagnostics(self, group, algorithm, reach, fillvalue):
+        """Write the FLP fit diagnostics for one algorithm group.
+
+        ``qbar_source`` and ``q33_source`` were already tracked in Integrate.py
+        and already drove prior-vs-FLPE uncertainty inside the solve, but were
+        never written out -- so a consumer could not tell a real FLPE estimate
+        from a prior reconstruction wearing the same variable names.  They are
+        written here.
+        """
+        integ = self.alg_dict.get(algorithm, {}).get(reach, {}).get('integrator', {})
+
+        for name, key, dtype in self.FLP_DIAGNOSTIC_FIELDS:
+            variable = group.createVariable(name, dtype, fill_value=fillvalue)
+            value = integ.get(key, np.nan)
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                value = np.nan
+            if not np.isfinite(value):
+                value = fillvalue
+            variable[:] = int(value) if dtype.startswith('i') else value
+
+        for attr_name, key in self.FLP_DIAGNOSTIC_ATTRS:
+            value = integ.get(key, '')
+            setattr(group, attr_name, str(value) if value is not None else '')
+
     def write_output(self):
         """Write data stored to NetCDF files for each reach"""
         fillvalue = -999999999999
@@ -280,8 +336,7 @@ class Output:
              gb_qbar_s2[:] = np.nan_to_num(self.alg_dict['busboi'][reach]['integrator']['qbar'], copy=True, nan=fillvalue)
              gb_sbQ = gb.createVariable("sbQ_rel", "f8", fill_value=fillvalue)
              gb_sbQ[:] = np.nan_to_num(self.alg_dict['busboi'][reach]['integrator']['sbQ_rel'], copy=True, nan=fillvalue)
-             gb_nrmse = gb.createVariable("flp_fit_nrmse", "f8", fill_value=fillvalue)
-             gb_nrmse[:] = np.nan_to_num(self.alg_dict['busboi'][reach]['integrator'].get('flp_fit_nrmse', np.nan), copy=True, nan=fillvalue)
+             self._write_flp_diagnostics(gb, 'busboi', reach, fillvalue)
 
              # 2 hivdi
              hv = out.createGroup("hivdi")
@@ -302,8 +357,7 @@ class Output:
              hv_qbar_s2[:] = np.nan_to_num(self.alg_dict['hivdi'][reach]['integrator']['qbar'], copy=True, nan=fillvalue)
              hv_sbQ = hv.createVariable("sbQ_rel", "f8", fill_value=fillvalue)
              hv_sbQ[:] = np.nan_to_num(self.alg_dict['hivdi'][reach]['integrator']['sbQ_rel'], copy=True, nan=fillvalue)
-             hv_nrmse = hv.createVariable("flp_fit_nrmse", "f8", fill_value=fillvalue)
-             hv_nrmse[:] = np.nan_to_num(self.alg_dict['hivdi'][reach]['integrator'].get('flp_fit_nrmse', np.nan), copy=True, nan=fillvalue)
+             self._write_flp_diagnostics(hv, 'hivdi', reach, fillvalue)
 
              # 3 metroman
              mm = out.createGroup("metroman")
@@ -326,8 +380,7 @@ class Output:
              mm_q33[:] = np.nan_to_num(self.alg_dict['metroman'][reach]['integrator']['q33'], copy=True, nan=fillvalue)
              mm_sbQ = mm.createVariable("sbQ_rel", "f8", fill_value=fillvalue)
              mm_sbQ[:] = np.nan_to_num(self.alg_dict['metroman'][reach]['integrator']['sbQ_rel'], copy=True, nan=fillvalue)
-             mm_nrmse = mm.createVariable("flp_fit_nrmse", "f8", fill_value=fillvalue)
-             mm_nrmse[:] = np.nan_to_num(self.alg_dict['metroman'][reach]['integrator'].get('flp_fit_nrmse', np.nan), copy=True, nan=fillvalue)
+             self._write_flp_diagnostics(mm, 'metroman', reach, fillvalue)
 
              # 4 momma
              mo = out.createGroup("momma")
@@ -348,8 +401,7 @@ class Output:
              mo_qbar_s2[:] = np.nan_to_num(self.alg_dict['momma'][reach]['integrator']['qbar'], copy=True, nan=fillvalue)
              mo_sbQ = mo.createVariable("sbQ_rel", "f8", fill_value=fillvalue)
              mo_sbQ[:] = np.nan_to_num(self.alg_dict['momma'][reach]['integrator']['sbQ_rel'], copy=True, nan=fillvalue)
-             mo_nrmse = mo.createVariable("flp_fit_nrmse", "f8", fill_value=fillvalue)
-             mo_nrmse[:] = np.nan_to_num(self.alg_dict['momma'][reach]['integrator'].get('flp_fit_nrmse', np.nan), copy=True, nan=fillvalue)
+             self._write_flp_diagnostics(mo, 'momma', reach, fillvalue)
 
              # 5 sad
              sd = out.createGroup("sad")
@@ -368,8 +420,7 @@ class Output:
              sd_qbar_s2[:] = np.nan_to_num(self.alg_dict['sad'][reach]['integrator']['qbar'], copy=True, nan=fillvalue)
              sd_sbQ = sd.createVariable("sbQ_rel", "f8", fill_value=fillvalue)
              sd_sbQ[:] = np.nan_to_num(self.alg_dict['sad'][reach]['integrator']['sbQ_rel'], copy=True, nan=fillvalue)
-             sd_nrmse = sd.createVariable("flp_fit_nrmse", "f8", fill_value=fillvalue)
-             sd_nrmse[:] = np.nan_to_num(self.alg_dict['sad'][reach]['integrator'].get('flp_fit_nrmse', np.nan), copy=True, nan=fillvalue)
+             self._write_flp_diagnostics(sd, 'sad', reach, fillvalue)
 
              # 6 sic4dvar
              sic = out.createGroup("sic4dvar")
@@ -388,8 +439,7 @@ class Output:
              sic_qbar_s2[:] = np.nan_to_num(self.alg_dict['sic4dvar'][reach]['integrator']['qbar'], copy=True, nan=fillvalue)
              sic_sbQ = sic.createVariable("sbQ_rel", "f8", fill_value=fillvalue)
              sic_sbQ[:] = np.nan_to_num(self.alg_dict['sic4dvar'][reach]['integrator']['sbQ_rel'], copy=True, nan=fillvalue)
-             sic_nrmse = sic.createVariable("flp_fit_nrmse", "f8", fill_value=fillvalue)
-             sic_nrmse[:] = np.nan_to_num(self.alg_dict['sic4dvar'][reach]['integrator'].get('flp_fit_nrmse', np.nan), copy=True, nan=fillvalue)
+             self._write_flp_diagnostics(sic, 'sic4dvar', reach, fillvalue)
 
              out.close()
 

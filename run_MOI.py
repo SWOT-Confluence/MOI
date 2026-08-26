@@ -105,6 +105,43 @@ def set_moi_params():
         # 'series': fit the flow-law parameters to the integrator hydrograph.
         # 'moments': match qbar and q33 only (previous behaviour).
         'FLP_Fit_Method': 'series',
+        # --- flow-law parameter refit ---------------------------------------
+        # 'varpro': solve the scale parameter analytically and scan the rest on
+        # a bounded grid -- deterministic, restart-free, and able to tell a
+        # stalled optimiser apart from a flow law that genuinely cannot fit.
+        # 'legacy': the previous single-start L-BFGS-B solve.
+        'FLP_Optimizer': 'varpro',
+        # 'linear' or 'log'.  Linear least squares on discharge is dominated by
+        # high flows; hydrologic error is multiplicative and the rescale step is
+        # itself multiplicative, so log space is the arm worth testing.  Default
+        # stays linear so the canary matrix keeps a fixed reference.
+        'FLP_Fit_Space': 'linear',
+        # 'l2', 'soft_l1' or 'huber'.  A robust loss suppresses individual bad
+        # d_x_area timesteps -- a geometry dropout, a jump after a missing pass
+        # -- without discarding the reach.
+        'FLP_Fit_Loss': 'l2',
+        # 'none' or 'obs_quality' (weight by SWOT reach_q / xovr_cal_q).
+        'FLP_Fit_Weighting': 'none',
+        'FLP_Grid_Points': 48,
+        'FLP_Exponent_Points': 17,
+        'FLP_Local_Refine': True,
+        # Below this many usable timesteps a two-parameter fit is interpolation,
+        # not estimation; the reach keeps its prior and is flagged.
+        'FLP_Min_Valid_Obs': 5,
+        # 'mean': shift the FLPE hydrograph's level to the integrated mean.
+        # 'powerlaw': q' = a*q**b, matching the integrated mean AND q33, which
+        # can also correct a hydrograph whose spread disagrees.
+        'Rescale_Transform': 'mean',
+        # --- SFOI weighting -------------------------------------------------
+        # 'step' reproduces the historical facc thresholds exactly; 'continuous'
+        # replaces them with a calibrated power law.  Default 'step' so this
+        # cannot move qbar_basinScale until asked.
+        'SFOI_Uncertainty_Model': 'step',
+        'SFOI_Use_Algorithm_Uncertainty': False,
+        'FLPE_Outlier_Nstdev': 10.0,
+        # Record non-convergence of the plain solver always; refuse its output
+        # only when this is on, so a global run can measure the cost first.
+        'SFOI_Require_Plain_Convergence': False,
         'quit_before_flpe': False,
         'apply_patches': False,
         'write_fill_only': False,
@@ -210,11 +247,81 @@ def main():
         '--flp-fit',
         type=str,
         default=None,
-        choices=['series', 'moments'],
+        choices=['series', 'series_log', 'moments'],
         help=(
             'How final flow-law parameters are fitted. series: least squares '
-            'against the integrator hydrograph. moments: match qbar and q33 '
-            'only (behaviour before the series fit change).'
+            'against the integrator hydrograph. series_log: the same in log '
+            'space, which stops high flows dominating the fit. moments: match '
+            'qbar and q33 only (behaviour before the series fit change).'
+        ),
+    )
+    parser.add_argument(
+        '--flp-optimizer',
+        type=str,
+        default=None,
+        choices=['varpro', 'legacy'],
+        help=(
+            'How the flow-law fit is searched. varpro: analytic scale plus a '
+            'bounded global scan over the remaining parameters -- '
+            'deterministic and restart-free. legacy: single-start L-BFGS-B '
+            'from the FLPE prior.'
+        ),
+    )
+    parser.add_argument(
+        '--flp-loss',
+        type=str,
+        default=None,
+        choices=['l2', 'soft_l1', 'huber'],
+        help='Loss for the flow-law fit. A robust loss down-weights bad dA timesteps.',
+    )
+    parser.add_argument(
+        '--flp-weighting',
+        type=str,
+        default=None,
+        choices=['none', 'obs_quality'],
+        help='Per-timestep weighting for the flow-law fit, from SWOT quality flags.',
+    )
+    parser.add_argument(
+        '--no-flp-refine',
+        action='store_true',
+        help='Skip the local polish after the grid search (grid optimum only).',
+    )
+    parser.add_argument(
+        '--rescale-transform',
+        type=str,
+        default=None,
+        choices=['mean', 'powerlaw'],
+        help=(
+            'How the FLPE hydrograph is rescaled. mean: multiplicative shift to '
+            'the integrated mean. powerlaw: q = a*q**b matching the mean and q33.'
+        ),
+    )
+    parser.add_argument(
+        '--sfoi-uncertainty-model',
+        type=str,
+        default=None,
+        choices=['step', 'continuous'],
+        help=(
+            'FLPE uncertainty as a function of drainage area. step: the '
+            'historical facc thresholds. continuous: a calibrated power law '
+            'without the discontinuities.'
+        ),
+    )
+    parser.add_argument(
+        '--flpe-outlier-nstdev',
+        type=float,
+        default=None,
+        help=(
+            'How many sigma an FLPE estimate may sit from the SoS climatology '
+            'before it is replaced by the prior (default 10).'
+        ),
+    )
+    parser.add_argument(
+        '--require-plain-convergence',
+        action='store_true',
+        help=(
+            'Refuse output from a plain solver run that exhausted its '
+            'iterations, instead of only recording it.'
         ),
     )
     parser.add_argument(
@@ -269,7 +376,31 @@ def main():
             if args.integrator_hydrograph is not None:
                 params_dict['Integrator_Hydrograph_Method'] = args.integrator_hydrograph
             if args.flp_fit is not None:
-                params_dict['FLP_Fit_Method'] = args.flp_fit
+                # series_log is the series objective evaluated in log space;
+                # it selects a space, not a different fitting method.
+                if args.flp_fit == 'series_log':
+                    params_dict['FLP_Fit_Method'] = 'series'
+                    params_dict['FLP_Fit_Space'] = 'log'
+                else:
+                    params_dict['FLP_Fit_Method'] = args.flp_fit
+            if args.flp_optimizer is not None:
+                params_dict['FLP_Optimizer'] = args.flp_optimizer
+            if args.flp_loss is not None:
+                params_dict['FLP_Fit_Loss'] = args.flp_loss
+            if args.flp_weighting is not None:
+                params_dict['FLP_Fit_Weighting'] = args.flp_weighting
+            if args.no_flp_refine:
+                params_dict['FLP_Local_Refine'] = False
+            if args.rescale_transform is not None:
+                params_dict['Rescale_Transform'] = args.rescale_transform
+            if args.sfoi_uncertainty_model is not None:
+                params_dict['SFOI_Uncertainty_Model'] = args.sfoi_uncertainty_model
+            if args.flpe_outlier_nstdev is not None:
+                if args.flpe_outlier_nstdev <= 0:
+                    raise ValueError('--flpe-outlier-nstdev must be positive')
+                params_dict['FLPE_Outlier_Nstdev'] = args.flpe_outlier_nstdev
+            if args.require_plain_convergence:
+                params_dict['SFOI_Require_Plain_Convergence'] = True
 
             # ---------------------------------------------------------
             # 1. INPUT EXTRACTION
