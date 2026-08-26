@@ -11,6 +11,8 @@ from netCDF4 import Dataset
 import numpy as np
 import shutil
 
+from moi import flp_fit
+
 def wait_random(min_seconds=1, max_seconds=10):
     """Wait for a random amount of time between min_seconds and max_seconds."""
     random_wait_time = random.uniform(min_seconds, max_seconds)
@@ -48,6 +50,10 @@ class Output:
         self.obs_dict = obs_dict
         self.sword_dir = sword_dir
         self.params_dict = params_dict
+        # Hydrographs whose length did not match the record, repaired rather
+        # than raised on.  Empty is the expected state; anything here means an
+        # algorithm produced a malformed series for a reach.
+        self.q_shape_repairs = []
 
     def _write_bias_correlation_diagnostics(self, out):
         """Persist basin-scale augmentation diagnostics in each reach file."""
@@ -190,6 +196,46 @@ class Output:
         ('q33_source', 'q33_source'),
     )
 
+    def _expand_q_to_full_record(self, algorithm, reach, iInsert, nDelete,
+                                 fillvalue):
+        """Put back the timesteps extract_swot() dropped, whatever shape q is in.
+
+        This used to be ``np.insert(q, iInsert, fillvalue, 1)``, which assumed q
+        was always ``(1, nt)``.  That held only because every ``*_flowlaw`` ends
+        with a reshape; anything reaching here as a 1-D array raised
+        ``AxisError`` and killed ``write_output`` for the entire basin -- all
+        six algorithms, every reach -- over one malformed hydrograph.
+
+        The shape is normalised rather than validated.  Raising here would be
+        the same failure with a friendlier message: the point of writing output
+        is that a partly-bad basin still produces files, with the bad parts
+        marked.  A repair is recorded in ``self.q_shape_repairs`` so it is
+        visible rather than silent.
+        """
+        integ = self.alg_dict[algorithm][reach]['integrator']
+        nt_valid = int(self.obs_dict[reach]['nt']) - int(nDelete)
+        if nt_valid < 0:
+            nt_valid = 0
+
+        q = integ.get('q')
+        if q is None or np.size(q) != nt_valid:
+            self.q_shape_repairs.append({
+                'algorithm': algorithm,
+                'reach': reach,
+                'size': 0 if q is None else int(np.size(q)),
+                'expected': nt_valid,
+            })
+            warnings.warn(
+                'integrator q for %s/%s had %s values, expected %d; padded'
+                % (algorithm, reach,
+                   'none' if q is None else np.size(q), nt_valid)
+            )
+
+        row = flp_fit.as_row(q, nt_valid)
+        if nDelete == 0:
+            return row
+        return np.insert(row, iInsert, fillvalue, axis=1)
+
     def _write_flp_diagnostics(self, group, algorithm, reach, fillvalue):
         """Write the FLP fit diagnostics for one algorithm group.
 
@@ -219,6 +265,7 @@ class Output:
     def write_output(self):
         """Write data stored to NetCDF files for each reach"""
         fillvalue = -999999999999
+        self.q_shape_repairs = []
 
         if self.out_dir == Path('/mnt/data/output'):
             reaches_to_write = self.basin_dict['reach_ids']
@@ -304,8 +351,9 @@ class Output:
              self.obs_dict[reach]['nt'] += nDelete
 
              for algo in ['busboi', 'hivdi', 'metroman', 'momma', 'sad', 'sic4dvar']:
-                 self.alg_dict[algo][reach]['integrator']['q'] = np.insert(
-                     self.alg_dict[algo][reach]['integrator']['q'], iInsert, fillvalue, 1)
+                 self.alg_dict[algo][reach]['integrator']['q'] = (
+                     self._expand_q_to_full_record(
+                         algo, reach, iInsert, nDelete, fillvalue))
 
              # NetCDF file creation for observed reaches
              out_file = self.out_dir / f"{reach}_integrator.nc"
