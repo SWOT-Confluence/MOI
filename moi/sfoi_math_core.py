@@ -513,9 +513,19 @@ def _solve_wls_sparse(
 
     prob = cp.Problem(objective, constraints)
 
+    # Clarabel (interior-point) tries first: profiling on a real ~1000-variable
+    # basin showed it solving the exact same problems ~100x faster than OSQP
+    # (0.05s vs 7.2s average). Qbar/facc routinely span 6-7 orders of
+    # magnitude in these problems, and OSQP's first-order ADMM iterations are
+    # far more sensitive to that conditioning than an interior-point method's
+    # Newton steps -- OSQP was grinding toward max_iter on most calls instead
+    # of failing outright, so this was invisible as an error, only as basins
+    # that took 30-70 minutes each. OSQP stays as a fallback with a much
+    # tighter iteration budget, since it is now the exception path rather
+    # than the common case.
     solvers = []
     installed = set(cp.installed_solvers())
-    for s in ('OSQP', 'CLARABEL', 'SCS'):
+    for s in ('CLARABEL', 'OSQP', 'SCS'):
         if s in installed:
             solvers.append(s)
 
@@ -525,9 +535,9 @@ def _solve_wls_sparse(
             if solver == 'OSQP':
                 prob.solve(
                     solver=cp.OSQP,
-                    max_iter=100000,
-                    eps_abs=1e-5,
-                    eps_rel=1e-5,
+                    max_iter=10000,
+                    eps_abs=1e-4,
+                    eps_rel=1e-4,
                     adaptive_rho=True,
                     warm_start=True,
                     verbose=verbose,
