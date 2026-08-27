@@ -950,6 +950,8 @@ def adjust_lsq_bias_correlated_sparse(
     minimum_step_relaxation: float = 0.05,
     relaxation_recovery: float = 1.25,
     relaxation_recovery_patience: int = 3,
+    convergence_hold_iters: int = 3,
+    max_So_at_convergence: float = 25.0,
     theta_floor: float = 5.0,
     w_max: Optional[float] = 1.0e6,
     fixed_weight_mask: Optional[np.ndarray] = None,
@@ -990,12 +992,27 @@ def adjust_lsq_bias_correlated_sparse(
     After several non-oscillating iterations, relaxation recovers gradually
     toward one.
 
-    Convergence is component-wise rather than controlled by one numerically
-    arbitrary delta. Both the raw Gauss-Newton candidate and the applied
-    (possibly relaxed) step must satisfy physical RMS, physical p95, bias, and
-    regional-effect tolerances; robust weights must satisfy their own tolerance.
-    ``change_thresh`` remains as a backward-compatible fallback for callers that
-    do not supply the component thresholds.
+    Convergence gates on the physical (Q, R) state only -- the part of the
+    fit ``Qintegrator`` actually reads -- rather than on every auxiliary
+    parameter. It declares convergence once the *applied* physical RMS and
+    p95 step have both stayed under their thresholds for
+    ``convergence_hold_iters`` consecutive iterations with a sane variance
+    of unit weight (``So <= max_So_at_convergence``). Requiring the raw
+    (undamped) candidate to also be tiny on a single iteration was tried
+    first and rejected: relaxation's own oscillation-detection/recovery
+    cycle can keep re-triggering on a fixed cadence indefinitely even after
+    the physical state has stopped moving in any way that matters, which
+    made that single-iteration, all-components gate self-perpetuating for
+    several real basins. Requiring several *consecutive* good applied
+    iterations is the standard, more robust substitute: it does not
+    manufacture false convergence out of thin air (a fluke small step still
+    has to repeat itself), and it does not depend on bias/effect/robust
+    bookkeeping settling to the same numerical precision as the answer
+    that is actually exported. Those components' own thresholds are still
+    evaluated every iteration and recorded on ``result.diagnostics`` and
+    ``result.fully_converged`` as a stricter, purely informational label.
+    ``change_thresh`` remains a backward-compatible fallback for callers
+    that do not supply the component thresholds.
     """
     A_obs = sp.csr_matrix(A_obs, dtype=float)
     L = _clean_vector('L', L)
@@ -1117,6 +1134,12 @@ def adjust_lsq_bias_correlated_sparse(
     relaxation_recovery_patience = int(relaxation_recovery_patience)
     if relaxation_recovery_patience < 1:
         raise ValueError('relaxation_recovery_patience must be >= 1')
+    convergence_hold_iters = int(convergence_hold_iters)
+    if convergence_hold_iters < 1:
+        raise ValueError('convergence_hold_iters must be >= 1')
+    max_So_at_convergence = float(max_So_at_convergence)
+    if not np.isfinite(max_So_at_convergence) or max_So_at_convergence <= 0:
+        raise ValueError('max_So_at_convergence must be finite and positive')
     effect_bound = max(float(correlation_effect_bound), 1.0)
 
     if x0 is None:
@@ -1193,6 +1216,9 @@ def adjust_lsq_bias_correlated_sparse(
     oscillation_events = 0
     relaxation_recoveries = 0
     stable_relaxation_iterations = 0
+    physical_stable_streak = 0
+    convergence_mode = None
+    last_fully_converged = False
 
     def assemble_state(
         physical: np.ndarray,
@@ -1559,9 +1585,13 @@ def adjust_lsq_bias_correlated_sparse(
         final_design = J_fit
         final_weights = weights_fit
 
-        # A relaxed step is not allowed to manufacture convergence: each state
-        # component must pass for both the raw candidate and the applied step.
-        physical_converged = (
+        # Strict, single-iteration, all-components label: kept purely as a
+        # diagnostic (see the docstring) -- it no longer gates whether a
+        # result is accepted, since requiring the raw candidate to also be
+        # tiny made this self-perpetuating whenever oscillation-detection
+        # had to keep re-arming on a fixed cadence to hold a bounded,
+        # low-amplitude cycle in check.
+        physical_converged_strict = (
             physical_delta < component_thresholds['physical_rms']
             and raw_physical_delta < component_thresholds['physical_rms']
             and physical_p95_delta < component_thresholds['physical_p95']
@@ -1576,18 +1606,45 @@ def adjust_lsq_bias_correlated_sparse(
             and raw_effect_delta < component_thresholds['effect']
         )
         robust_converged = robust_delta < component_thresholds['robust']
-        diagnostic['physical_converged'] = physical_converged
-        diagnostic['bias_converged'] = bias_converged
-        diagnostic['effect_converged'] = effect_converged
-        diagnostic['robust_converged'] = robust_converged
-
-        if (
-            physical_converged
+        fully_converged = (
+            physical_converged_strict
             and bias_converged
             and effect_converged
             and robust_converged
-        ):
+        )
+        diagnostic['physical_converged'] = physical_converged_strict
+        diagnostic['bias_converged'] = bias_converged
+        diagnostic['effect_converged'] = effect_converged
+        diagnostic['robust_converged'] = robust_converged
+        diagnostic['fully_converged'] = fully_converged
+        last_fully_converged = fully_converged
+
+        # Actual gate: the *applied* physical (Q, R) step -- what
+        # Qintegrator is built from -- has to stay under its own RMS/p95
+        # tolerance for several consecutive iterations, with a sane
+        # variance of unit weight. This does not depend on the raw
+        # candidate or on bias/effect/robust bookkeeping finishing at the
+        # same precision, so a basin whose physical state has genuinely
+        # settled is not held hostage by an oscillation-recovery cycle
+        # still chasing its own tail on the side.
+        physical_ok_applied = (
+            physical_delta < component_thresholds['physical_rms']
+            and physical_p95_delta < component_thresholds['physical_p95']
+        )
+        physical_stable_streak = (
+            physical_stable_streak + 1 if physical_ok_applied else 0
+        )
+        diagnostic['physical_stable_streak'] = physical_stable_streak
+        so_sane = np.isfinite(So) and So <= max_So_at_convergence
+
+        if fully_converged:
             converged = True
+            convergence_mode = 'strict'
+        elif physical_stable_streak >= convergence_hold_iters and so_sane:
+            converged = True
+            convergence_mode = 'physical_hold'
+
+        if converged:
             break
 
     if final_design is None or final_weights is None:
@@ -1630,7 +1687,12 @@ def adjust_lsq_bias_correlated_sparse(
         converged=bool(converged),
     )
     # Keep the historical result interface intact while exposing augmented
-    # diagnostics to Integrate.py and downstream callers.
+    # diagnostics to Integrate.py and downstream callers. ``convergence_mode``
+    # distinguishes the strict (all-components) exit from the physical-hold
+    # one the status string does not spell out.
+    result.convergence_mode = (convergence_mode or 'maxiter') if converged else 'maxiter'
+    result.fully_converged = bool(last_fully_converged)
+    result.physical_stable_streak = int(physical_stable_streak)
     result.bias = float(bias)
     result.bias_std = float(bias_std)
     result.bias_enabled = bool(bias_enabled)

@@ -736,14 +736,68 @@ class Integrate:
         )
 
     @staticmethod
-    def _require_converged_augmented_result(result):
-        """Reject an augmented result that exhausted its outer iterations."""
-        if not result.converged:
-            raise RuntimeError(
-                'bias-correlated outer solver did not converge: '
-                f'{result.status}; iterations={result.outer_iterations}; '
-                f'last_delta={result.delta[-1] if result.delta else np.nan}'
-            )
+    def _augmented_result_is_usable(result):
+        """Whether a bias/correlation fit is trustworthy enough to export.
+
+        ``result.converged`` (see ``adjust_lsq_bias_correlated_sparse``)
+        already requires the physical (Q, R) state -- the only part of the
+        fit that ``Qintegrator`` ever reads -- to have held still for
+        several consecutive iterations with a sane variance of unit
+        weight. A fit that never reaches that bar is a genuinely unresolved
+        estimation problem (e.g. too few real FLPE rows to identify a
+        per-region correlation effect, or a topology the mass-conservation
+        rows do not describe well), not a numerical-tolerance nuisance, so
+        it is discarded here rather than exported: the caller falls back to
+        the plain multiplicative solver instead of losing the whole basin.
+        """
+        return bool(getattr(result, 'converged', False))
+
+    def _run_plain_solver(
+        self,
+        n,
+        problem,
+        solver_A,
+        solver_L,
+        solver_cov,
+        solver_A_eq,
+        solver_b_eq,
+        n_soft_mass_rows,
+        gage_obs,
+        fixed_weight,
+        robust_eligible,
+    ):
+        """Run the ordinary (non-augmented) multiplicative-error solver.
+
+        Shared by the normal ungaged/uncorrelated dispatch and by the
+        bias/correlation fallback path, so both call it with identical
+        arguments instead of keeping two copies of this argument list in
+        sync.
+        """
+        return adjust_lsq_mult_sparse(
+            A_obs=solver_A,
+            L=solver_L,
+            cov=solver_cov,
+            A_eq=solver_A_eq,
+            b_eq=solver_b_eq,
+            lb=problem['lb'],
+            ub=problem.get('ub', None),
+            x0=problem['x0'],
+            idxbad=problem.get('idxbad', None),
+            maxiter=self.params_dict.get('SFOI_Maxiter', 20),
+            change_thresh=self.params_dict.get('SFOI_Change_Thresh', 0.05),
+            inner_itermax=self.params_dict.get('SFOI_Inner_Maxiter', 15),
+            outlier_limit=self.params_dict.get('SFOI_Outlier_Limit', 2.5),
+            alpha=self.params_dict.get('SFOI_Alpha', 0.05),
+            verbose=self.VerboseFlag,
+            theta_floor=self.params_dict.get('SFOI_Theta_Floor', 5.0),
+            w_max=self.params_dict.get('SFOI_W_Max', 1.0e6),
+            n_reaches=n,
+            n_regions=problem['K_regions'],
+            n_soft_mass_rows=n_soft_mass_rows,
+            n_gage_rows=gage_obs['A'].shape[0],
+            fixed_weight_mask=fixed_weight,
+            robust_eligible_mask=robust_eligible,
+        )
 
     def _augmented_solver_features(
         self, FlowLevel, n_gage_rows, n_real_flpe_rows=None
@@ -913,7 +967,35 @@ class Integrate:
                                 )
 
                     if result is None and (bias_enabled or correlation_enabled):
-                        result = adjust_lsq_bias_correlated_sparse(
+                        # A handful of genuine FLPE rows cannot reliably pin
+                        # down both a global bias and a per-region
+                        # correlation effect -- basin 7118 (9 FLPE rows /
+                        # 23 regions) and basin 7121 (4 / 8) chased exactly
+                        # this during diagnosis. Rather than an all-or-
+                        # nothing gate on FLPE count (which does not
+                        # separate stable from unstable basins cleanly --
+                        # some basins with even fewer FLPE rows behaved
+                        # fine), scale the augmentation's own prior
+                        # strength down smoothly as real evidence gets
+                        # thinner, so it degrades toward the bias-free,
+                        # uncorrelated model instead of chasing a
+                        # near-unidentified estimate out to its box bounds.
+                        n_real_flpe = int(np.sum(real_flpe_mask))
+                        identification_reference = max(
+                            float(
+                                self.params_dict.get(
+                                    'SFOI_Augmented_Identification_Reference',
+                                    25.0,
+                                )
+                            ),
+                            1.0,
+                        )
+                        identification_scale = float(
+                            np.clip(
+                                n_real_flpe / identification_reference, 0.0, 1.0
+                            )
+                        )
+                        augmented_result = adjust_lsq_bias_correlated_sparse(
                             A_obs=solver_A,
                             L=solver_L,
                             cov=solver_cov,
@@ -923,12 +1005,17 @@ class Integrate:
                             correlation_groups=problem['reach_regions'],
                             correlation_rho=(
                                 self.params_dict.get('SFOI_Correlation_Rho', 0.20)
+                                * identification_scale
                                 if correlation_enabled
                                 else 0.0
                             ),
                             bias_enabled=bias_enabled,
-                            bias_prior_std=self.params_dict.get(
-                                'SFOI_Bias_Prior_Std', 0.50
+                            bias_prior_std=max(
+                                self.params_dict.get(
+                                    'SFOI_Bias_Prior_Std', 0.50
+                                )
+                                * identification_scale,
+                                1.0e-3,
                             ),
                             bias_initial=self.params_dict.get(
                                 'SFOI_Bias_Initial', 0.0
@@ -944,7 +1031,7 @@ class Integrate:
                             ub=problem.get('ub', None),
                             x0=problem['x0'],
                             maxiter=self.params_dict.get(
-                                'SFOI_Augmented_Maxiter', 40
+                                'SFOI_Augmented_Maxiter', 50
                             ),
                             change_thresh=self.params_dict.get(
                                 'SFOI_Augmented_Change_Thresh', 1.0e-2
@@ -987,6 +1074,12 @@ class Integrate:
                             relaxation_recovery_patience=self.params_dict.get(
                                 'SFOI_Augmented_Relaxation_Recovery_Patience', 3
                             ),
+                            convergence_hold_iters=self.params_dict.get(
+                                'SFOI_Augmented_Convergence_Hold_Iters', 3
+                            ),
+                            max_So_at_convergence=self.params_dict.get(
+                                'SFOI_Augmented_So_Max', 25.0
+                            ),
                             theta_floor=self.params_dict.get(
                                 'SFOI_Theta_Floor', 5.0
                             ),
@@ -995,39 +1088,55 @@ class Integrate:
                             robust_eligible_mask=robust_eligible,
                             verbose=self.VerboseFlag,
                         )
-                    elif result is None:
-                        result = adjust_lsq_mult_sparse(
-                            A_obs=solver_A,
-                            L=solver_L,
-                            cov=solver_cov,
-                            A_eq=solver_A_eq,
-                            b_eq=solver_b_eq,
-                            lb=problem['lb'],
-                            ub=problem.get('ub', None),
-                            x0=problem['x0'],
-                            idxbad=problem.get('idxbad', None),
-                            maxiter=self.params_dict.get('SFOI_Maxiter', 20),
-                            change_thresh=self.params_dict.get(
-                                'SFOI_Change_Thresh', 0.05
-                            ),
-                            inner_itermax=self.params_dict.get(
-                                'SFOI_Inner_Maxiter', 15
-                            ),
-                            outlier_limit=self.params_dict.get(
-                                'SFOI_Outlier_Limit', 2.5
-                            ),
-                            alpha=self.params_dict.get('SFOI_Alpha', 0.05),
-                            verbose=self.VerboseFlag,
-                            theta_floor=self.params_dict.get(
-                                'SFOI_Theta_Floor', 5.0
-                            ),
-                            w_max=self.params_dict.get('SFOI_W_Max', 1.0e6),
-                            n_reaches=n,
-                            n_regions=problem['K_regions'],
-                            n_soft_mass_rows=n_soft_mass_rows,
-                            n_gage_rows=gage_obs['A'].shape[0],
-                            fixed_weight_mask=fixed_weight,
-                            robust_eligible_mask=robust_eligible,
+                        if self._augmented_result_is_usable(augmented_result):
+                            result = augmented_result
+                        else:
+                            fallback_note = {
+                                'algorithm': alg,
+                                'flow_level': FlowLevel,
+                                'status': str(
+                                    getattr(augmented_result, 'status', 'unknown')
+                                ),
+                                'outer_iterations': int(
+                                    getattr(
+                                        augmented_result, 'outer_iterations', 0
+                                    )
+                                ),
+                                'final_So': float(
+                                    getattr(augmented_result, 'So', np.nan)
+                                ),
+                                'n_real_flpe_rows': n_real_flpe,
+                                'identification_scale': identification_scale,
+                            }
+                            self.integ_dict.setdefault(
+                                'solver_fallback', {}
+                            ).setdefault(FlowLevel, {})[alg] = fallback_note
+                            if self.VerboseFlag:
+                                print(
+                                    f'      [solver] {alg} {FlowLevel}: '
+                                    'bias/correlation fit never reached a '
+                                    f'stable physical state (status='
+                                    f'{fallback_note["status"]}, So='
+                                    f'{fallback_note["final_So"]:.3g}); '
+                                    'falling back to the plain multiplicative '
+                                    'solver for this alg/flow-level.'
+                                )
+                            bias_enabled = False
+                            correlation_enabled = False
+
+                    if result is None:
+                        result = self._run_plain_solver(
+                            n,
+                            problem,
+                            solver_A,
+                            solver_L,
+                            solver_cov,
+                            solver_A_eq,
+                            solver_b_eq,
+                            n_soft_mass_rows,
+                            gage_obs,
+                            fixed_weight,
+                            robust_eligible,
                         )
 
                     if cache_key is not None and reused_from_algorithm is None:
@@ -1036,17 +1145,11 @@ class Integrate:
                             'result': copy.deepcopy(result),
                         }
 
-                    if (
-                        (bias_enabled or correlation_enabled)
-                    ):
-                        self._require_converged_augmented_result(result)
-
-                    # The augmented solver refuses to hand back an unconverged
-                    # result; the plain one did not, so a solve that merely ran
-                    # out of iterations still produced finite values that looked
-                    # like a normal answer.  Record it always.  Gate on it only
-                    # when asked, so the first global run can measure how many
-                    # basins this affects before it starts rejecting them.
+                    # A solve that merely ran out of iterations still
+                    # produced finite values that looked like a normal
+                    # answer.  Record it always.  Gate on it only when
+                    # asked, so a global run can measure how many basins
+                    # this affects before it starts rejecting them.
                     if not bool(getattr(result, 'converged', True)):
                         note = {
                             'algorithm': alg,
@@ -1174,9 +1277,66 @@ class Integrate:
                 except Exception as e:
                     print(f"      Sparse paper-SFOI solver failed: {e}")
                     if bias_enabled or correlation_enabled:
-                        raise RuntimeError(
-                            f'{alg} {FlowLevel} augmented solve failed: {e}'
-                        ) from e
+                        # A basin still needs a qbar_basinscale estimate even
+                        # when the bias/correlation augmentation itself blows
+                        # up (e.g. a singular normal matrix on a topology its
+                        # mass rows do not describe well). Fall back to the
+                        # plain solver rather than losing every algorithm and
+                        # flow level for the whole basin over one alg's
+                        # augmented fit.
+                        self.integ_dict.setdefault(
+                            'solver_fallback', {}
+                        ).setdefault(FlowLevel, {})[alg] = {
+                            'algorithm': alg,
+                            'flow_level': FlowLevel,
+                            'status': f'exception: {e}',
+                        }
+                        try:
+                            result = self._run_plain_solver(
+                                n,
+                                problem,
+                                solver_A,
+                                solver_L,
+                                solver_cov,
+                                solver_A_eq,
+                                solver_b_eq,
+                                n_soft_mass_rows,
+                                gage_obs,
+                                fixed_weight,
+                                robust_eligible,
+                            )
+                            bias_enabled = False
+                            correlation_enabled = False
+                            if not bool(getattr(result, 'converged', True)):
+                                self.unconverged_solves.append({
+                                    'algorithm': alg,
+                                    'flow_level': FlowLevel,
+                                    'status': str(
+                                        getattr(result, 'status', 'unknown')
+                                    ),
+                                })
+                            x_hat_saved = result.x
+                            if (
+                                x_hat_saved is not None
+                                and np.all(np.isfinite(x_hat_saved[:n]))
+                            ):
+                                Qintegrator = np.clip(
+                                    x_hat_saved[:n], 0.1, np.inf
+                                )
+                                stdQc_rel = estimate_q_uncertainty_rel(
+                                    result,
+                                    n_reaches=n,
+                                    Qhat=Qintegrator,
+                                    fallback_rel=self.params_dict.get(
+                                        'FLPE_Uncertainty', 0.6
+                                    ),
+                                )
+                                Success = True
+                        except Exception as fallback_exc:
+                            print(
+                                f"      Plain-solver fallback also failed "
+                                f"for {alg} {FlowLevel}: {fallback_exc}"
+                            )
 
             if Success and FlowLevel == 'Mean':
                 if not hasattr(self, 'reach_epsilons'):

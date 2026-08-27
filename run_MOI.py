@@ -77,7 +77,14 @@ def set_moi_params():
         'SFOI_Correlation_Enabled': True,
         'SFOI_Correlation_Rho': 0.20,
         'SFOI_Correlation_Effect_Bound': 8.0,
-        'SFOI_Augmented_Maxiter': 40,
+        # Below this many genuine FLPE rows, bias_prior_std and
+        # correlation_rho are scaled down proportionally (see
+        # Integrate.py's dispatch), pulling the estimate toward the
+        # bias-free, uncorrelated model as real evidence gets thinner
+        # instead of letting a handful of points drive a full-strength
+        # per-region correlation structure to its box bounds.
+        'SFOI_Augmented_Identification_Reference': 25.0,
+        'SFOI_Augmented_Maxiter': 50,
         # Component-specific convergence tolerances. The legacy aggregate
         # threshold remains only as a backward-compatible fallback.
         'SFOI_Augmented_Change_Thresh': 1.0e-2,
@@ -86,6 +93,13 @@ def set_moi_params():
         'SFOI_Augmented_Bias_Thresh': 1.0e-3,
         'SFOI_Augmented_Effect_Thresh': 1.0e-2,
         'SFOI_Augmented_Robust_Thresh': 1.0e-3,
+        # The applied physical (Q, R) step must stay under its RMS/p95
+        # threshold for this many consecutive iterations, with So under
+        # SFOI_Augmented_So_Max, to accept a result -- see the
+        # "convergence gates on the physical state only" note in
+        # adjust_lsq_bias_correlated_sparse.
+        'SFOI_Augmented_Convergence_Hold_Iters': 3,
+        'SFOI_Augmented_So_Max': 25.0,
         'SFOI_Augmented_Robust_Damping': 0.50,
         # Progressively shorten a Gauss-Newton step when its direction strongly
         # opposes the preceding step (the signature of a period-two cycle).

@@ -375,13 +375,85 @@ def test_relaxation_recovers_after_stable_directions(monkeypatch):
     assert result.diagnostics[-1]['relaxation_recovered']
 
 
-def test_pipeline_rejects_nonconverged_augmented_result():
-    result = SimpleNamespace(
+def test_persistent_bounded_oscillation_converges_via_physical_hold(monkeypatch):
+    """A non-decaying raw 2-cycle must not block acceptance once the
+    *applied* state has been small for several iterations running.
+
+    This reproduces the exact signature diagnosed in production basins
+    7823/7240/6230: relaxation gets pinned low by an oscillation that
+    re-triggers every single iteration (so the raw candidate never shrinks),
+    while the actually-exported physical state has been oscillating inside a
+    tiny, bounded band the whole time. The old single-iteration,
+    raw-and-applied gate never terminates on this pattern; physical-hold
+    accepts it once the applied step has stayed small for
+    convergence_hold_iters iterations in a row -- without requiring the raw
+    candidate, which never gets small here by construction, to agree.
+    """
+    call = {'count': 0}
+
+    def persistent_two_cycle(
+        A_obs, L, W, A_eq=None, b_eq=None, lb=None, ub=None, x0=None, verbose=False
+    ):
+        call['count'] += 1
+        sign = 1.0 if call['count'] % 2 else -1.0
+        # Jump by a fixed absolute amount from wherever the state currently
+        # sits (not a fixed-point map) -- so the raw step never decays,
+        # unlike test_augmented_result_damps_period_two_oscillation_to_convergence's
+        # F(z) = C - z, which converges to a fixed point and lets raw shrink
+        # along with everything else.
+        return np.asarray(x0, dtype=float) + sign * 2.0, 'success_mock_optimal'
+
+    monkeypatch.setattr(sfoi_math_core, '_solve_wls_sparse', persistent_two_cycle)
+
+    result = adjust_lsq_bias_correlated_sparse(
+        A_obs=sp.eye(1, format='csr'),
+        L=np.array([100.0]),
+        cov=np.array([0.20]),
+        n_reaches=1,
+        n_regions=0,
+        correlation_rho=0.0,
+        bias_enabled=False,
+        x0=np.array([100.0]),
+        lb=np.array([0.0]),
+        maxiter=15,
+        physical_rms_thresh=0.01,
+        physical_p95_thresh=0.01,
+        convergence_hold_iters=3,
+        fixed_weight_mask=np.array([True]),
+        robust_eligible_mask=np.array([False]),
+    )
+
+    assert result.converged
+    assert result.convergence_mode == 'physical_hold'
+    assert result.physical_stable_streak >= 3
+    # The raw candidate's relative jump (~2/100 = 0.02) never drops under
+    # physical_rms_thresh=0.01 by construction, so the strict, all-components
+    # criterion this basin used to be stuck on must never have fired.
+    assert not result.fully_converged
+    assert not result.diagnostics[-1]['physical_converged']
+
+
+def test_pipeline_falls_back_instead_of_rejecting_nonconverged_result():
+    """A non-converged augmented fit is discarded, not raised.
+
+    The pipeline used to crash the whole basin on this outcome. It now asks
+    whether the result is usable and, if not, the caller in Integrate.py
+    retries with the plain multiplicative solver so a basin never loses its
+    qbar_basinscale output over one algorithm's unresolved bias/correlation
+    fit.
+    """
+    unconverged = SimpleNamespace(
         converged=False,
         status='failed_bias_correlated_maxiter_success_mock_optimal',
         outer_iterations=30,
         delta=[0.083],
     )
+    converged = SimpleNamespace(
+        converged=True,
+        status='success_bias_correlated_converged_naturally_success_mock_optimal',
+        outer_iterations=12,
+        delta=[0.0004],
+    )
 
-    with pytest.raises(RuntimeError, match='outer solver did not converge'):
-        Integrate._require_converged_augmented_result(result)
+    assert not Integrate._augmented_result_is_usable(unconverged)
+    assert Integrate._augmented_result_is_usable(converged)
