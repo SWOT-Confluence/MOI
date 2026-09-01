@@ -73,7 +73,19 @@ class Output:
         Write integrator FLPs back to a copy of the SWORD file
     """
 
-    def __init__(self, basin_dict, out_dir, integ_dict, alg_dict, obs_dict, sword_dir, params_dict):
+    def __init__(
+        self,
+        basin_dict,
+        out_dir,
+        integ_dict,
+        alg_dict,
+        obs_dict,
+        sword_dir,
+        params_dict,
+        gage_groups=None,
+        gage_dict=None,
+        corridors_reaches=None,
+    ):
         self.basin_dict = basin_dict
         self.out_dir = out_dir
         self.stage_estimate = integ_dict
@@ -81,6 +93,59 @@ class Output:
         self.obs_dict = obs_dict
         self.sword_dir = sword_dir
         self.params_dict = params_dict
+        # ``gage_groups`` comes from the complete Cal/Val CSV, whereas
+        # ``gage_dict`` contains the gages made available to the integrator.
+        # The former is needed to label validation gages, which intentionally
+        # are not included in constrained integration.
+        #
+        # ``corridors_reaches`` names the reaches whose gage_dict entry is a
+        # CORRIDORS pseudo-gage rather than a real station.  The two are folded
+        # into one dict by Input.merge_corridors_and_gages, so without this set
+        # a pseudo-gage would be indistinguishable from a station here.
+        #
+        # Two questions are deliberately kept apart, because a validation reach
+        # answers them differently: whether a reach HAS a gage (it is in the
+        # catalogue) and what actually CONSTRAINED it (what reached gage_dict).
+        # A validation gage is withheld from constrained integration on purpose,
+        # so it is has_gage=1 with constraint_source='none' -- or 'corridors'
+        # when a pseudo-gage stood in for it.
+        self.corridors_reaches = {
+            str(reach) for reach in (corridors_reaches or set())
+        }
+        self.gage_groups = {
+            str(reach): str(group).strip().lower()
+            for reach, group in (gage_groups or {}).items()
+            if group is not None and str(group).strip()
+        }
+
+        # Catalogued gages: the Cal/Val CSV plus any real station handed to the
+        # integrator.  Validation reaches belong here even though they never
+        # constrain anything.
+        self.gage_reaches = set(self.gage_groups)
+        # What actually constrained each reach, keyed by reach id.
+        self.constraint_sources = {}
+
+        for reach, gage in (gage_dict or {}).items():
+            reach = str(reach)
+            source = gage.get('source') if isinstance(gage, dict) else None
+            # constraint_source follows the winning entry alone.  Reading it
+            # off corridors_reaches instead would mislabel a reach that has
+            # CORRIDORS data but was constrained by its real gage.
+            if source == 'corridors':
+                # Belt and braces: honour the entry's own source even when the
+                # caller did not pass corridors_reaches.
+                self.corridors_reaches.add(reach)
+                self.constraint_sources[reach] = 'corridors'
+                continue
+            self.constraint_sources[reach] = 'gage'
+            self.gage_reaches.add(reach)
+            if reach not in self.gage_groups:
+                group = gage.get('group') if isinstance(gage, dict) else None
+                self.gage_groups[reach] = (
+                    str(group).strip().lower()
+                    if group is not None and str(group).strip()
+                    else 'unclassified'
+                )
         # Hydrographs whose length did not match the record, repaired rather
         # than raised on.  Empty is the expected state; anything here means an
         # algorithm produced a malformed series for a reach.
@@ -196,6 +261,38 @@ class Output:
             'unavailable',
         )
         time_str[:] = values
+
+    def _write_gage_metadata(self, out, reach):
+        """Write what in-situ discharge this reach has, and what constrained it.
+
+        has_gage
+            The reach is in the real gage catalogue.  Independent of whether
+            that gage was used: a validation gage is catalogued but withheld.
+        has_corridors
+            A CORRIDORS pseudo-gage was built for the reach.  Also independent
+            of whether it was used: a reach with both keeps its real gage by
+            default, and is then has_gage=1, has_corridors=1, source='gage'.
+        constraint_source
+            What actually reached the integrator -- 'gage', 'corridors' or
+            'none'.  This is the field to score against, because it alone
+            says whether the estimate saw in-situ discharge.
+        group
+            Cal/Val label for the catalogued gage.
+        """
+        reach = str(reach)
+        gage = out.createGroup('gage')
+        has_gage = reach in self.gage_reaches
+        has_corridors = reach in self.corridors_reaches
+
+        gage.setncattr('has_gage', int(has_gage))
+        gage.setncattr('has_corridors', int(has_corridors))
+        gage.setncattr(
+            'constraint_source', self.constraint_sources.get(reach, 'none')
+        )
+        gage.setncattr(
+            'group',
+            self.gage_groups.get(reach, 'none') if has_gage else 'none',
+        )
         
     # Diagnostic fields describing HOW the flow-law parameters in this group
     # were obtained, and how well they reproduce the hydrograph.  Written for
@@ -330,6 +427,7 @@ class Output:
                 out = Dataset(out_file, 'w', format="NETCDF4")
                 out.production_date = datetime.now().strftime('%d-%b-%Y %H:%M:%S')
                 self._write_bias_correlation_diagnostics(out)
+                self._write_gage_metadata(out, reach)
 
                 # 1 busboi
                 gb = out.createGroup("busboi")
@@ -393,6 +491,7 @@ class Output:
              out = Dataset(out_file, 'w', format="NETCDF4")
              out.production_date = datetime.now().strftime('%d-%b-%Y %H:%M:%S')
              self._write_bias_correlation_diagnostics(out)
+             self._write_gage_metadata(out, reach)
 
              out.createDimension("nt", self.obs_dict[reach]['nt'])
              nt = out.createVariable("nt", "i4", ("nt",))

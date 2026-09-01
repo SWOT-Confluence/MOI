@@ -11,6 +11,7 @@ import warnings
 from moi.Input import Input
 from moi.Integrate import Integrate
 from moi.Output import Output
+from moi.Corridors import Corridors
 
 
 def get_basin_data(basin_json, index_to_run):
@@ -159,6 +160,22 @@ def set_moi_params():
         'quit_before_flpe': False,
         'apply_patches': False,
         'write_fill_only': False,
+        # CORRIDORS field discharge as an extra integrator constraint.
+        'UseCORRIDORS': False,
+        # Matched field measurements below this leave the reach without a
+        # pseudo-gage.  A floor, not a defensible minimum: a one-parameter law
+        # fitted to three points is barely constrained.
+        'Corridors_Min_Observations': 3,
+        # Relative-uncertainty floor for a pseudo-gage.  Matches
+        # Gage_Uncertainty, so a well-fitting pseudo-gage carries the same
+        # weight as a station and a poorly fitting one is downweighted by its
+        # own residual.
+        'Corridors_Min_Uncertainty': 0.10,
+        # What wins when a reach has both a real gage and a pseudo-gage.
+        # False keeps the station, which is the better measurement; True
+        # reproduces the original CORRIDORS branch, where the pseudo-gage
+        # replaced it.
+        'Corridors_Override_Gage': False,
     }
 
 
@@ -181,7 +198,15 @@ def resolve_index(cli_index):
 
 
 def main():
-    warnings.filterwarnings("ignore")
+    # Targeted rather than blanket.  A plain filterwarnings("ignore") hid the
+    # pipeline's own warnings too -- a CORRIDORS resource being skipped, a
+    # reach dropped for an ambiguous SWORD translation -- which are exactly
+    # what an operator needs to see.  numpy's per-reach divide-by-zero and
+    # invalid-value noise stays suppressed; it would otherwise bury them.
+    warnings.simplefilter('ignore', RuntimeWarning)
+    warnings.simplefilter('ignore', DeprecationWarning)
+    warnings.simplefilter('ignore', FutureWarning)
+    warnings.simplefilter('once', UserWarning)
 
     parser = argparse.ArgumentParser(description='Run SFOI Integration Pipeline')
     parser.add_argument('-i', '--index', type=int, default=None, help='Index of basin in JSON')
@@ -244,6 +269,44 @@ def main():
         '--disable-bias-augmentation',
         action='store_true',
         help='Disable the systematic FLPE bias state.',
+    )
+    parser.add_argument(
+        '--use-corridors',
+        action='store_true',
+        help='Enable the integration of CORRIDORS data.',
+    )
+    parser.add_argument(
+        '--corridors-dir',
+        type=Path,
+        # Resolved against this file, not the working directory: the container
+        # runs from an arbitrary cwd, and a relative default would silently
+        # find nothing there.
+        default=Path(__file__).resolve().parent / 'corridors',
+        help=(
+            'Directory holding the CORRIDORS resource CSVs and the SWORD '
+            'v16-v17 translation table. Defaults to the corridors/ directory '
+            'beside run_MOI.py, which is where confluence-offline bind-mounts '
+            'them in the container.'
+        ),
+    )
+    parser.add_argument(
+        '--corridors-override-gage',
+        action='store_true',
+        help=(
+            'Let a CORRIDORS pseudo-gage replace a real gage on the same '
+            'reach, as the original CORRIDORS branch did. By default the real '
+            'gage is kept, being the better measurement.'
+        ),
+    )
+    parser.add_argument(
+        '--corridors-timezone',
+        type=str,
+        default=None,
+        help=(
+            'IANA timezone used to read CORRIDORS measurement dates, which are '
+            'local calendar dates. Defaults to America/Anchorage; every '
+            'resource released so far is Alaskan, but that will not hold.'
+        ),
     )
     parser.add_argument(
         '--integrator-hydrograph',
@@ -375,6 +438,10 @@ def main():
             log.write(f"Starting SFOI Pipeline Index {index_to_run}, Basin {basin_id}\n")
 
             params_dict = set_moi_params()
+            if args.use_corridors:
+                params_dict['UseCORRIDORS'] = True
+            if args.corridors_override_gage:
+                params_dict['Corridors_Override_Gage'] = True
             if args.correlation_rho is not None:
                 if not 0.0 <= args.correlation_rho < 1.0:
                     raise ValueError('--correlation-rho must satisfy 0 <= rho < 1')
@@ -479,6 +546,43 @@ def main():
                 print(f"[{basin_id}] SKIP: Essential data missing ({str(e)})")
                 sys.exit(1)
 
+            # Optionally extract CORRIDORS data.  A basin with no CORRIDORS
+            # resource is the normal case, so nothing here may be fatal.
+            corridors_dict = None
+            if params_dict.get('UseCORRIDORS') and args.branch == 'constrained':
+                if args.corridors_dir and args.corridors_dir.is_dir():
+                    print(f"[{basin_id}] Extracting CORRIDORS Data...")
+                    try:
+                        corridors_kwargs = {}
+                        if args.corridors_timezone:
+                            corridors_kwargs['timezone'] = args.corridors_timezone
+                        corridors_obj = Corridors(
+                            args.corridors_dir,
+                            input_obj.basin_dict,
+                            input_obj.obs_dict,
+                            verbose=args.verbose,
+                            min_observations=params_dict['Corridors_Min_Observations'],
+                            min_uncertainty=params_dict['Corridors_Min_Uncertainty'],
+                            **corridors_kwargs,
+                        )
+                        corridors_dict = corridors_obj.integrate_corridors_data()
+                        input_obj.merge_corridors_and_gages(
+                            corridors_dict,
+                            override_gage=params_dict['Corridors_Override_Gage'],
+                        )
+                    except Exception as e:
+                        corridors_dict = None
+                        warnings.warn(
+                            f'CORRIDORS extraction failed ({e}); continuing '
+                            'without it.'
+                        )
+                        log.write(f"CORRIDORS extraction failed: {e}\n")
+                else:
+                    warnings.warn(
+                        'UseCORRIDORS is true, but no valid --corridors-dir was '
+                        'provided. Proceeding without CORRIDORS.'
+                    )
+
             # ---------------------------------------------------------
             # 2. INTEGRATION
             # ---------------------------------------------------------
@@ -495,7 +599,13 @@ def main():
                 args.verbose,
                 # An explicit (even empty) SVS selection must not be refilled
                 # from SoS, because that could reintroduce validation gages.
-                gage_dict=getattr(input_obj, 'gage_dict', {}) if svs_loaded else None,
+                # CORRIDORS pseudo-gages live in the same dict, so passing it
+                # is equally required once any were merged in.
+                gage_dict=(
+                    getattr(input_obj, 'gage_dict', {})
+                    if (svs_loaded or corridors_dict) else None
+                ),
+                corridors_dict=corridors_dict,
             )
 
             try:
@@ -522,6 +632,9 @@ def main():
                     input_obj.obs_dict,
                     sword_dir,
                     params_dict,
+                    gage_groups=getattr(input_obj, 'calval_groups', {}),
+                    gage_dict=getattr(integrate_obj, 'gage_dict', {}),
+                    corridors_reaches=getattr(input_obj, 'corridors_reaches', set()),
                 )
                 output_obj.write_output()
                 output_obj.write_sword_output(args.branch)

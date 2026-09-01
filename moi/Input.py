@@ -71,6 +71,10 @@ class Input:
         self.sos_dict = {}
         self.gage_dict = {}
         self.calval_groups = {}
+        # Reaches whose gage_dict entry is a CORRIDORS pseudo-gage rather than
+        # a real station.  Kept separately so downstream consumers can tell the
+        # two apart once merge_corridors_and_gages has folded them together.
+        self.corridors_reaches = set()
         self.sos_dir = sos_dir
         self.sword_dir = sword_dir
         self.swot_dir = swot_dir
@@ -412,6 +416,58 @@ class Input:
                 f'Loaded {len(self.gage_dict)} SVS gages for the basin '
                 f'using {reach_var_name} from {svs_file}{group_message}'
             )
+        return self.gage_dict
+
+    def merge_corridors_and_gages(self, corridors_dict, override_gage=False):
+        """Fold the CORRIDORS pseudo-gages into gage_dict.
+
+        The integrator takes all of its constraints from gage_dict, so a
+        CORRIDORS reach has to arrive there to be used.
+
+        ``override_gage`` decides what happens when a reach has both.  The
+        default keeps the real station, because it is a rated measurement with
+        a continuous record whereas the pseudo-gage is a one-parameter flow law
+        fitted to a handful of field measurements and extrapolated across the
+        SWOT record.  Set it True to reproduce the original CORRIDORS branch,
+        which let the pseudo-gage replace the station.
+
+        ``corridors_reaches`` records every reach a pseudo-gage was built for,
+        whether or not it won, so the output can report that CORRIDORS data
+        exists for the reach separately from what actually constrained it.
+
+        corridors_dict may be None -- Corridors.integrate_corridors_data()
+        returns None for every basin without CORRIDORS data, which is the
+        common case.
+        """
+        if not corridors_dict:
+            return self.gage_dict
+
+        n_used = 0
+        n_deferred = 0
+        for rid, entry in corridors_dict.items():
+            rid = str(rid)
+            # Availability is recorded regardless of precedence.
+            self.corridors_reaches.add(rid)
+
+            if rid in self.gage_dict and not override_gage:
+                n_deferred += 1
+                if self.VerboseFlag:
+                    print(f'Reach {rid} already has a gage; '
+                          'keeping it over the CORRIDORS pseudo-gage')
+                continue
+
+            self.gage_dict[rid] = entry
+            n_used += 1
+
+        if self.VerboseFlag:
+            message = (
+                f'Added {n_used} CORRIDORS pseudo-gage(s) to {len(self.gage_dict)} '
+                'total gage constraints'
+            )
+            if n_deferred:
+                message += f'; {n_deferred} deferred to an existing gage'
+            print(message)
+
         return self.gage_dict
 
     def extract_sos(self):

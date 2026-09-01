@@ -35,6 +35,7 @@ class Integrate:
         Branch,
         VerboseFlag,
         gage_dict=None,
+        corridors_dict=None,
     ):
         self.alg_dict = alg_dict
         self.basin_dict = basin_dict
@@ -44,6 +45,9 @@ class Integrate:
         self.sos_dict = sos_dict
         self._use_sos_gage_fallback = gage_dict is None
         self.gage_dict = {} if gage_dict is None else dict(gage_dict)
+        # The pseudo-gages are already inside gage_dict by the time we get
+        # here; this is kept only so the integrator can report on them.
+        self.corridors_dict = {} if corridors_dict is None else dict(corridors_dict)
         self.Branch = Branch
         self.VerboseFlag = VerboseFlag
         self.junctions = []
