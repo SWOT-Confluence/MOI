@@ -7,6 +7,7 @@ import json
 import warnings
 import os
 import sys
+from constrainwidthMM import ConstrainWidth
 
 try:
     import geopandas as gpd
@@ -710,6 +711,14 @@ class Input:
             self.obs_dict[reach]['S'] = swot_dataset["reach/slope2"][0:nt].filled(np.nan)
             self.obs_dict[reach]['dA'] = swot_dataset["reach/d_x_area"][0:nt].filled(np.nan)
             self.obs_dict[reach]['t'] = swot_dataset["reach/time"][0:nt].filled(np.nan)
+            #constrain widths
+            area_fit={}
+            area_fit['h_break']=swot_dataset['reach']['hwfit']['h_break'][:].filled(np.nan)
+            area_fit['fit_coeffs']=swot_dataset['reach']['hwfit']['fit_coeffs'][:].filled(np.nan) #slope: index 1; intercept: index 0
+            hhat,what=ConstrainWidth(swot_dataset["reach/wse"][0:nt].filled(np.nan),
+                                     swot_dataset["reach/width"][0:nt].filled(np.nan),
+                                     area_fit,nt)
+            self.obs_dict[reach]['w']=what
             reach_group = swot_dataset['reach']
             if 'time_str' in reach_group.variables:
                 self.obs_dict[reach]['time_str'] = self._decode_time_strings(
