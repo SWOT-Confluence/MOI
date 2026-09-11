@@ -7,7 +7,14 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from moi.Corridors import Corridors, TIME_COLUMN, DISCHARGE_COLUMN
+from moi.Corridors import (
+    Corridors,
+    DISCHARGE_COLUMN,
+    MAX_REACH_MATCH_KM,
+    MERGED_DATASET_FILE,
+    MIN_FIT_OBSERVATIONS,
+    TIME_COLUMN,
+)
 from moi.Input import Input
 
 
@@ -46,6 +53,32 @@ def corridors_rows(reach_id, dates, discharges):
             TIME_COLUMN: [f"{d}'" for d in dates],
             DISCHARGE_COLUMN: discharges,
             'Qu_(m^3/s_daily)': [-9999] * len(dates),
+        }
+    )
+
+
+def merged_rows(reach_id_v17, times_utc, discharges, match_km=0.1,
+                data_type='field_campaign', lon=-162.36, lat=67.11,
+                id_prefix='m'):
+    """The merged dataset layout: v17 ids and absolute UTC instants."""
+    return pd.DataFrame(
+        {
+            'measurement_id': [f'{id_prefix}{i}' for i in range(len(times_utc))],
+            'resource': ['test_resource'] * len(times_utc),
+            'reach_id_v16': [NOATAK_V16] * len(times_utc),
+            'reach_id_v17': [reach_id_v17] * len(times_utc),
+            'reach_id_source': ['stated_v16_id'] * len(times_utc),
+            'reach_match_km': (
+                match_km if isinstance(match_km, list)
+                else [match_km] * len(times_utc)
+            ),
+            'lon': [lon] * len(times_utc),
+            'lat': [lat] * len(times_utc),
+            'time_utc': times_utc,
+            'time_zone': ['America/Anchorage'] * len(times_utc),
+            'time_precision': ['day'] * len(times_utc),
+            'data_type': [data_type] * len(times_utc),
+            'q_cms': discharges,
         }
     )
 
@@ -136,6 +169,7 @@ def test_merge_corridors_and_gages_accepts_none():
     input_obj = Input.__new__(Input)
     input_obj.gage_dict = {'1001': {'source': 'SVS'}}
     input_obj.corridors_reaches = set()
+    input_obj.corridors_diagnostics = {}
     input_obj.VerboseFlag = False
 
     assert input_obj.merge_corridors_and_gages(None) == {'1001': {'source': 'SVS'}}
@@ -146,6 +180,7 @@ def fresh_input(gage_dict):
     input_obj = Input.__new__(Input)
     input_obj.gage_dict = dict(gage_dict)
     input_obj.corridors_reaches = set()
+    input_obj.corridors_diagnostics = {}
     input_obj.VerboseFlag = False
     return input_obj
 
@@ -274,7 +309,11 @@ def test_non_positive_discharge_never_reaches_the_fit(tmp_path):
 
 
 def test_non_positive_discharge_does_not_pad_the_observation_count(tmp_path):
-    """The min_observations threshold must count fittable measurements only."""
+    """The min_observations threshold must count fittable measurements only.
+
+    The threshold is raised above its default here so that the padding, if it
+    happened, would be what carried the reach over it.
+    """
     corridors = build_corridors(
         tmp_path,
         dates=['02-07-2024', '03-07-2024', '04-07-2024', '05-07-2024'],
@@ -282,7 +321,7 @@ def test_non_positive_discharge_does_not_pad_the_observation_count(tmp_path):
         discharges=[646.58, 0.0, -5.0, 624.41],
         swot_dates=['2024-07-02', '2024-07-03', '2024-07-04', '2024-07-05'],
     )
-    # Two usable measurements is below the default threshold of three.
+    corridors.min_observations = 3
     assert corridors.integrate_corridors_data() is None
 
 
@@ -357,8 +396,32 @@ def test_too_few_matches_yields_no_pseudo_gage(tmp_path):
         discharges=[646.58, 676.71],
         swot_dates=['2024-07-02', '2024-07-03', '2024-07-04'],
     )
-    # Two matches, below MIN_FIT_OBSERVATIONS.
+    corridors.min_observations = 3
     assert corridors.integrate_corridors_data() is None
+
+
+def test_min_fit_observations_defaults_to_one(tmp_path):
+    """A single measurement is a one-point rating, and is kept.
+
+    What it is not is a validated fit: with one point the one-parameter law
+    has no degrees of freedom left, so it reproduces the measurement exactly
+    and the residual is zero by construction.  That is why the residual never
+    touches the weight -- see test_the_fit_residual_does_not_change_the_weight.
+    """
+    assert MIN_FIT_OBSERVATIONS == 1
+
+    corridors = build_corridors(
+        tmp_path,
+        dates=['02-07-2024'],
+        discharges=[646.58],
+        swot_dates=['2024-07-02', '2024-07-03', '2024-07-04'],
+    )
+    entry = corridors.integrate_corridors_data()[NOATAK_V17]
+
+    assert entry['n_corridors_measurements'] == 1
+    assert entry['n_corridors_overpasses'] == 1
+    assert entry['corridors_fit_relative_rmse'] == pytest.approx(0.0, abs=1e-9)
+    assert entry['relative_uncertainty'] == pytest.approx(0.10)
 
 
 def test_pseudo_gage_is_indexed_on_utc_ordinal_days(tmp_path):
@@ -480,12 +543,12 @@ def test_unambiguous_reach_still_translates_alongside_an_ambiguous_one(tmp_path)
 # Uncertainty
 # ---------------------------------------------------------------------------
 
-def test_pseudo_gage_carries_its_own_uncertainty(tmp_path):
+def test_pseudo_gage_carries_a_fixed_uncertainty(tmp_path):
     """Integrate reads relative_uncertainty straight off the gage entry.
 
-    Without it the pseudo-gage inherits Gage_Uncertainty, i.e. a flow law
-    fitted to three field measurements would constrain the integrator as
-    tightly as a rated station.
+    It is fixed at the configured value, which matches Gage_Uncertainty: a
+    pseudo-gage constrains the integrator exactly as tightly as a rated
+    station, whatever its fit residual or sample size.
     """
     corridors = build_corridors(
         tmp_path,
@@ -495,18 +558,19 @@ def test_pseudo_gage_carries_its_own_uncertainty(tmp_path):
     )
     entry = corridors.integrate_corridors_data()[NOATAK_V17]
 
-    assert 'relative_uncertainty' in entry
-    assert entry['relative_uncertainty'] >= 0.10
+    assert entry['relative_uncertainty'] == pytest.approx(0.10)
     assert entry['n_corridors_measurements'] == 3
     assert 'corridors_fit_relative_rmse' in entry
-    # The floor may only be raised by the fit residual, never lowered.
-    rrmse = entry['corridors_fit_relative_rmse']
-    if np.isfinite(rrmse):
-        assert entry['relative_uncertainty'] == pytest.approx(max(0.10, rrmse))
 
 
-def test_a_poor_fit_is_downweighted_beyond_the_floor(tmp_path):
-    """A badly fitting flow law must not constrain as tightly as a good one."""
+def test_the_fit_residual_does_not_change_the_weight(tmp_path):
+    """A badly fitting flow law is recorded as such, not downweighted.
+
+    Deliberate: the in-sample residual is not comparable across sample sizes,
+    so feeding it back into the weight would rank a reach fitted to one
+    measurement -- residual zero by construction -- above every reach with
+    enough data to disagree with itself.  It is reported instead.
+    """
     corridors = build_corridors(
         tmp_path,
         dates=['02-07-2024', '03-07-2024', '04-07-2024', '05-07-2024'],
@@ -515,7 +579,11 @@ def test_a_poor_fit_is_downweighted_beyond_the_floor(tmp_path):
         swot_dates=['2024-07-02', '2024-07-03', '2024-07-04', '2024-07-05'],
     )
     entry = corridors.integrate_corridors_data()[NOATAK_V17]
-    assert entry['relative_uncertainty'] > 0.10
+
+    # The fit really is bad ...
+    assert entry['corridors_fit_relative_rmse'] > 0.10
+    # ... and the weight is unmoved by it.
+    assert entry['relative_uncertainty'] == pytest.approx(0.10)
 
 
 def test_min_uncertainty_is_configurable(tmp_path):
@@ -527,7 +595,7 @@ def test_min_uncertainty_is_configurable(tmp_path):
     )
     corridors.min_uncertainty = 0.5
     entry = corridors.integrate_corridors_data()[NOATAK_V17]
-    assert entry['relative_uncertainty'] >= 0.5
+    assert entry['relative_uncertainty'] == pytest.approx(0.5)
 
 
 def test_unknown_timezone_is_rejected_up_front(tmp_path):
@@ -580,6 +648,7 @@ def test_pseudo_gage_survives_into_prepared_gage_constraints(tmp_path):
     input_obj = Input.__new__(Input)
     input_obj.gage_dict = {}
     input_obj.corridors_reaches = set()
+    input_obj.corridors_diagnostics = {}
     input_obj.VerboseFlag = False
     input_obj.merge_corridors_and_gages(corridors_dict)
     assert input_obj.corridors_reaches == {NOATAK_V17}
@@ -678,3 +747,319 @@ def test_real_noatak_resource_produces_pseudo_gages(tmp_path):
     assert entry['source'] == 'corridors'
     assert entry['Q'].size > 0
     assert np.all(np.isfinite(entry['Q']))
+
+
+# ---------------------------------------------------------------------------
+# The merged dataset
+# ---------------------------------------------------------------------------
+
+def build_merged(tmp_path, times_utc, discharges, swot_dates, match_km=0.1,
+                 reach_id_v17=int(NOATAK_V17), data_type='field_campaign',
+                 extra_rows=None):
+    rows = merged_rows(
+        reach_id_v17, times_utc, discharges, match_km, data_type=data_type
+    )
+    if extra_rows is not None:
+        rows = pd.concat([rows, extra_rows], ignore_index=True)
+    rows.to_csv(tmp_path / MERGED_DATASET_FILE, index=False)
+    obs_dict = {NOATAK_V17: swot_obs(swot_dates)}
+    return Corridors(
+        tmp_path, {'basin_id': NOATAK_BASIN}, obs_dict, verbose=True
+    )
+
+
+def test_merged_dataset_needs_no_translation_table(tmp_path):
+    """Its reach ids are already SWORD v17, so there is nothing to translate."""
+    corridors = build_merged(
+        tmp_path,
+        times_utc=['2024-07-02 20:00:00', '2024-07-03 20:00:00'],
+        discharges=[646.58, 676.71],
+        swot_dates=['2024-07-02', '2024-07-03', '2024-07-04'],
+    )
+    result = corridors.integrate_corridors_data()
+
+    assert corridors.merged_mode is True
+    assert result is not None
+    entry = result[NOATAK_V17]
+    assert entry['source'] == 'corridors'
+    assert entry['n_corridors_measurements'] == 2
+    assert entry['Q'].size > 0
+    assert np.all(np.isfinite(entry['Q']))
+
+
+def test_merged_dataset_is_paired_in_utc(tmp_path):
+    """No local time is reconstructed, so no time zone has to be guessed.
+
+    The measurement below is 22:00 UTC on 3 July, which in America/Anchorage
+    -- the default this module would otherwise assume -- is still 2 July.  The
+    pairing must follow the UTC instant the dataset states.
+    """
+    corridors = build_merged(
+        tmp_path,
+        times_utc=['2024-07-03 22:00:00'],
+        discharges=[646.58],
+        swot_dates=['2024-07-03'],
+    )
+    _, reachdf = corridors_merged_reach_df(corridors)
+
+    assert len(reachdf) == 1
+    assert reachdf['time_str'].iloc[0] == '2024-07-03T22:00:00Z'
+
+
+def corridors_merged_reach_df(corridors):
+    """Run the merged read far enough to inspect one reach's matched pairs."""
+    assert corridors.integrate_corridors_data() is not None
+    return corridors.create_reach_df(int(NOATAK_V17))
+
+
+def test_merged_dataset_hides_the_raw_resources_it_contains(tmp_path):
+    """Reading both would enter every measurement twice."""
+    merged_rows(
+        int(NOATAK_V17),
+        ['2024-07-02 20:00:00', '2024-07-03 20:00:00'],
+        [646.58, 676.71],
+    ).to_csv(tmp_path / MERGED_DATASET_FILE, index=False)
+    # The same two measurements in the raw layout, as shipped by the PI.
+    corridors_rows(NOATAK_V16, ['02-07-2024', '03-07-2024'], [646.58, 676.71]).to_csv(
+        tmp_path / 'resource.csv', index=False
+    )
+    write_translation(tmp_path, [(NOATAK_V16, int(NOATAK_V17))])
+
+    corridors = Corridors(
+        tmp_path, {'basin_id': NOATAK_BASIN},
+        {NOATAK_V17: swot_obs(['2024-07-02', '2024-07-03', '2024-07-04'])},
+        verbose=True,
+    )
+    entry = corridors.integrate_corridors_data()[NOATAK_V17]
+
+    assert len(corridors.corridors_df) == 2
+    assert entry['n_corridors_measurements'] == 2
+
+
+def test_a_measurement_far_from_its_reach_is_dropped(tmp_path):
+    """Error exclusion: past the cap the row does not say which reach it measured.
+
+    One merged record puts a Chilean measurement 2822 km from the reach its
+    stated id names.  That is a broken record, not an imprecise one.
+    """
+    corridors = build_merged(
+        tmp_path,
+        times_utc=[
+            '2024-07-02 20:00:00', '2024-07-03 20:00:00', '2024-07-04 20:00:00',
+        ],
+        discharges=[646.58, 676.71, 624.41],
+        match_km=[0.1, MAX_REACH_MATCH_KM + 0.5, 2821.96],
+        swot_dates=['2024-07-02', '2024-07-03', '2024-07-04'],
+    )
+    with pytest.warns(UserWarning, match='more than 2.0 km'):
+        entry = corridors.integrate_corridors_data()[NOATAK_V17]
+
+    assert entry['n_corridors_measurements'] == 1
+
+
+def test_the_cap_is_configurable(tmp_path):
+    corridors = build_merged(
+        tmp_path,
+        times_utc=['2024-07-02 20:00:00', '2024-07-03 20:00:00'],
+        discharges=[646.58, 676.71],
+        match_km=[0.1, 5.0],
+        swot_dates=['2024-07-02', '2024-07-03'],
+    )
+    corridors.max_match_km = 10.0
+    entry = corridors.integrate_corridors_data()[NOATAK_V17]
+
+    assert entry['n_corridors_measurements'] == 2
+
+
+def test_a_daily_series_reports_fewer_overpasses_than_pairs(tmp_path):
+    """One overpass can be paired with several daily measurements.
+
+    Both days either side of an overpass fall within MATCH_TOLERANCE, so the
+    same SWOT geometry enters the fit more than once.  The pair count alone
+    would overstate how much independent information the reach has, which is
+    why the distinct-overpass count is recorded next to it.
+    """
+    corridors = build_merged(
+        tmp_path,
+        # swot_obs puts the overpass at 22:00 UTC, so these are the overpass
+        # day and the two days either side of it, all inside MATCH_TOLERANCE.
+        times_utc=[
+            '2024-07-02 22:00:00', '2024-07-03 22:00:00', '2024-07-04 22:00:00',
+        ],
+        discharges=[646.58, 676.71, 624.41],
+        swot_dates=['2024-07-03'],
+    )
+    entry = corridors.integrate_corridors_data()[NOATAK_V17]
+
+    assert entry['n_corridors_measurements'] == 3
+    assert entry['n_corridors_overpasses'] == 1
+
+
+def test_a_gzipped_merged_dataset_reads(tmp_path):
+    """The merged table travels compressed; pandas unpacks it transparently."""
+    merged_rows(
+        int(NOATAK_V17),
+        ['2024-07-02 20:00:00', '2024-07-03 20:00:00'],
+        [646.58, 676.71],
+    ).to_csv(tmp_path / f'{MERGED_DATASET_FILE}.gz', index=False)
+
+    corridors = Corridors(
+        tmp_path, {'basin_id': NOATAK_BASIN},
+        {NOATAK_V17: swot_obs(['2024-07-02', '2024-07-03'])},
+        verbose=True,
+    )
+    entry = corridors.integrate_corridors_data()[NOATAK_V17]
+
+    assert corridors.merged_mode is True
+    assert entry['n_corridors_measurements'] == 2
+
+
+# ---------------------------------------------------------------------------
+# Pairing: a daily series and a field campaign ask opposite questions
+# ---------------------------------------------------------------------------
+
+def test_one_overpass_takes_one_daily_value(tmp_path):
+    """Three consecutive daily values, one overpass: the nearest one is used.
+
+    Pairing measurement-first would give all three to the overpass and enter
+    its SWOT geometry into the flow-law fit three times over.
+    """
+    corridors = build_merged(
+        tmp_path,
+        # swot_obs puts the overpass at 22:00 UTC on 3 July.
+        times_utc=[
+            '2024-07-02 22:00:00', '2024-07-03 12:00:00', '2024-07-04 22:00:00',
+        ],
+        discharges=[100.0, 200.0, 300.0],
+        swot_dates=['2024-07-03'],
+        data_type='daily_series',
+    )
+    entry = corridors.integrate_corridors_data()[NOATAK_V17]
+
+    assert entry['n_corridors_measurements'] == 1
+    assert entry['n_corridors_overpasses'] == 1
+
+    _, reachdf = corridors.create_reach_df(int(NOATAK_V17))
+    # 12:00 on the 3rd is 10 hours from the overpass; the other two are 24.
+    assert reachdf[DISCHARGE_COLUMN].tolist() == [200.0]
+
+
+def test_each_overpass_takes_its_own_daily_value(tmp_path):
+    """Two overpasses, two days: one pair each, not a shared nearest."""
+    corridors = build_merged(
+        tmp_path,
+        times_utc=['2024-07-03 22:00:00', '2024-07-24 22:00:00'],
+        discharges=[100.0, 300.0],
+        swot_dates=['2024-07-03', '2024-07-24'],
+        data_type='daily_series',
+    )
+    entry = corridors.integrate_corridors_data()[NOATAK_V17]
+
+    assert entry['n_corridors_measurements'] == 2
+    assert entry['n_corridors_overpasses'] == 2
+
+    _, reachdf = corridors.create_reach_df(int(NOATAK_V17))
+    assert sorted(reachdf[DISCHARGE_COLUMN].tolist()) == [100.0, 300.0]
+
+
+def test_a_field_campaign_keeps_every_measurement_of_an_overpass(tmp_path):
+    """Three instantaneous measurements around one overpass are three
+    observations of it, not repeats, and all three belong in the fit."""
+    corridors = build_merged(
+        tmp_path,
+        times_utc=[
+            '2024-07-02 22:00:00', '2024-07-03 12:00:00', '2024-07-04 22:00:00',
+        ],
+        discharges=[100.0, 200.0, 300.0],
+        swot_dates=['2024-07-03'],
+        data_type='field_campaign',
+    )
+    entry = corridors.integrate_corridors_data()[NOATAK_V17]
+
+    assert entry['n_corridors_measurements'] == 3
+    assert entry['n_corridors_overpasses'] == 1
+
+
+def test_a_field_measurement_displaces_the_daily_value(tmp_path):
+    """An instantaneous measurement is nearer to what SWOT saw than a daily mean.
+
+    No reach in the current dataset carries both types, so this decides
+    nothing today -- it is here so that one which does cannot double-count.
+    """
+    corridors = build_merged(
+        tmp_path,
+        times_utc=['2024-07-03 12:00:00'],
+        discharges=[200.0],
+        swot_dates=['2024-07-03'],
+        data_type='daily_series',
+        extra_rows=merged_rows(
+            int(NOATAK_V17), ['2024-07-03 21:00:00'], [250.0],
+            data_type='field_campaign', id_prefix='f',
+        ),
+    )
+    entry = corridors.integrate_corridors_data()[NOATAK_V17]
+
+    assert entry['n_corridors_measurements'] == 1
+    _, reachdf = corridors.create_reach_df(int(NOATAK_V17))
+    assert reachdf[DISCHARGE_COLUMN].tolist() == [250.0]
+
+
+def test_a_daily_value_beyond_the_tolerance_is_not_paired(tmp_path):
+    """The overpass-first merge honours MATCH_TOLERANCE like the other one."""
+    corridors = build_merged(
+        tmp_path,
+        times_utc=['2024-07-10 22:00:00'],
+        discharges=[200.0],
+        swot_dates=['2024-07-03'],
+        data_type='daily_series',
+    )
+    assert corridors.integrate_corridors_data() is None
+
+
+def test_two_stations_on_one_reach_both_reach_the_fit(tmp_path):
+    """One per overpass is per station, not per reach.
+
+    Reach 23267000091 carries two Rhine gauges 3.8 km apart.  Those are
+    independent measurements of the overpass; collapsing to one value per
+    reach would discard a whole station's record.
+    """
+    corridors = build_merged(
+        tmp_path,
+        times_utc=['2024-07-03 12:00:00'],
+        discharges=[200.0],
+        swot_dates=['2024-07-03'],
+        data_type='daily_series',
+        extra_rows=merged_rows(
+            int(NOATAK_V17), ['2024-07-03 13:00:00'], [210.0],
+            data_type='daily_series', lon=-162.40, lat=67.15, id_prefix='b',
+        ),
+    )
+    entry = corridors.integrate_corridors_data()[NOATAK_V17]
+
+    assert entry['n_corridors_measurements'] == 2
+    assert entry['n_corridors_overpasses'] == 1
+
+    _, reachdf = corridors.create_reach_df(int(NOATAK_V17))
+    assert sorted(reachdf[DISCHARGE_COLUMN].tolist()) == [200.0, 210.0]
+
+
+def test_the_same_measurement_twice_is_one_measurement(tmp_path):
+    """A .csv left beside its own .csv.gz must not double the sample size."""
+    rows = merged_rows(
+        int(NOATAK_V17),
+        ['2024-07-02 20:00:00', '2024-07-03 20:00:00'],
+        [646.58, 676.71],
+    )
+    rows.to_csv(tmp_path / MERGED_DATASET_FILE, index=False)
+    rows.to_csv(tmp_path / f'{MERGED_DATASET_FILE}.gz', index=False)
+
+    corridors = Corridors(
+        tmp_path, {'basin_id': NOATAK_BASIN},
+        {NOATAK_V17: swot_obs(['2024-07-02', '2024-07-03'])},
+        verbose=True,
+    )
+    with pytest.warns(UserWarning, match='2 merged CORRIDORS datasets'):
+        entry = corridors.integrate_corridors_data()[NOATAK_V17]
+
+    assert len(corridors.corridors_df) == 2
+    assert entry['n_corridors_measurements'] == 2

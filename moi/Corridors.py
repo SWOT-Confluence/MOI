@@ -11,6 +11,22 @@ pseudo-gage" -- through Input.merge_corridors_and_gages().
 The CSVs are contributed by different groups and are not uniformly formatted,
 so every read is defensive: a resource that cannot be parsed is skipped with a
 warning rather than taking down the basin.
+
+Two input layouts are accepted:
+
+* the raw per-PI resources, in the layout CORRIDORS publishes, together with
+  the SWORD v16->v17 translation table.  Every reach id has to be translated
+  here, and a v16 reach that SWORD split into several v17 reaches is dropped
+  because this module has no way to divide the discharge between them.
+* one merged dataset (``corridors_measurements.csv``), where the reach ids are
+  already resolved to SWORD v17 -- including the split reaches, which are
+  resolved against the measurement coordinates -- and every timestamp is an
+  absolute UTC instant.  This is the preferred input: it carries information
+  the raw layout cannot express, and it needs no translation table.
+
+The merged layout is detected from its columns.  When one is present the raw
+resources in the same directory are ignored, because the merged dataset is
+built from them and reading both would count every measurement twice.
 """
 
 import csv
@@ -37,6 +53,51 @@ DISCHARGE_COLUMN = 'Q_(m^3/s_daily)'
 # A resource missing any of these cannot be used at all.
 REQUIRED_COLUMNS = (REACH_COLUMN, TIME_COLUMN, DISCHARGE_COLUMN)
 
+# The merged dataset's conventional file name.  Detection is by columns, not
+# by name, so a renamed file still reads; this is what the repo ships and what
+# the documentation points at.  A .gz alongside it reads too.
+MERGED_DATASET_FILE = 'corridors_measurements.csv'
+
+# The merged dataset's own column names.  Its reach ids are already SWORD v17
+# and its timestamps are already UTC, which is what lets the merged path skip
+# both the translation table and the local-time reconstruction.
+MERGED_REACH_COLUMN = 'reach_id_v17'
+MERGED_TIME_COLUMN = 'time_utc'
+MERGED_DISCHARGE_COLUMN = 'q_cms'
+MERGED_DISTANCE_COLUMN = 'reach_match_km'
+
+# A file carrying all three is a merged dataset, not a raw resource.
+MERGED_REQUIRED_COLUMNS = (
+    MERGED_REACH_COLUMN, MERGED_TIME_COLUMN, MERGED_DISCHARGE_COLUMN,
+)
+
+# Columns worth carrying through the merge.  Absent ones are skipped, so an
+# older merged file still reads.  measurement_id is the stable per-measurement
+# key, used to drop a measurement that arrives twice; lon/lat identify the
+# contributing station, which matters when one reach carries several.
+MERGED_PROVENANCE_COLUMNS = (
+    'measurement_id', 'resource', 'data_type', 'time_precision', 'lon', 'lat',
+)
+
+# The stable per-measurement key, and the columns that identify one station's
+# series within a reach.
+MEASUREMENT_ID_COLUMN = 'measurement_id'
+SITE_COLUMNS = ('lon', 'lat')
+
+# A resource whose rows are a continuous daily series rather than field
+# campaigns.  It is paired with the overpasses differently -- see
+# create_reach_df.
+DAILY_SERIES_TYPE = 'daily_series'
+DATA_TYPE_COLUMN = 'data_type'
+
+# How far a measurement may sit from the reach it was assigned to before the
+# record is treated as broken rather than merely imprecise.  The merged
+# dataset's 99.9th percentile is 1.8 km, so 2 km excludes only the records
+# whose stated reach and coordinates disagree outright -- one of them puts a
+# Chilean measurement 2822 km from its reach.  This is error exclusion, not an
+# uncertainty penalty: a row past the cap carries no usable position at all.
+MAX_REACH_MATCH_KM = 2.0
+
 # Resources whose values and headers carry stray double quotes that
 # pd.read_csv cannot unpick on its own.  Matched case-insensitively on the
 # file name and read by _read_quoted_csv instead.
@@ -54,23 +115,39 @@ FILL_VALUE = -9999
 # pairs a measurement with an overpass months away.
 MATCH_TOLERANCE = pd.Timedelta(days=1)
 
-# Below this many matched pairs the one-parameter fit is not worth trusting.
-# Three is a floor, not a recommendation: a one-parameter law fitted to three
-# points has two degrees of freedom and its in-sample residual says very little
-# about how it extrapolates.  Configurable through Corridors_Min_Observations.
-MIN_FIT_OBSERVATIONS = 3
+# Matched field measurements below this leave the reach without a pseudo-gage.
+# One, by decision: a single measurement scales the flow law to an observed
+# discharge, which is a one-point rating and worth having.  Note what it is
+# not -- with one point a one-parameter law has no degrees of freedom left, so
+# it reproduces that measurement exactly and its in-sample residual is zero by
+# construction, saying nothing about the fit.  The residual and both sample
+# counts are written to the output as diagnostics for exactly this reason.
+# Configurable through Corridors_Min_Observations.
+MIN_FIT_OBSERVATIONS = 1
 
-# Relative uncertainty floor for a pseudo-gage, matching the default for a real
-# station (Integrate.Gage_Uncertainty).  A pseudo-gage that fits its field
-# measurements well is therefore weighted like a gage, reproducing the
-# behaviour CORRIDORS was first tested with; a poorly fitting one is
-# automatically downweighted by its own residual.  See build_pseudo_gage.
+# Relative uncertainty of a pseudo-gage, matching the default for a real
+# station (Integrate.Gage_Uncertainty).  Applied as a fixed value: every
+# pseudo-gage enters the integrator with this weight whatever its fit residual
+# or sample size.  See build_pseudo_gage for why the diagnostics do not feed
+# back into it.
 MIN_RELATIVE_UNCERTAINTY = 0.10
 
-# CORRIDORS dates are local calendar dates, so the overpass timestamps have to
-# be compared in local time.  TODO: pick this from the reach lat/lon instead of
-# assuming Alaska -- every resource released so far is Alaskan, but that will
-# stop being true.
+# What a pseudo-gage records about its own fit.  None of it is acted on: the
+# weight is fixed at MIN_RELATIVE_UNCERTAINTY, and these travel to the output
+# so the distribution can be measured on a global run before anything is gated
+# on it.  Input.merge_corridors_and_gages copies them out of the entry.
+CORRIDORS_DIAGNOSTIC_KEYS = (
+    'n_corridors_measurements',
+    'n_corridors_overpasses',
+    'corridors_fit_relative_rmse',
+    'relative_uncertainty',
+)
+
+# Raw CORRIDORS dates are local calendar dates, so the overpass timestamps have
+# to be compared in local time and one zone has to be assumed for every
+# resource.  This applies to the raw path only: the merged dataset carries an
+# absolute UTC instant per measurement, resolved against that measurement's own
+# time zone when it was built, so nothing is assumed there.
 DEFAULT_TIMEZONE = 'America/Anchorage'
 
 
@@ -93,7 +170,8 @@ class Corridors:
     def __init__(self, corridors_dir, basin_dict, obs_dict, verbose=False,
                  timezone=DEFAULT_TIMEZONE,
                  min_observations=MIN_FIT_OBSERVATIONS,
-                 min_uncertainty=MIN_RELATIVE_UNCERTAINTY):
+                 min_uncertainty=MIN_RELATIVE_UNCERTAINTY,
+                 max_match_km=MAX_REACH_MATCH_KM):
         self.corridors_dir = Path(corridors_dir)
         self.basin_dict = basin_dict
         self.obs_dict = obs_dict
@@ -101,9 +179,15 @@ class Corridors:
         self.timezone = validate_timezone(timezone)
         self.min_observations = int(min_observations)
         self.min_uncertainty = float(min_uncertainty)
+        self.max_match_km = float(max_match_km)
         self.corridors_dict = {}
         self.corridors_df = None
         self.rids_in_basin = []
+        # True once a merged dataset has been recognised.  It changes two
+        # things: the translation table is not needed, and the measurement
+        # timestamps are absolute UTC rather than local calendar dates, so the
+        # pairing with the overpasses happens in UTC.
+        self.merged_mode = False
         # v16 reaches that SWORD splits into several v17 reaches; recorded so
         # integrate_corridors_data can report them once.
         self.ambiguous_v16_reaches = []
@@ -125,8 +209,13 @@ class Corridors:
             warnings.warn(f'CORRIDORS directory not found: {self.corridors_dir}.')
             return None
 
-        # 1. separate the resources from the SWORD translation table
-        csv_files = sorted(self.corridors_dir.glob('*.csv'))
+        # 1. separate the resources from the SWORD translation table.  .csv.gz
+        # is accepted so the merged dataset can travel compressed; pandas reads
+        # it transparently and a 13 MB table becomes 1.3 MB in the repo.
+        csv_files = sorted(
+            list(self.corridors_dir.glob('*.csv'))
+            + list(self.corridors_dir.glob('*.csv.gz'))
+        )
         trans_file = next(
             (f for f in csv_files if f.name == TRANSLATION_FILE), None
         )
@@ -135,43 +224,31 @@ class Corridors:
         if not csv_files:
             warnings.warn(f'No CORRIDORS CSV files found in {self.corridors_dir}.')
             return None
-        if trans_file is None:
-            warnings.warn(
-                f'SWORD v16-v17 translation file {TRANSLATION_FILE} not found in '
-                f'{self.corridors_dir}; CORRIDORS reaches cannot be matched to '
-                'SWORD v17 ids.'
-            )
-            return None
 
-        # 2. read every resource we can and stack them into one frame
-        corridors_dfs = self.read_corridors_files(csv_files)
-        if not corridors_dfs:
-            warnings.warn('No CORRIDORS resource could be read.')
-            return None
+        # 2. read the measurements into one frame, either merged or raw
+        merged_files = [f for f in csv_files if self.is_merged_dataset(f)]
+        if merged_files:
+            if not self.read_merged_dataset(merged_files, csv_files):
+                return None
+        else:
+            if trans_file is None:
+                warnings.warn(
+                    f'SWORD v16-v17 translation file {TRANSLATION_FILE} not '
+                    f'found in {self.corridors_dir}; CORRIDORS reaches cannot '
+                    'be matched to SWORD v17 ids.'
+                )
+                return None
+            if not self.read_raw_resources(csv_files, trans_file):
+                return None
 
-        try:
-            self.corridors_df = pd.concat(corridors_dfs, ignore_index=True)
-        except Exception as e:
-            # Mismatched columns or dtypes across resources land here.
-            warnings.warn(f'Could not combine CORRIDORS resources: {e}')
-            return None
-
-        # 3. add sword17 rids via translation
-        if not self.add_sword_17_ids(trans_file):
-            return None
-
-        # 4. check whether there are any corridors data in this basin
+        # 3. check whether there are any corridors data in this basin
         self.find_corridors_in_basin()
         if not self.rids_in_basin:
             if self.verbose:
                 print('  -> No CORRIDORS reaches fall in this basin')
             return None
 
-        # 5. corridors timestamps are shared by every reach, so parse them once
-        if not self.prepare_corridors_time():
-            return None
-
-        # 6. for each reach, fit flow law and evaluate Q over the SWOT record
+        # 4. for each reach, fit flow law and evaluate Q over the SWOT record
         for rid in self.rids_in_basin:
             try:
                 entry = self.build_pseudo_gage(rid)
@@ -196,6 +273,155 @@ class Corridors:
     # ------------------------------------------------------------------
     # Reading
     # ------------------------------------------------------------------
+
+    def is_merged_dataset(self, csv_file):
+        """True when a file carries the merged layout rather than a resource.
+
+        Only the header is read.  A file that cannot be opened at all is not
+        called merged; the raw reader reports it, so it is not silently lost.
+        """
+        try:
+            header = pd.read_csv(csv_file, nrows=0)
+        except Exception:
+            return False
+        return all(c in header.columns for c in MERGED_REQUIRED_COLUMNS)
+
+    def read_merged_dataset(self, merged_files, csv_files):
+        """Read the merged dataset(s) into corridors_df.
+
+        The raw resources sitting in the same directory are deliberately
+        ignored: the merged dataset is built from them, so reading both would
+        enter every measurement twice and double the apparent sample size.
+        """
+        self.merged_mode = True
+
+        ignored = [f for f in csv_files if f not in merged_files]
+        if ignored:
+            if self.verbose:
+                print(f'  -> Merged CORRIDORS dataset found; ignoring '
+                      f'{len(ignored)} raw resource(s) it already contains: '
+                      f'{", ".join(f.name for f in ignored)}')
+
+        frames = []
+        for csv_file in merged_files:
+            if self.verbose:
+                print(f"  -> Processing merged dataset {csv_file.name}...")
+            try:
+                frames.append(self.read_merged_csv(csv_file))
+            except Exception as e:
+                warnings.warn(f'Error reading merged dataset {csv_file.name}: {e}')
+
+        if not frames:
+            warnings.warn('No merged CORRIDORS dataset could be read.')
+            return False
+
+        if len(merged_files) > 1:
+            # Almost always a mistake -- a .csv left beside its own .csv.gz,
+            # or two builds of the same dataset.  Reading both would enter
+            # every measurement twice, so say so rather than quietly doubling
+            # the sample size.
+            warnings.warn(
+                f'{len(merged_files)} merged CORRIDORS datasets found in '
+                f'{self.corridors_dir} and all were read: '
+                f'{", ".join(f.name for f in merged_files)}. Keep one.'
+            )
+
+        self.corridors_df = pd.concat(frames, ignore_index=True)
+
+        # Belt and braces for the case above: a measurement that arrives twice
+        # under the same id is one measurement.
+        if MEASUREMENT_ID_COLUMN in self.corridors_df.columns:
+            duplicated = self.corridors_df[MEASUREMENT_ID_COLUMN].duplicated()
+            if duplicated.any():
+                warnings.warn(
+                    f'{int(duplicated.sum())} merged CORRIDORS measurement(s) '
+                    'appeared more than once and the repeats were dropped.'
+                )
+                self.corridors_df = self.corridors_df.loc[~duplicated]
+            self.corridors_df = self.corridors_df.reset_index(drop=True)
+
+        if self.verbose:
+            n_reaches = self.corridors_df['reach_id_17'].dropna().nunique()
+            print(f'  -> {len(self.corridors_df)} merged measurement(s) on '
+                  f'{n_reaches} SWORD v17 reach(es)')
+        return True
+
+    def read_merged_csv(self, csv_file):
+        """One merged dataset, reduced to the columns the fit needs.
+
+        The output is deliberately the same shape the raw path produces after
+        translation and time parsing -- ``reach_id_17``, ``t`` and the
+        discharge column -- so everything downstream is shared.
+        """
+        df = pd.read_csv(csv_file, low_memory=False)
+
+        out = pd.DataFrame(index=df.index)
+        out['reach_id_17'] = pd.to_numeric(
+            df[MERGED_REACH_COLUMN], errors='coerce'
+        ).astype('Int64')
+
+        # Already absolute instants: a day-precision row was centred on local
+        # midday and converted to UTC when the dataset was built, which is the
+        # same convention prepare_corridors_time applies to a raw resource.
+        out['t'] = pd.to_datetime(df[MERGED_TIME_COLUMN], errors='coerce', utc=True)
+
+        # Screened on q > 0 rather than on the fill value, as normalize_frame
+        # does, so an unflagged zero or negative is caught too.
+        q = pd.to_numeric(df[MERGED_DISCHARGE_COLUMN], errors='coerce')
+        out[DISCHARGE_COLUMN] = q.mask(~(q > 0))
+
+        for column in MERGED_PROVENANCE_COLUMNS:
+            if column in df.columns:
+                out[column] = df[column]
+
+        # Error exclusion, not an uncertainty penalty: past the cap the stated
+        # reach and the coordinates disagree outright, so the row does not say
+        # which reach it measured.
+        if MERGED_DISTANCE_COLUMN in df.columns:
+            km = pd.to_numeric(df[MERGED_DISTANCE_COLUMN], errors='coerce')
+            too_far = (km > self.max_match_km).fillna(False)
+            if too_far.any():
+                warnings.warn(
+                    f'{int(too_far.sum())} merged CORRIDORS measurement(s) in '
+                    f'{csv_file.name} sit more than {self.max_match_km} km from '
+                    'the reach they were assigned to and were dropped as broken '
+                    f'records (furthest {km[too_far].max():.1f} km).'
+                )
+                out = out.loc[~too_far]
+
+        n_unresolved = int(out['reach_id_17'].isna().sum())
+        if n_unresolved and self.verbose:
+            print(f'  -> {n_unresolved} merged measurement(s) in '
+                  f'{csv_file.name} carry no SWORD v17 reach')
+
+        n_undated = int(out['t'].isna().sum())
+        if n_undated:
+            warnings.warn(
+                f'{n_undated} merged CORRIDORS measurement(s) in '
+                f'{csv_file.name} carry no usable timestamp and were ignored.'
+            )
+
+        return out.reset_index(drop=True)
+
+    def read_raw_resources(self, csv_files, trans_file):
+        """Read the raw per-PI resources, translate their ids, parse their time."""
+        corridors_dfs = self.read_corridors_files(csv_files)
+        if not corridors_dfs:
+            warnings.warn('No CORRIDORS resource could be read.')
+            return False
+
+        try:
+            self.corridors_df = pd.concat(corridors_dfs, ignore_index=True)
+        except Exception as e:
+            # Mismatched columns or dtypes across resources land here.
+            warnings.warn(f'Could not combine CORRIDORS resources: {e}')
+            return False
+
+        if not self.add_sword_17_ids(trans_file):
+            return False
+
+        # Raw timestamps are shared by every reach, so parse them once.
+        return self.prepare_corridors_time()
 
     def read_corridors_files(self, csv_files):
         """Read each resource, skipping any that cannot be parsed."""
@@ -465,7 +691,14 @@ class Corridors:
         # the pseudo-gage against; local time is only for pairing with the
         # CORRIDORS calendar dates below.
         swotdf['t_utc'] = t_utc
-        swotdf['t'] = t_utc.dt.tz_convert(self.timezone)
+        if self.merged_mode:
+            # The merged dataset carries an absolute UTC instant per
+            # measurement, so the pairing happens in UTC and the per-resource
+            # local time zone -- which varies by contributor and is only
+            # guessed at by self.timezone -- never has to be reconstructed.
+            swotdf['t'] = t_utc
+        else:
+            swotdf['t'] = t_utc.dt.tz_convert(self.timezone)
         swotdf['time_str_local'] = swotdf['t'].dt.strftime('%Y-%m-%d %H:%M')
 
         swotdf = swotdf.dropna(subset=['t'])
@@ -475,7 +708,30 @@ class Corridors:
         return swotdf.sort_values('t').reset_index(drop=True)
 
     def create_reach_df(self, rid):
-        """Pair this reach's field measurements with the nearest overpass."""
+        """Pair this reach's measurements with the overpasses, by resource type.
+
+        The two resource types need the pairing run in opposite directions.
+
+        A field campaign is a handful of instantaneous measurements, so each
+        one asks which overpass it belongs to: several campaign measurements
+        around one overpass are several genuine observations of it, and all of
+        them belong in the fit.
+
+        A daily series has a value for every day of the record, so asking the
+        same question pairs both the day before and the day after an overpass
+        with it -- and the same SWOT geometry then enters the flow-law fit
+        two or three times over, which really does move the fitted parameter
+        (measured at about half a percent on the Rhine).  The question is
+        turned round for a daily series: each overpass asks which daily value
+        is nearest, so it contributes one.
+
+        "One per overpass" is applied per station, not per reach.  A v17 reach
+        can carry more than one contributing station -- reach 23267000091
+        carries two Rhine gauges 3.8 km apart -- and those are independent
+        measurements of the overpass, not repeats of one.  Collapsing to a
+        single value per reach would silently discard one station's whole
+        record.
+        """
         swotdf = self.swot_reach_frame(rid)
 
         reach_rows = self.corridors_df[
@@ -485,20 +741,34 @@ class Corridors:
         if reach_rows.empty:
             return swotdf, reach_rows
 
-        # merge_asof needs both sides sorted on the key, the right side
-        # included -- swotdf comes back sorted from swot_reach_frame.
-        reachdf = pd.merge_asof(
-            reach_rows.sort_values('t'),
-            swotdf,
-            on='t',
-            direction='nearest',
-            tolerance=MATCH_TOLERANCE,
-            suffixes=('_corridors', '_swot'),
+        if DATA_TYPE_COLUMN in reach_rows.columns:
+            is_daily = reach_rows[DATA_TYPE_COLUMN] == DAILY_SERIES_TYPE
+        else:
+            # The raw layout does not say, and every raw resource released so
+            # far is a field campaign.
+            is_daily = pd.Series(False, index=reach_rows.index)
+
+        field_pairs = self.pair_measurements_to_overpasses(
+            reach_rows[~is_daily], swotdf
+        )
+        daily_pairs = self.pair_overpasses_to_daily_series(
+            reach_rows[is_daily], swotdf
         )
 
-        # Rows outside the tolerance come back with the SWOT columns unfilled;
-        # they carry no information for the fit.
-        reachdf = reachdf.dropna(subset=['h', 'w', 'S', 'dA'])
+        # An overpass measured by a field campaign does not also need the day's
+        # mean: the instantaneous measurement is nearer to what SWOT saw.  No
+        # reach in the current dataset carries both, so this decides nothing
+        # today; it is here so that one which does cannot double-count.
+        if not field_pairs.empty and not daily_pairs.empty:
+            daily_pairs = daily_pairs[
+                ~daily_pairs['t_utc'].isin(field_pairs['t_utc'])
+            ]
+
+        reachdf = pd.concat(
+            [field_pairs, daily_pairs], ignore_index=True, sort=False
+        )
+        if reachdf.empty:
+            return swotdf, reachdf
 
         # 4 drop unwanted columns
         cols_to_drop = [
@@ -511,7 +781,73 @@ class Corridors:
         # errors='ignore': resources do not all carry the same optional columns.
         reachdf = reachdf.drop(columns=cols_to_drop, errors='ignore')
 
-        return swotdf, reachdf
+        return swotdf, reachdf.sort_values('t').reset_index(drop=True)
+
+    def pair_measurements_to_overpasses(self, measurements, swotdf):
+        """Each measurement takes the overpass nearest to it.
+
+        Several measurements may land on one overpass, which for a field
+        campaign is what should happen.
+        """
+        if measurements.empty:
+            return measurements
+
+        # merge_asof needs both sides sorted on the key, the right side
+        # included -- swotdf comes back sorted from swot_reach_frame.
+        paired = pd.merge_asof(
+            measurements.sort_values('t'),
+            swotdf,
+            on='t',
+            direction='nearest',
+            tolerance=MATCH_TOLERANCE,
+            suffixes=('_corridors', '_swot'),
+        )
+
+        # Measurements outside the tolerance come back with the SWOT columns
+        # unfilled; they carry no information for the fit.
+        return paired.dropna(subset=['h', 'w', 'S', 'dA'])
+
+    def pair_overpasses_to_daily_series(self, measurements, swotdf):
+        """Each overpass takes the daily value nearest to it, per station.
+
+        The merge runs with the overpasses on the left, so an overpass can
+        claim at most one value from each station's series rather than a
+        station's series claiming an overpass several times over.
+        """
+        if measurements.empty:
+            return measurements
+
+        site_columns = [c for c in SITE_COLUMNS if c in measurements.columns]
+        if site_columns:
+            series = [rows for _, rows in measurements.groupby(site_columns, dropna=False)]
+        else:
+            series = [measurements]
+
+        overpasses = swotdf.sort_values('t')
+        paired = []
+        for station_rows in series:
+            # The measurement time moves aside so the merge key can stay 't'
+            # on both sides of the concat: 't' is the measurement time in the
+            # frame this returns, matching the field-campaign branch.
+            matched = pd.merge_asof(
+                overpasses,
+                station_rows.sort_values('t').rename(columns={'t': 't_measurement'}),
+                left_on='t',
+                right_on='t_measurement',
+                direction='nearest',
+                tolerance=MATCH_TOLERANCE,
+                suffixes=('_swot', '_corridors'),
+            )
+            # An overpass with no value within the tolerance comes back with
+            # the measurement columns unfilled.
+            matched = matched.dropna(subset=['t_measurement', DISCHARGE_COLUMN])
+            if not matched.empty:
+                matched['t'] = matched['t_measurement']
+                paired.append(matched.drop(columns=['t_measurement']))
+
+        if not paired:
+            return measurements.iloc[0:0]
+        return pd.concat(paired, ignore_index=True, sort=False)
 
     # ------------------------------------------------------------------
     # Flow law
@@ -531,6 +867,16 @@ class Corridors:
         Qhat = np.asarray(self.evaluate_flow_law(swotdf, flow_law_cal), dtype=float)
         fit_rrmse = self.fit_relative_rmse(flow_law_cal)
 
+        # Matched pairs and distinct overpasses are not the same number.  A
+        # daily series contributes both the day before and the day after an
+        # overpass within MATCH_TOLERANCE, so one overpass can be paired with
+        # several measurements and the same SWOT geometry then enters the fit
+        # more than once.  Both counts are recorded so a global run can see
+        # which reaches that happened on.
+        n_overpasses = (
+            int(reachdf['t_utc'].nunique()) if 't_utc' in reachdf else 0
+        )
+
         t_ordinal = swotdf['t_utc'].map(pd.Timestamp.toordinal).to_numpy()
         count = min(Qhat.size, t_ordinal.size)
         Qhat = Qhat[:count]
@@ -543,13 +889,16 @@ class Corridors:
                       'discharge; skipped')
             return None
 
-        # A pseudo-gage is a flow law fitted to a handful of field
-        # measurements, not a measurement.  Integrate.build_gage_system reads
-        # relative_uncertainty straight off this dict, so setting it here is
-        # what stops the integrator weighting it like a real station.
+        # Fixed, by decision: every pseudo-gage enters the integrator with the
+        # same relative uncertainty as a real station, whatever its fit
+        # residual or sample size.  The residual is not used to downweight,
+        # because it is not comparable across sample sizes -- a one-parameter
+        # law fitted to one point has a zero residual by construction, so
+        # feeding it back would weight the least-supported pseudo-gages the
+        # highest.  It is written to the output as a diagnostic instead, next
+        # to both sample counts, so the first global run can measure what those
+        # numbers are worth before any of them gates anything.
         relative_uncertainty = self.min_uncertainty
-        if np.isfinite(fit_rrmse):
-            relative_uncertainty = max(relative_uncertainty, float(fit_rrmse))
 
         return {
             'source': 'corridors',
@@ -560,6 +909,7 @@ class Corridors:
             'Q': Qhat[valid],
             'relative_uncertainty': float(relative_uncertainty),
             'n_corridors_measurements': int(len(reachdf)),
+            'n_corridors_overpasses': n_overpasses,
             'corridors_fit_relative_rmse': float(fit_rrmse),
         }
 
@@ -567,10 +917,11 @@ class Corridors:
     def fit_relative_rmse(flow_law_cal):
         """In-sample relative RMSE of the calibrated flow law, or NaN.
 
-        This is measured on the same few measurements the law was fitted to,
-        so it is optimistic and says nothing about extrapolating across the
-        SWOT record -- it can only raise the uncertainty above the floor, never
-        lower it.
+        Recorded, not acted on.  It is measured on the same measurements the
+        law was fitted to, so it is optimistic, says nothing about
+        extrapolating across the SWOT record, and is not comparable between a
+        reach fitted to one measurement and one fitted to twenty.  It reaches
+        the output as a diagnostic and never touches the weight.
         """
         performance = getattr(flow_law_cal, 'Performance', None)
         value = getattr(performance, 'rRMSE', None)

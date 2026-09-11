@@ -85,6 +85,7 @@ class Output:
         gage_groups=None,
         gage_dict=None,
         corridors_reaches=None,
+        corridors_diagnostics=None,
     ):
         self.basin_dict = basin_dict
         self.out_dir = out_dir
@@ -111,6 +112,14 @@ class Output:
         # when a pseudo-gage stood in for it.
         self.corridors_reaches = {
             str(reach) for reach in (corridors_reaches or set())
+        }
+        # Per-reach fit diagnostics for the pseudo-gages, from Input.  Written
+        # to the gage group and used to gate nothing -- see
+        # Corridors.CORRIDORS_DIAGNOSTIC_KEYS for why they are recorded rather
+        # than acted on.
+        self.corridors_diagnostics = {
+            str(reach): dict(diagnostics)
+            for reach, diagnostics in (corridors_diagnostics or {}).items()
         }
         self.gage_groups = {
             str(reach): str(group).strip().lower()
@@ -293,6 +302,20 @@ class Output:
             'group',
             self.gage_groups.get(reach, 'none') if has_gage else 'none',
         )
+
+        # Written only where a pseudo-gage was actually built, so their absence
+        # is itself the signal that CORRIDORS had nothing for the reach.
+        diagnostics = self.corridors_diagnostics.get(reach)
+        if has_corridors and diagnostics:
+            for attribute, key in self.CORRIDORS_DIAGNOSTIC_ATTRS:
+                if key not in diagnostics:
+                    continue
+                value = diagnostics[key]
+                gage.setncattr(
+                    attribute,
+                    int(value) if isinstance(value, (int, np.integer))
+                    else float(value),
+                )
         
     # Diagnostic fields describing HOW the flow-law parameters in this group
     # were obtained, and how well they reproduce the hydrograph.  Written for
@@ -311,6 +334,23 @@ class Output:
         ('dA_valid_frac', 'dA_valid_frac', 'f8'),
         ('rescale_factor', 'rescale_factor', 'f8'),
         ('rescale_exponent', 'rescale_b', 'f8'),
+    )
+
+    # CORRIDORS pseudo-gage fit diagnostics: (netCDF attribute, entry key).
+    # Quality reporting only.  A pseudo-gage's weight is fixed, so none of
+    # these changes what the integrator did -- they exist so a global run can
+    # measure how the pseudo-gages actually performed.
+    CORRIDORS_DIAGNOSTIC_ATTRS = (
+        # Matched measurement/overpass pairs that entered the flow-law fit.
+        ('corridors_n_measurements', 'n_corridors_measurements'),
+        # Distinct SWOT overpasses among those pairs.  Lower than the pair
+        # count wherever one overpass matched several daily measurements.
+        ('corridors_n_overpasses', 'n_corridors_overpasses'),
+        # In-sample relative RMSE of the fit.  Zero by construction when the
+        # reach was fitted to a single measurement.
+        ('corridors_fit_relative_rmse', 'corridors_fit_relative_rmse'),
+        # What the integrator actually used to weight it.
+        ('corridors_relative_uncertainty', 'relative_uncertainty'),
     )
 
     # String provenance, written as group attributes rather than variables so

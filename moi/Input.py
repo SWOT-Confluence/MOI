@@ -17,6 +17,9 @@ except ImportError:  # Optional unless a GeoPackage SWORD input is used.
 from netCDF4 import Dataset,chartostring
 import numpy as np
 
+# Local imports
+from moi.Corridors import CORRIDORS_DIAGNOSTIC_KEYS
+
 class Input:
     """Extracts and stores reach-level FLPE algorithm data.
     
@@ -71,6 +74,11 @@ class Input:
         self.sos_dict = {}
         self.gage_dict = {}
         self.calval_groups = {}
+        # Fit diagnostics for every CORRIDORS pseudo-gage that was built,
+        # keyed by reach id: the in-sample residual and the two sample counts.
+        # Recorded whether or not the pseudo-gage won, so the output can report
+        # them for a reach that also has a real gage.
+        self.corridors_diagnostics = {}
         # Reaches whose gage_dict entry is a CORRIDORS pseudo-gage rather than
         # a real station.  Kept separately so downstream consumers can tell the
         # two apart once merge_corridors_and_gages has folded them together.
@@ -446,8 +454,14 @@ class Input:
         n_deferred = 0
         for rid, entry in corridors_dict.items():
             rid = str(rid)
-            # Availability is recorded regardless of precedence.
+            # Availability and fit quality are recorded regardless of
+            # precedence, so a reach that keeps its real gage still reports
+            # what its pseudo-gage would have been.
             self.corridors_reaches.add(rid)
+            self.corridors_diagnostics[rid] = {
+                key: entry[key] for key in CORRIDORS_DIAGNOSTIC_KEYS
+                if key in entry
+            }
 
             if rid in self.gage_dict and not override_gage:
                 n_deferred += 1

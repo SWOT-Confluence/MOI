@@ -163,14 +163,18 @@ def set_moi_params():
         # CORRIDORS field discharge as an extra integrator constraint.
         'UseCORRIDORS': False,
         # Matched field measurements below this leave the reach without a
-        # pseudo-gage.  A floor, not a defensible minimum: a one-parameter law
-        # fitted to three points is barely constrained.
-        'Corridors_Min_Observations': 3,
-        # Relative-uncertainty floor for a pseudo-gage.  Matches
-        # Gage_Uncertainty, so a well-fitting pseudo-gage carries the same
-        # weight as a station and a poorly fitting one is downweighted by its
-        # own residual.
+        # pseudo-gage.  One: a single measurement scales the flow law to an
+        # observed discharge, which is a one-point rating and worth having.
+        'Corridors_Min_Observations': 1,
+        # Relative uncertainty of a pseudo-gage, applied as a fixed value.
+        # Matches Gage_Uncertainty, so a pseudo-gage carries the same weight as
+        # a station whatever its fit residual or sample size.  The residual and
+        # both sample counts are written to the output as diagnostics instead.
         'Corridors_Min_Uncertainty': 0.10,
+        # How far a measurement may sit from the reach it was assigned to
+        # before the record is dropped as broken.  Error exclusion, not an
+        # uncertainty penalty.
+        'Corridors_Max_Match_KM': 2.0,
         # What wins when a reach has both a real gage and a pseudo-gage.
         # False keeps the station, which is the better measurement; True
         # reproduces the original CORRIDORS branch, where the pseudo-gage
@@ -563,6 +567,7 @@ def main():
                             verbose=args.verbose,
                             min_observations=params_dict['Corridors_Min_Observations'],
                             min_uncertainty=params_dict['Corridors_Min_Uncertainty'],
+                            max_match_km=params_dict['Corridors_Max_Match_KM'],
                             **corridors_kwargs,
                         )
                         corridors_dict = corridors_obj.integrate_corridors_data()
@@ -635,6 +640,9 @@ def main():
                     gage_groups=getattr(input_obj, 'calval_groups', {}),
                     gage_dict=getattr(integrate_obj, 'gage_dict', {}),
                     corridors_reaches=getattr(input_obj, 'corridors_reaches', set()),
+                    corridors_diagnostics=getattr(
+                        input_obj, 'corridors_diagnostics', {}
+                    ),
                 )
                 output_obj.write_output()
                 output_obj.write_sword_output(args.branch)

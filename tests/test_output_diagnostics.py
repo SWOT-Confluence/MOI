@@ -2,6 +2,7 @@ from pathlib import Path
 
 from netCDF4 import Dataset
 import numpy as np
+import pytest
 
 from moi.Output import Output
 
@@ -258,3 +259,68 @@ def test_corridors_source_is_honoured_without_the_explicit_set(tmp_path):
         gage = dataset.groups['gage']
         assert gage.getncattr('has_gage') == 0
         assert gage.getncattr('constraint_source') == 'corridors'
+
+
+def test_corridors_fit_diagnostics_reach_the_output(tmp_path):
+    """The pseudo-gage's fit quality is reported, not acted on.
+
+    Its weight is fixed, so these numbers change nothing about the run.  They
+    are written so a global run can measure how the pseudo-gages performed --
+    in particular how many were fitted to a single measurement, and where one
+    overpass was paired with several daily measurements.
+    """
+    writer = Output(
+        basin_dict={},
+        out_dir=Path(tmp_path),
+        integ_dict={},
+        alg_dict={},
+        obs_dict={},
+        sword_dir=Path(tmp_path),
+        params_dict={},
+        gage_dict={'4004': {'source': 'corridors', 'station_id': None}},
+        corridors_reaches={'4004'},
+        corridors_diagnostics={
+            '4004': {
+                'n_corridors_measurements': 3,
+                'n_corridors_overpasses': 1,
+                'corridors_fit_relative_rmse': 0.42,
+                'relative_uncertainty': 0.10,
+            }
+        },
+    )
+
+    output_path = tmp_path / 'corridors_diagnostics.nc'
+    with Dataset(output_path, 'w') as dataset:
+        writer._write_gage_metadata(dataset, '4004')
+
+    with Dataset(output_path, 'r') as dataset:
+        gage = dataset.groups['gage']
+        assert gage.getncattr('corridors_n_measurements') == 3
+        assert gage.getncattr('corridors_n_overpasses') == 1
+        assert gage.getncattr('corridors_fit_relative_rmse') == pytest.approx(0.42)
+        # A poor fit did not move the weight.
+        assert gage.getncattr('corridors_relative_uncertainty') == pytest.approx(0.10)
+
+
+def test_a_reach_without_corridors_data_gets_no_diagnostics(tmp_path):
+    """Their absence is the signal that CORRIDORS had nothing for the reach."""
+    writer = Output(
+        basin_dict={},
+        out_dir=Path(tmp_path),
+        integ_dict={},
+        alg_dict={},
+        obs_dict={},
+        sword_dir=Path(tmp_path),
+        params_dict={},
+        gage_groups={'1001': 'calibration'},
+        gage_dict={'1001': {'source': 'SVS'}},
+    )
+
+    output_path = tmp_path / 'no_corridors.nc'
+    with Dataset(output_path, 'w') as dataset:
+        writer._write_gage_metadata(dataset, '1001')
+
+    with Dataset(output_path, 'r') as dataset:
+        gage = dataset.groups['gage']
+        assert gage.getncattr('has_corridors') == 0
+        assert 'corridors_n_measurements' not in gage.ncattrs()

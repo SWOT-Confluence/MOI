@@ -32,9 +32,14 @@ From: ghcr.io/swot-confluence/moi:4.0.0
     tests/test_sword_v17c_input.py /app/tests/test_sword_v17c_input.py
     tests/test_time_str_output.py /app/tests/test_time_str_output.py
 
-# The CORRIDORS resource CSVs are deliberately not baked in: confluence-offline
+# The CORRIDORS data is deliberately not baked in: confluence-offline
 # bind-mounts the repo's corridors/ directory at /app/corridors read-only, so
-# resources can be added without rebuilding the image.
+# the dataset can be updated without rebuilding the image.  That directory
+# holds corridors_measurements.csv.gz -- the merged dataset, with SWORD v17
+# reach ids and UTC timestamps already resolved -- and, for the raw reading
+# path, the per-PI resources plus the v16->v17 translation table.  When the
+# merged dataset is present the raw resources beside it are ignored, because
+# it is built from them.
 
 %post
     set -eu
