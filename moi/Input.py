@@ -7,7 +7,7 @@ import json
 import warnings
 import os
 import sys
-from constrainwidthMM import ConstrainWidth
+from moi.constrainwidthMM import ConstrainWidth
 
 try:
     import geopandas as gpd
