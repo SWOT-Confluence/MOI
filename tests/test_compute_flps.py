@@ -172,6 +172,97 @@ def test_legacy_optimizer_still_runs_and_is_labelled():
         assert integ['flp_fit_status'] in flp_fit.FIT_STATUS_CODE, alg
 
 
+# ---------------------------------------------------------------------------
+# MOMMA stage datum
+#
+# B and H are absolute stages.  A B >= 0.1 m floor made the bound interval
+# empty wherever min(h) < 0.2 m (e.g. Noatak 81340100031, WSE ~ -1.4 .. -0.4 m):
+# the grid evaluated nothing, the fit came back 'failed', and the fallback
+# (B, H) went on to offline discharge.
+# ---------------------------------------------------------------------------
+
+NOATAK_LIKE_SHIFT = -13.4   # moves make_obs() stages to about -1.4 .. +0.7 m
+
+
+def make_shifted_integrator(shift, params=None, momma_prior=None):
+    integrator, reach = make_integrator(params=params)
+    integrator.obs_dict[reach]['h'] = integrator.obs_dict[reach]['h'] + shift
+    entry = integrator.alg_dict['momma'][reach]
+    if momma_prior is None:
+        entry['B'] = entry['B'] + shift
+        entry['H'] = entry['H'] + shift
+    else:
+        entry['B'], entry['H'] = momma_prior
+    return integrator, reach
+
+
+def test_momma_fits_a_reach_below_the_geoid():
+    integrator, reach = make_shifted_integrator(NOATAK_LIKE_SHIFT)
+    h = integrator.obs_dict[reach]['h']
+    assert np.min(h) < 0.2   # the old B >= 0.1 interval was empty here
+    run(integrator)
+
+    integ = integrator.alg_dict['momma'][reach]['integrator']
+    assert integ['flp_fit_status'] == flp_fit.FIT_GOOD
+    assert integ['flp_grid_evals'] > 0
+    assert integ['B'] < np.min(h)
+    assert integ['H'] > integ['B']
+    assert np.isfinite(integ['flp_fit_nrmse'])
+
+
+def test_momma_fit_without_flpe_priors_below_the_geoid():
+    # 81340100031 had no usable reach-scale B/H from the MOMMA module.
+    integrator, reach = make_shifted_integrator(
+        NOATAK_LIKE_SHIFT, momma_prior=(np.nan, np.nan))
+    run(integrator)
+
+    integ = integrator.alg_dict['momma'][reach]['integrator']
+    assert integ['flp_fit_status'] == flp_fit.FIT_GOOD
+    assert integ['flp_grid_evals'] > 0
+    assert integ['B'] < np.min(integrator.obs_dict[reach]['h'])
+
+
+@pytest.mark.parametrize('shift', [NOATAK_LIKE_SHIFT, -11.0, -6.0])
+def test_compute_flps_momma_is_invariant_to_the_vertical_datum(shift):
+    reference, reach = make_integrator()
+    run(reference)
+    shifted, _ = make_shifted_integrator(shift)
+    run(shifted)
+
+    ref = reference.alg_dict['momma'][reach]['integrator']
+    new = shifted.alg_dict['momma'][reach]['integrator']
+    assert new['flp_fit_status'] == ref['flp_fit_status'] == flp_fit.FIT_GOOD
+    assert new['flp_grid_evals'] == ref['flp_grid_evals']
+    assert new['B'] - shift == pytest.approx(ref['B'], abs=1e-4)
+    assert new['H'] - shift == pytest.approx(ref['H'], abs=1e-4)
+    assert new['flp_fit_nrmse'] == pytest.approx(
+        ref['flp_fit_nrmse'], rel=1e-4, abs=1e-8)
+    np.testing.assert_allclose(new['q'], ref['q'], rtol=1e-12)
+    # The shift must not leak into any other algorithm.
+    for alg in ALGS:
+        if alg == 'momma':
+            continue
+        for key in Integrate.FLP_PARAM_KEYS[alg]:
+            assert (shifted.alg_dict[alg][reach]['integrator'][key]
+                    == reference.alg_dict[alg][reach]['integrator'][key]), (alg, key)
+
+
+@pytest.mark.parametrize('params', [
+    {'FLP_Optimizer': 'legacy'},
+    {'FLP_Fit_Method': 'moments'},
+])
+def test_legacy_momma_paths_accept_a_negative_stage(params):
+    integrator, reach = make_shifted_integrator(NOATAK_LIKE_SHIFT, params=params)
+    spec = integrator._flp_reach_spec('momma', reach)
+    (b_lo, b_hi), (h_lo, _h_hi) = spec['bounds']
+    assert b_lo < b_hi < h_lo
+    run(integrator)
+
+    integ = integrator.alg_dict['momma'][reach]['integrator']
+    assert integ['flp_fit_method'] == 'legacy'
+    assert integ['flp_fit_status'] != flp_fit.FIT_FAILED
+
+
 def test_powerlaw_rescale_matches_mean_and_q33():
     integrator, reach = make_integrator(
         qbar=250., q33=170., params={'Rescale_Transform': 'powerlaw'})

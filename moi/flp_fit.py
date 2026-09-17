@@ -398,6 +398,68 @@ def exponent_grid(prior_value, lo=-2.0, hi=2.0, n_points=17):
     return np.unique(grid[np.isfinite(grid)])
 
 
+# MOMMA stage bounds.  B (zero-flow stage) and H (bankfull stage) are
+# absolute water-surface elevations, so they carry the sign of the datum: a
+# reach whose WSE is near or below the geoid has a negative B, and that is
+# physical.  The flow law itself only needs B < min(h), so that
+# log10((H - B) / (h - B)) is defined at every observation, and H > B.
+#
+# The previous code also imposed B >= 0.1 m.  That made the interval empty for
+# every reach with min(h) < 0.2 m -- the grid evaluated nothing and the fit
+# came back 'failed' with the fallback parameters -- and truncated the search
+# (B could not go below 0.1 m) for every reach with
+# min(h) < 0.2 + max(5 * stage span, 10) m.
+MOMMA_B_MARGIN = 0.1               # B sits at least this far below min(h), m
+MOMMA_B_SEARCH_SPAN_FACTOR = 5.0   # grid searches B this many stage spans ...
+MOMMA_B_SEARCH_MIN_DEPTH = 10.0    # ... below B_hi, and never less than this, m
+MOMMA_MIN_STAGE_SPAN = 0.5         # floor on the observed stage span, m
+
+
+def _finite_stage_extent(h):
+    h = _as_1d(h)
+    h_fin = h[np.isfinite(h)]
+    if h_fin.size == 0:
+        return None
+    return float(np.min(h_fin)), float(np.max(h_fin))
+
+
+def momma_param_bounds(h):
+    """``((B_lo, B_hi), (H_lo, H_hi))`` for a bounded MOMMA solve.
+
+    ``B <= min(h) - margin`` is the physical constraint; ``H >= min(h)`` is
+    the convention the fit already used and is unchanged.  ``B`` has no lower
+    bound -- it is an elevation, not a depth -- so a local refine is free to go
+    deeper than the grid looked (previously it stopped at B = 0.1 m).
+    ``H > B + 0.1`` is enforced by the flow law itself (it returns ``inf``).
+    A reach with no finite stage gets NaN upper/lower edges, which no grid
+    candidate satisfies.
+    """
+    extent = _finite_stage_extent(h)
+    if extent is None:
+        return ((-np.inf, np.nan), (np.nan, np.inf))
+    b_hi = extent[0] - MOMMA_B_MARGIN
+    return ((-np.inf, b_hi), (b_hi + MOMMA_B_MARGIN, np.inf))
+
+
+def momma_b_search_range(h):
+    """``(B_lo, B_hi)`` covered by the MOMMA grid; ``B_hi`` matches the bounds.
+
+    The grid needs a finite range where the solve does not.  It extends
+    ``max(5 * stage span, 10 m)`` below ``B_hi``, independent of the sign of
+    the stage.  For reaches with ``min(h) >= 0.2 + max(5 * span, 10)`` m this
+    is exactly the range the grid covered before.
+    """
+    extent = _finite_stage_extent(h)
+    if extent is None:
+        return (np.nan, np.nan)
+    h_min, h_max = extent
+    h_span = max(h_max - h_min, MOMMA_MIN_STAGE_SPAN)
+    b_hi = h_min - MOMMA_B_MARGIN
+    b_lo = b_hi - max(MOMMA_B_SEARCH_SPAN_FACTOR * h_span,
+                      MOMMA_B_SEARCH_MIN_DEPTH)
+    return (b_lo, b_hi)
+
+
 def momma_grid(obs, prior_B, prior_H, b_points=14, depth_points=10):
     """(B, H) candidates for MOMMA, parameterised by depth rather than by H.
 
@@ -411,14 +473,11 @@ def momma_grid(obs, prior_B, prior_H, b_points=14, depth_points=10):
     if h_fin.size == 0:
         return np.empty((0, 2))
 
-    h_min = float(np.min(h_fin))
-    h_max = float(np.max(h_fin))
-    b_max = h_min - 0.1
-    h_span = max(h_max - h_min, 0.5)
+    h_span = max(float(np.max(h_fin)) - float(np.min(h_fin)),
+                 MOMMA_MIN_STAGE_SPAN)
+    b_lo, b_max = momma_b_search_range(h_fin)
+    (_b_lo, _b_hi), (h_lo, _h_hi) = momma_param_bounds(h_fin)
 
-    b_lo = max(0.1, b_max - max(5.0 * h_span, 10.0))
-    if b_lo >= b_max:
-        b_lo = b_max - 1.0
     b_values = np.linspace(b_lo, b_max, int(b_points))
     if np.isfinite(prior_B) and b_lo <= prior_B <= b_max:
         b_values = np.append(b_values, float(prior_B))
@@ -432,9 +491,9 @@ def momma_grid(obs, prior_B, prior_H, b_points=14, depth_points=10):
     for b in b_values:
         for d in depths:
             H = b + d
-            if H >= b_max + 0.1:
+            if H >= h_lo:
                 pairs.append((b, H))
-        if np.isfinite(prior_H) and prior_H >= b_max + 0.1 and prior_H > b:
+        if np.isfinite(prior_H) and prior_H >= h_lo and prior_H > b:
             pairs.append((b, float(prior_H)))
 
     if not pairs:

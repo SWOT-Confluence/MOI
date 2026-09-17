@@ -221,8 +221,7 @@ def test_momma_grid_recovers_its_own_parameters():
     target = np.asarray(
         integrator.momma_flowlaw(truth, obs, save), dtype=float).ravel()
 
-    b_max = float(np.min(obs['h'])) - 0.1
-    bounds = ((0.1, b_max), (b_max + 0.1, np.inf))
+    bounds = flp_fit.momma_param_bounds(obs['h'])
     params, cost, n_evals = flp_fit.fit_momma_law(
         obs, target, {}, save, bounds)
 
@@ -230,6 +229,147 @@ def test_momma_grid_recovers_its_own_parameters():
     lin, _log = flp_fit.nrmse_pair(
         flp_fit.momma_basis(params[0], params[1], obs, save), target)
     assert lin < 0.25
+
+
+def _shifted_obs(shift, nt=40, seed=7):
+    obs = synthetic_obs(nt=nt, seed=seed)
+    obs['h'] = obs['h'] + shift
+    return obs
+
+
+def _legacy_momma_b_search_range(h):
+    """The grid range before negative stages were allowed, for regression."""
+    h_min, h_max = float(np.min(h)), float(np.max(h))
+    b_max = h_min - 0.1
+    h_span = max(h_max - h_min, 0.5)
+    b_lo = max(0.1, b_max - max(5.0 * h_span, 10.0))
+    if b_lo >= b_max:
+        b_lo = b_max - 1.0
+    return b_lo, b_max
+
+
+def test_momma_bounds_admit_negative_stages():
+    # Noatak 81340100031-like: every WSE below the geoid.
+    h = np.linspace(-1.3684, -0.3684, 30)
+    (b_lo, b_hi), (h_lo, h_hi) = flp_fit.momma_param_bounds(h)
+
+    assert b_lo == -np.inf
+    assert b_hi == pytest.approx(-1.4684)
+    assert h_lo == pytest.approx(-1.3684)
+    assert h_hi == np.inf
+    assert b_lo < b_hi < h_lo
+
+    s_lo, s_hi = flp_fit.momma_b_search_range(h)
+    assert s_hi == b_hi
+    assert s_lo == pytest.approx(b_hi - 10.0)
+
+
+@pytest.mark.parametrize('h_min', [-50.0, -1.3684, 0.05, 0.15, 1.0, 9.0, 12.0, 500.0])
+def test_momma_grid_is_nonempty_and_inside_the_bounds(h_min):
+    obs = synthetic_obs()
+    obs['h'] = obs['h'] - float(np.min(obs['h'])) + h_min
+    bounds = flp_fit.momma_param_bounds(obs['h'])
+    (b_lo, b_hi), (h_lo, _h_hi) = bounds
+
+    grid = flp_fit.momma_grid(obs, np.nan, np.nan)
+
+    assert grid.shape[0] > 0
+    assert np.all(grid[:, 0] >= b_lo)
+    assert np.all(grid[:, 0] <= b_hi)
+    assert np.all(grid[:, 0] < float(np.min(obs['h'])))
+    assert np.all(grid[:, 1] >= h_lo)
+    assert np.all(grid[:, 1] > grid[:, 0])
+
+    _params, _cost, n_evals = flp_fit.fit_momma_law(
+        obs, np.ones(obs['nt']), {}, 2.0e-4, bounds)
+    assert n_evals == grid.shape[0]
+
+
+@pytest.mark.parametrize('margin', [0.001, 0.01, 5.0, 500.0])
+def test_momma_search_range_unchanged_where_the_old_floor_never_bound(margin):
+    obs = synthetic_obs()
+    h = obs['h'] - float(np.min(obs['h']))
+    span = max(float(np.max(h)), 0.5)
+    # The old floor was inactive exactly when min(h) - 0.1 - depth >= 0.1.
+    h = h + 0.2 + max(5.0 * span, 10.0) + margin
+    assert flp_fit.momma_b_search_range(h) == _legacy_momma_b_search_range(h)
+
+
+def test_momma_search_range_widens_where_the_old_floor_bound():
+    for h_min in (-1.3684, 0.05, 1.0, 9.0):
+        obs = synthetic_obs()
+        h = obs['h'] - float(np.min(obs['h'])) + h_min
+        new_lo, new_hi = flp_fit.momma_b_search_range(h)
+        old_lo, old_hi = _legacy_momma_b_search_range(h)
+        assert new_hi == old_hi
+        assert new_lo < old_lo
+
+
+def test_momma_bounds_ignore_non_finite_stages():
+    h = np.array([np.nan, -2.0, -1.0, np.inf])
+    (b_lo, b_hi), (h_lo, _h_hi) = flp_fit.momma_param_bounds(h)
+    assert b_hi == pytest.approx(-2.1)
+    assert h_lo == pytest.approx(-2.0)
+
+    (b_lo, b_hi), (h_lo, _h_hi) = flp_fit.momma_param_bounds([np.nan, np.nan])
+    assert np.isnan(b_hi) and np.isnan(h_lo)
+    assert np.all(np.isnan(flp_fit.momma_b_search_range([np.nan])))
+
+
+def test_momma_fit_recovers_parameters_below_the_geoid():
+    obs = _shifted_obs(-12.0)           # h spans roughly -2 .. -0.5 m
+    integrator = Integrate.__new__(Integrate)
+    save = 2.0e-4
+    truth = (-5.0, 1.0)
+    assert truth[0] < np.min(obs['h'])
+    target = np.asarray(
+        integrator.momma_flowlaw(truth, obs, save), dtype=float).ravel()
+
+    outcome = flp_fit.fit_flow_law(
+        alg='momma', obs=obs, target=target, priors={},
+        param_bounds=flp_fit.momma_param_bounds(obs['h']),
+        flowlaw=integrator.momma_flowlaw, fallback_params=(np.nan, np.nan),
+        save=save, extra=(save,), penalty=Integrate.momma_shape_penalty)
+
+    assert outcome.status == flp_fit.FIT_GOOD
+    assert outcome.n_grid_evals > 0
+    B, H = outcome.params
+    assert B < np.min(obs['h'])
+    assert H > B
+    assert outcome.nrmse_lin < 0.05
+
+
+@pytest.mark.parametrize('shift', [-12.0, -10.5, -9.5, -5.0, 100.0])
+def test_momma_fit_is_invariant_to_the_vertical_datum(shift):
+    # The flow law depends on stage only through h - B and H - B, so moving
+    # the datum must move B and H by the same amount and change nothing else.
+    # The reference reach sits high enough that the old B >= 0.1 floor never
+    # applied to it; the shifts cover negative, near-zero and low stages.
+    integrator = Integrate.__new__(Integrate)
+    save = 2.0e-4
+    truth = (7.0, 13.0)
+
+    def fit(offset):
+        obs = _shifted_obs(offset)
+        target = np.asarray(integrator.momma_flowlaw(
+            (truth[0] + offset, truth[1] + offset), obs, save),
+            dtype=float).ravel()
+        return flp_fit.fit_flow_law(
+            alg='momma', obs=obs, target=target,
+            priors={'B': 8.0 + offset, 'H': 14.0 + offset},
+            param_bounds=flp_fit.momma_param_bounds(obs['h']),
+            flowlaw=integrator.momma_flowlaw,
+            fallback_params=(8.0 + offset, 14.0 + offset),
+            save=save, extra=(save,), penalty=Integrate.momma_shape_penalty)
+
+    reference = fit(0.0)
+    shifted = fit(shift)
+
+    assert reference.status == shifted.status == flp_fit.FIT_GOOD
+    assert shifted.n_grid_evals == reference.n_grid_evals
+    assert shifted.params[0] - shift == pytest.approx(reference.params[0], abs=1e-4)
+    assert shifted.params[1] - shift == pytest.approx(reference.params[1], abs=1e-4)
+    assert shifted.nrmse_lin == pytest.approx(reference.nrmse_lin, rel=1e-4, abs=1e-8)
 
 
 # ---------------------------------------------------------------------------

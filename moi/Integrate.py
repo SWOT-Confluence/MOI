@@ -1824,10 +1824,13 @@ class Integrate:
         if alg == 'momma':
             B0 = self._flp_prior_mean(alg, reach, 'B')
             H0 = self._flp_prior_mean(alg, reach, 'H')
+            # B and H are absolute stages and may be negative; see
+            # flp_fit.momma_param_bounds for the constraints actually imposed.
+            bounds = flp_fit.momma_param_bounds(obs['h'])
+            b_max = bounds[0][1]
             with warnings.catch_warnings():
                 warnings.simplefilter('ignore')
-                b_max = np.min(obs['h']) - 0.1
-                min_h_obs = np.min(obs['h'])
+                min_h_obs = float(np.nanmin(np.asarray(obs['h'], dtype=float)))
             init = (B0, H0) if np.isfinite(B0) else (b_max - 1.0, b_max + 1.0)
             if np.isfinite(init[0]) and min_h_obs - init[0] > 10.:
                 init = (min_h_obs - 10., min_h_obs)
@@ -1841,7 +1844,7 @@ class Integrate:
             return dict(
                 flowlaw=self.momma_flowlaw, moment_objfun=self.momma_objfun,
                 moment_args=(obs, qbar, q33, save),
-                bounds=((0.1, b_max), (b_max + 0.1, np.inf)),
+                bounds=bounds,
                 init=init, priors={'B': B0, 'H': H0}, extra=(save,),
                 penalty=self.momma_shape_penalty, a0_min=None, save=save,
             )
