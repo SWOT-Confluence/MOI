@@ -29,9 +29,9 @@ def ConstrainWidth(h,w,area_fit,nt):
 
     if constrain_mode==0:
         for j in np.arange(nt):
-            if h[j] < h_break[0]:
+            if h[j] < h_break[1]:
                 sd=0
-            elif h[j] >= h_break[0] and h[j]<h_break[1]:
+            elif h[j] < h_break[2]:
                 sd=1
             else:
                 sd=2
