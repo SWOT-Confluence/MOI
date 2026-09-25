@@ -691,8 +691,10 @@ class Input:
         self.obs_dict = {}
 
         for reach in self.basin_dict['reach_ids']:
+            pw=self.sword_dict['width'][np.where(self.sword_dict['reach_id']==reach)[0][0]]
             reach = str(reach)
             swotfile = self.swot_dir.joinpath(reach + '_SWOT.nc')
+           
             
             # --- NEW DIAGNOSTIC BLOCK ---
             try:
@@ -717,7 +719,7 @@ class Input:
             area_fit['fit_coeffs']=swot_dataset['reach']['hwfit']['fit_coeffs'][:].filled(np.nan) #slope: index 1; intercept: index 0
             hhat,what=ConstrainWidth(swot_dataset["reach/wse"][0:nt].filled(np.nan),
                                      swot_dataset["reach/width"][0:nt].filled(np.nan),
-                                     area_fit,nt)
+                                     area_fit,nt,prior_width)
             self.obs_dict[reach]['w']=what
             reach_group = swot_dataset['reach']
             if 'time_str' in reach_group.variables:

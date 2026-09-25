@@ -11,7 +11,7 @@ Function to constrain widths to hypsometric curve
 import numpy as np
 import sys
 
-def ConstrainWidth(h,w,area_fit,nt):
+def ConstrainWidth(h,w,area_fit,nt,pw):
 
     hhat=np.full( (nt,) ,np.nan)
     what=np.full( (nt,) ,np.nan)
@@ -44,6 +44,10 @@ def ConstrainWidth(h,w,area_fit,nt):
         print('hypsometric constraint configured incorrectly and some widths were negative. setting all widths to average value')
         constrain_mode=1
     if constrain_mode ==1:
-        what=np.full( (nt,), np.nanmean(w) )
+
+        if np.nanmean(w)>0:
+            what=np.full( (nt,), np.nanmean(w) )
+        else:
+            what=np.full( (nt,), pw )
     print('widths constrained')
     return hhat,what
