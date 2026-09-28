@@ -4,7 +4,7 @@ from netCDF4 import Dataset
 import numpy as np
 import pytest
 
-from moi import sword_finalize
+from moi import flowlaw_preprocess, sword_finalize
 
 BRANCHES = ('constrained', 'unconstrained')
 
@@ -23,8 +23,16 @@ def _make_sword(path, reach_ids=(1001, 1002, 1003)):
                     sub.createVariable(name, 'f8', ('num_reaches',))[:] = -1.0
 
 
-def _make_integrator(path, value, drop_group=None, masked=(), nan=()):
+def _make_integrator(path, value, drop_group=None, masked=(), nan=(),
+                     preprocess=None):
+    preprocess = ({
+        'flowlaw_preprocess_version': flowlaw_preprocess.PREPROCESS_VERSION,
+        'flowlaw_observation_filter': flowlaw_preprocess.FILTER_ROBUST_V2,
+        'flowlaw_slope_policy': flowlaw_preprocess.SLOPE_L2_3P4,
+    } if preprocess is None else preprocess)
     with Dataset(path, 'w') as ds:
+        for name, setting in preprocess.items():
+            ds.setncattr(name, setting)
         for group_name, (_model, variables) in sword_finalize.PARAMETERS.items():
             if group_name == drop_group:
                 continue
@@ -74,7 +82,41 @@ def test_both_branches_are_written_in_one_pass(layout):
     np.testing.assert_allclose(_abar(output, 'constrained'), [10.0, 20.0, -1.0])
     np.testing.assert_allclose(_abar(output, 'unconstrained'), [110.0, 120.0, -1.0])
     np.testing.assert_allclose(_abar(source, 'constrained'), [-1.0] * 3)
+    with Dataset(output) as ds:
+        for branch in BRANCHES:
+            group = ds['reaches']['discharge_models'][branch]
+            assert group.flowlaw_preprocess_version == \
+                flowlaw_preprocess.PREPROCESS_VERSION
+            assert group.flowlaw_observation_filter == 'robust_v2'
+            assert group.flowlaw_slope_policy == 'l2_3p4'
     assert sorted(p.name for p in output.parent.iterdir()) == [output.name]
+
+
+def test_mixed_preprocessing_config_blocks_publication(layout):
+    source, output, basin_json, dirs = layout
+    _fill(dirs)
+    config = {
+        'flowlaw_preprocess_version': flowlaw_preprocess.PREPROCESS_VERSION,
+        'flowlaw_observation_filter': flowlaw_preprocess.FILTER_LEGACY,
+        'flowlaw_slope_policy': flowlaw_preprocess.SLOPE_L2_3P4,
+    }
+    _make_integrator(dirs['constrained'] / '1002_integrator.nc', 20.0,
+                     preprocess=config)
+
+    report = sword_finalize.finalize(source, output, basin_json, dirs)
+    assert not report['published'] and not output.exists()
+    assert any('preprocessing config differs' in p for p in report['problems'])
+
+
+def test_missing_preprocessing_config_blocks_publication(layout):
+    source, output, basin_json, dirs = layout
+    _fill(dirs)
+    _make_integrator(dirs['constrained'] / '1001_integrator.nc', 10.0,
+                     preprocess={})
+
+    report = sword_finalize.finalize(source, output, basin_json, dirs)
+    assert not report['published'] and not output.exists()
+    assert any('flowlaw_preprocess_version' in p for p in report['problems'])
 
 
 def test_missing_integrator_file_blocks_publication(layout):
@@ -142,3 +184,43 @@ def test_cli_exit_codes(layout):
     _fill(dirs)
     assert sword_finalize.main(args) == 0
     assert output.is_file()
+
+
+def test_version_and_attribute_names_match_the_shared_module():
+    # sword_finalize.py is standalone (no moi imports), so it repeats these.
+    from moi import flowlaw_preprocess
+    assert sword_finalize.PREPROCESS_VERSION == flowlaw_preprocess.PREPROCESS_VERSION
+    assert set(sword_finalize.PREPROCESS_ATTRIBUTES) == set(
+        flowlaw_preprocess.CONFIG_ATTRIBUTES.values())
+
+
+def test_branch_without_any_integrator_file_blocks_even_with_allow_missing(layout):
+    source, output, basin_json, dirs = layout
+    _fill(dirs)
+    for path in dirs['unconstrained'].iterdir():
+        path.unlink()
+    report = sword_finalize.finalize(source, output, basin_json, dirs,
+                                     allow_missing=True)
+    assert not report['published'] and not output.exists()
+    assert any('unconstrained: no usable integrator file' in p
+               for p in report['problems'])
+
+
+def test_per_basin_sword_write_records_the_preprocessing_config(tmp_path):
+    from moi import flowlaw_preprocess
+    from moi.Output import Output
+
+    _make_sword(tmp_path / 'na_sword_v17.nc')
+    out_dir = tmp_path / 'out'
+    out_dir.mkdir()
+    Output(basin_dict={'sword': 'na_sword_v17.nc', 'reach_ids': []},
+           out_dir=out_dir, integ_dict={}, alg_dict={}, obs_dict={},
+           sword_dir=tmp_path,
+           params_dict={'Slope_Policy': flowlaw_preprocess.SLOPE_L2_3P4},
+           ).write_sword_output('constrained')
+
+    with Dataset(out_dir / 'na_sword_v17_moi.nc') as ds:
+        branch = ds['reaches']['discharge_models']['constrained']
+        assert flowlaw_preprocess.read_config(branch) == {
+            'observation_filter': flowlaw_preprocess.DEFAULT_OBSERVATION_FILTER,
+            'slope_policy': flowlaw_preprocess.SLOPE_L2_3P4}

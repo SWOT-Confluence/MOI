@@ -1480,6 +1480,12 @@ class Integrate:
         qsic4dvar=np.reshape(qsic4dvar,(1,len(d_x_area)))
         return qsic4dvar
 
+    def flowlaw_mask(self, alg, reach):
+        """Per-algorithm observations on which offline can produce Q."""
+        key = ('flowlaw_valid_da' if alg in self.DA_FLOW_LAW_ALGORITHMS
+               else 'flowlaw_valid')
+        return self.obs_dict.get(reach, {}).get(key)
+
     def flp_fit_target(self, alg, reach):
         """Series the FLP refit should reproduce, or None to fall back.
 
@@ -1495,7 +1501,7 @@ class Integrate:
         q = np.array(integ.get('q'), dtype=float).ravel()
         if q.size == 0:
             return None
-        keep = self.obs_dict.get(reach, {}).get('flowlaw_valid')
+        keep = self.flowlaw_mask(alg, reach)
         if (self.params_dict.get('FLP_Use_Offline_Mask', True)
                 and keep is not None and np.size(keep) == q.size):
             q[~np.asarray(keep, dtype=bool)] = np.nan
@@ -1980,8 +1986,9 @@ class Integrate:
         integ['q_flowlaw_candidate'] = q_flowlaw
         integ['q_flowlaw'] = (q_flowlaw if exported
                               else np.full_like(q_flowlaw, np.nan))
+        valid_mask = self.flowlaw_mask(alg, reach)
         integ['flowlaw_valid_obs'] = int(np.sum(np.asarray(
-            obs.get('flowlaw_valid', []), dtype=bool)))
+            [] if valid_mask is None else valid_mask, dtype=bool)))
 
         integ['flp_fit_nrmse'] = outcome.nrmse_lin
         integ['flp_fit_nrmse_log'] = outcome.nrmse_log

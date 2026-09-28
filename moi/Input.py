@@ -682,7 +682,7 @@ class Input:
             prep = flowlaw_preprocess.prepare_flowlaw_inputs(
                 h, w_raw, s_raw, area_fit,
                 self._quality_variables(reach_group, nt),
-                self.observation_filter, self.slope_policy)
+                self.observation_filter, self.slope_policy, dA=obs['dA'])
             obs['h'] = h
             obs['w'] = prep['width_used']
             obs['S'] = prep['slope_used']
@@ -691,6 +691,7 @@ class Input:
             obs['width_source'] = prep['width_source']
             obs['slope_status'] = prep['slope_status']
             obs['flowlaw_valid'] = prep['flowlaw_valid']
+            obs['flowlaw_valid_da'] = prep['flowlaw_valid_da']
             obs['observation_filter_counts'] = {
                 key: prep[key] for key in (
                     'n_nrt_bad', 'n_quality_unknown', 'n_outlier',
@@ -711,15 +712,16 @@ class Input:
 
             swot_dataset.close()
 
-            # Timesteps with no WSE, width, slope or area at all are dropped
-            # from every MOI product (and re-inserted as fill on output).
+            # Timesteps with no common flow-law geometry are dropped from every
+            # MOI product (and re-inserted as fill on output).  d_x_area is not
+            # common geometry: MOMMA does not use it, so a dA gap stays on the
+            # time grid and is invalid only for the five dA-driven laws.
             iDelete = np.where(
                 np.isnan(h) | np.isnan(obs['w']) | np.isnan(s_raw)
-                | np.isnan(obs['dA'])
             )
             for key in ('h', 'w', 'S', 'dA', 't', 'w_raw', 'S_raw',
-                        'slope_status', 'flowlaw_valid', 'reach_q',
-                        'xovr_cal_q'):
+                        'slope_status', 'flowlaw_valid', 'flowlaw_valid_da',
+                        'reach_q', 'xovr_cal_q'):
                 obs[key] = np.delete(obs[key], iDelete, 0)
             obs['iDelete'] = iDelete
             obs['nt'] -= np.shape(iDelete)[1]
@@ -931,4 +933,3 @@ class Input:
             ("sic4dvar", sv_file, self._read_sic4dvar),
         ):
             self.alg_dict[alg][r_id] = self._extract_one_flpe(alg, r_id, path, reader)
-

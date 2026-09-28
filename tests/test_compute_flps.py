@@ -32,6 +32,8 @@ def make_obs(nt=40, seed=5, constant_da=False):
         'iDelete': np.where(np.zeros(nt, dtype=bool)),
         'reach_q': np.zeros(nt),
         'xovr_cal_q': np.zeros(nt),
+        'flowlaw_valid': np.ones(nt, dtype=bool),
+        'flowlaw_valid_da': np.ones(nt, dtype=bool),
     }
 
 
@@ -483,6 +485,7 @@ def test_offline_mask_removes_timesteps_from_the_fit_target():
     keep = np.ones(40, dtype=bool)
     keep[[3, 7, 11]] = False
     integrator.obs_dict[reach]['flowlaw_valid'] = keep
+    integrator.obs_dict[reach]['flowlaw_valid_da'] = keep
     integrator.calc_integrator_hydrographs()
 
     target = integrator.flp_fit_target('busboi', reach)
@@ -543,6 +546,7 @@ def test_export_decision_rules():
     good_q = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
     anti = {'flp_fit_pearson_r': -0.4, 'flp_fit_n_paired': 20}
     weak = {'flp_fit_pearson_r': 0.3, 'flp_fit_n_paired': 20}
+    undefined = {'flp_fit_pearson_r': np.nan, 'flp_fit_n_paired': 20}
     few = {'flp_fit_pearson_r': -0.4, 'flp_fit_n_paired': 3}
     decide = flp_fit.export_decision
     assert decide(flp_fit.FIT_POOR, (1., 2.), good_q, anti) == \
@@ -551,6 +555,10 @@ def test_export_decision_rules():
         flp_fit.EXPORT_REASON_NONE
     assert decide(flp_fit.FIT_POOR, (1., 2.), good_q, weak) == \
         flp_fit.EXPORT_REASON_NONE
+    assert decide(flp_fit.FIT_FAILED, (1., 2.), good_q, weak) == \
+        flp_fit.EXPORT_REASON_FIT_FAILED
+    assert decide(flp_fit.FIT_POOR, (1., 2.), good_q, undefined) == \
+        flp_fit.EXPORT_REASON_UNDEFINED_CORRELATION
     assert decide(flp_fit.FIT_POOR, (1., 2.), good_q, weak,
                   flp_fit.EXPORT_MASK_ALL_POOR) == flp_fit.EXPORT_REASON_POOR_FIT
     assert decide(flp_fit.FIT_GOOD, (1., np.nan), good_q, weak) == \

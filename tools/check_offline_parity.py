@@ -85,6 +85,7 @@ def make_swot(path, reach_id, seed, hwfit, gaps=False, reverse_da=False):
     q['obs_frac_n'][36] = np.nan                    # unknown quality
     if gaps:
         w_obs[[44, 45]] = np.nan
+        dA[46] = np.nan       # MOMMA remains valid; dA-driven laws do not
         time[50] = np.nan
 
     with Dataset(path, 'w') as ds:

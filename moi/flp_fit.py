@@ -83,7 +83,9 @@ DEFAULT_EXPORT_POLICY = EXPORT_MASK_UNUSABLE
 EXPORT_REASON_NONE = 'none'
 EXPORT_REASON_INVALID_GEOMETRY = 'invalid_geometry'
 EXPORT_REASON_NON_FINITE = 'non_finite'
+EXPORT_REASON_FIT_FAILED = 'fit_failed'
 EXPORT_REASON_ANTI_CORRELATED = 'anti_correlated'
+EXPORT_REASON_UNDEFINED_CORRELATION = 'undefined_correlation'
 EXPORT_REASON_POOR_FIT = 'poor_fit'
 
 # param_at_bound is a bitmask: bit i set means parameter i sits on a bound.
@@ -360,12 +362,17 @@ def export_decision(status, params, q_flowlaw, diagnostics,
         return EXPORT_REASON_NONE
     if status == FIT_INVALID_GEOMETRY:
         return EXPORT_REASON_INVALID_GEOMETRY
+    if status == FIT_FAILED:
+        return EXPORT_REASON_FIT_FAILED
     q = _as_1d(q_flowlaw) if q_flowlaw is not None else np.array([])
     if not all(np.isfinite(p) for p in params) or not np.any(np.isfinite(q)):
         return EXPORT_REASON_NON_FINITE
     r = diagnostics.get('flp_fit_pearson_r', np.nan)
-    if diagnostics.get('flp_fit_n_paired', 0) >= min_paired and r <= 0.:
-        return EXPORT_REASON_ANTI_CORRELATED
+    if diagnostics.get('flp_fit_n_paired', 0) >= min_paired:
+        if not np.isfinite(r):
+            return EXPORT_REASON_UNDEFINED_CORRELATION
+        if r <= 0.:
+            return EXPORT_REASON_ANTI_CORRELATED
     if policy == EXPORT_MASK_ALL_POOR and status == FIT_POOR:
         return EXPORT_REASON_POOR_FIT
     return EXPORT_REASON_NONE

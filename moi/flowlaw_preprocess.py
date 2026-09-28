@@ -20,6 +20,8 @@ Order of operations (prepare_flowlaw_inputs):
       -> slope policy            (slope2; invalid or floored per policy)
       -> flowlaw_valid mask      (observation kept, slope valid, width and
                                   WSE finite)
+      -> flowlaw_valid_da mask   (flowlaw_valid and d_x_area finite; used by
+                                  the five dA-driven laws, not MOMMA)
 
 Nothing here modifies its inputs.
 """
@@ -270,13 +272,14 @@ def prepare_slope(slope2, policy=DEFAULT_SLOPE_POLICY):
 # ---------------------------------------------------------------------------
 def prepare_flowlaw_inputs(h, w, s, area_fit, quality,
                            observation_filter=DEFAULT_OBSERVATION_FILTER,
-                           slope_policy=DEFAULT_SLOPE_POLICY):
+                           slope_policy=DEFAULT_SLOPE_POLICY, dA=None):
     """Width, slope and validity mask at which to evaluate the flow laws.
 
     Returns a dict with per-timestep arrays ``keep`` (observation filter),
     ``width_used``, ``slope_used``, ``slope_status`` and ``flowlaw_valid``
-    (discharge is defined only there), plus ``width_source`` and the filter
-    counts.  The WSE and d_x_area are used as observed.
+    (common validity for every law), plus ``flowlaw_valid_da`` for laws that
+    require d_x_area, ``width_source`` and the filter counts.  WSE and
+    d_x_area are used as observed.
     """
     h = _float_array(h)
     keep, info = observation_keep_mask(h, w, s, quality, observation_filter)
@@ -285,6 +288,13 @@ def prepare_flowlaw_inputs(h, w, s, area_fit, quality,
     with np.errstate(invalid='ignore'):
         flowlaw_valid = (keep & slope_valid & np.isfinite(h)
                          & np.isfinite(width_used) & (width_used > 0))
+    if dA is None:
+        flowlaw_valid_da = flowlaw_valid.copy()
+    else:
+        dA = _float_array(dA)
+        if dA.size != h.size:
+            raise ValueError('d_x_area must have the same length as WSE')
+        flowlaw_valid_da = flowlaw_valid & np.isfinite(dA)
     result = {
         'keep': keep,
         'width_used': width_used,
@@ -292,21 +302,35 @@ def prepare_flowlaw_inputs(h, w, s, area_fit, quality,
         'slope_used': slope_used,
         'slope_status': slope_status,
         'flowlaw_valid': flowlaw_valid,
+        'flowlaw_valid_da': flowlaw_valid_da,
     }
     result.update(info)
     return result
 
 
-def read_config(dataset):
+def read_config(dataset, require_version=True):
     """Preprocessing options recorded on an open *_integrator.nc dataset.
 
-    Files written before these attributes existed get the defaults.
+    ``require_version`` is True on production MOI/offline handoffs: silently
+    interpreting an old file with today's defaults would apply a different
+    slope rule from the one its parameters were fitted with.  Tests and
+    explicit legacy tools may opt into the old fallback with False.
     """
     def attribute(key, default):
         name = CONFIG_ATTRIBUTES[key]
         return str(dataset.getncattr(name)) if name in dataset.ncattrs() else default
-    return {
-        'observation_filter': attribute('observation_filter',
-                                        DEFAULT_OBSERVATION_FILTER),
-        'slope_policy': attribute('slope_policy', DEFAULT_SLOPE_POLICY),
-    }
+    version = attribute('preprocess_version', None)
+    if require_version and version is None:
+        raise ValueError('flow-law preprocessing version is missing')
+    if version is not None and version != PREPROCESS_VERSION:
+        raise ValueError('unsupported flow-law preprocessing version %r; expected %r'
+                         % (version, PREPROCESS_VERSION))
+    observation_filter = attribute('observation_filter',
+                                   DEFAULT_OBSERVATION_FILTER)
+    slope_policy = attribute('slope_policy', DEFAULT_SLOPE_POLICY)
+    if observation_filter not in OBSERVATION_FILTERS:
+        raise ValueError('unknown observation filter %r' % observation_filter)
+    if slope_policy not in SLOPE_POLICIES:
+        raise ValueError('unknown slope policy %r' % slope_policy)
+    return {'observation_filter': observation_filter,
+            'slope_policy': slope_policy}

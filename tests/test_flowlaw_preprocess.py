@@ -182,15 +182,18 @@ def test_missing_quality_variables_keep_everything():
 
 def test_prepare_flowlaw_inputs_combines_filter_width_and_slope():
     h, w, s, q = _series()
+    dA = np.linspace(-100., 100., NT)
+    dA[10] = np.nan
     s = np.linspace(1e-5, 5e-5, NT)
     s[4] = 0.0          # inside the Tukey limits, invalid under legacy_safe
     q['dark_frac'][6] = 0.9
     area_fit = _fit([19.0, 19.9, 20.1, 21.0], [0.0] * 3, [120.0] * 3)
-    prep = fp.prepare_flowlaw_inputs(h, w, s, area_fit, q)
+    prep = fp.prepare_flowlaw_inputs(h, w, s, area_fit, q, dA=dA)
     assert prep['width_source'] == fp.WIDTH_SOURCE_HYPSOMETRIC
     assert not prep['flowlaw_valid'][4] and prep['keep'][4]   # slope only
     assert not prep['flowlaw_valid'][6] and not prep['keep'][6]
     assert prep['flowlaw_valid'].sum() == NT - 2
+    assert prep['flowlaw_valid'][10] and not prep['flowlaw_valid_da'][10]
     assert np.isnan(prep['slope_used'][4])
 
 
@@ -199,7 +202,9 @@ def test_read_config_defaults_and_values(tmp_path):
     with netCDF4.Dataset(path, 'w') as ds:
         ds.setncattr(fp.CONFIG_ATTRIBUTES['slope_policy'], fp.SLOPE_L2_3P4)
     with netCDF4.Dataset(path) as ds:
-        assert fp.read_config(ds) == {
+        with pytest.raises(ValueError, match='version is missing'):
+            fp.read_config(ds)
+        assert fp.read_config(ds, require_version=False) == {
             'observation_filter': fp.DEFAULT_OBSERVATION_FILTER,
             'slope_policy': fp.SLOPE_L2_3P4}
 
@@ -236,6 +241,7 @@ def test_extract_swot_uses_offline_observations_for_flowlaw_geometry(tmp_path):
     h, w, s, q = _series()
     dA = 150.0 * (h - h.mean())
     dA[3] = -1e6                 # extreme area at an observation offline drops
+    dA[14] = np.nan              # MOMMA remains valid; dA-driven laws do not
     q['dark_frac'][3] = 0.9
     s[8] = -2e-5                 # negative slope: no discharge, but kept in MOI
     w[12] = np.nan               # no width at all -> removed from every product
@@ -248,12 +254,16 @@ def test_extract_swot_uses_offline_observations_for_flowlaw_geometry(tmp_path):
     obs = obj.obs_dict['1']
 
     assert obs['nt'] == NT - 1
-    for key in ('h', 'w', 'S', 'dA', 'reach_q', 'xovr_cal_q', 'flowlaw_valid'):
+    for key in ('h', 'w', 'S', 'dA', 'reach_q', 'xovr_cal_q',
+                'flowlaw_valid', 'flowlaw_valid_da'):
         assert np.size(obs[key]) == NT - 1, key
     # index 3 (NRT-bad) and 8 (negative slope) stay in MOI but carry no
     # flow-law geometry, so they cannot influence bounds or fits.
     assert not obs['flowlaw_valid'][3] and not obs['flowlaw_valid'][8]
     assert np.isnan(obs['dA'][3]) and np.isnan(obs['S'][8])
+    # Original index 12 was deleted, so the dA gap at original index 14 is 13.
+    assert obs['flowlaw_valid'][13] and not obs['flowlaw_valid_da'][13]
+    assert np.isnan(obs['dA'][13])
     assert np.nanmin(obs['dA']) > -1e3
     assert obs['S_raw'][8] == pytest.approx(-2e-5)
     assert obs['geometry_status'] == Input.GEOMETRY_OK
@@ -271,5 +281,6 @@ def test_extract_swot_without_hwfit_or_quality_variables(tmp_path):
     obs = obj.obs_dict['1']
     assert obs['width_source'] == fp.WIDTH_SOURCE_MEDIAN
     assert obs['flowlaw_valid'].all()
+    assert obs['flowlaw_valid_da'].all()
     assert obs['observation_filter_counts']['outlier_test_skipped'] == \
         'no_quality_variables'

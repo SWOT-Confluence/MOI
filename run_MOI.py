@@ -161,6 +161,9 @@ def set_moi_params():
         'quit_before_flpe': False,
         'apply_patches': False,
         'write_fill_only': False,
+        # Each basin task updates the continental *_moi.nc (JPL inspects it).
+        # --defer-sword-output leaves it to one serial moi/sword_finalize.py job.
+        'write_sword_output': True,
         # Observation preprocessing shared with offline (moi/flowlaw_preprocess.py)
         # and which fitted flow-law parameters are exported (moi/flp_fit.py).
         'Observation_Filter_Version': flowlaw_preprocess.DEFAULT_OBSERVATION_FILTER,

@@ -755,6 +755,10 @@ class Output:
             raise RuntimeError(f'Could not open SWORD file: {sword_dest_file}')
 
         try:
+            # Same record the serial finalizer writes: offline in SWORD mode
+            # must reproduce the preprocessing these parameters were fitted on.
+            self._write_preprocess_config(
+                sword_dataset['reaches']['discharge_models'][branch])
             reaches = sword_dataset['reaches']['reach_id'][:]
             for reach in self.basin_dict['reach_ids']:
                 reach_ind = np.where(reaches == np.int64(reach))

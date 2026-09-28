@@ -75,8 +75,8 @@ def test_load_sword_netcdf_centerlines_filters_reaches(tmp_path):
 
 
 def test_sword_output_can_be_deferred(tmp_path, capsys):
-    # JPL requires the *_moi.nc file, so the basin write stays on by default;
-    # --defer-sword-output hands it to moi/sword_finalize.py instead.
+    # JPL requires and inspects *_moi.nc, so the basin write stays on by
+    # default; --defer-sword-output hands it to moi/sword_finalize.py.
     writer = Output(
         basin_dict={"sword": "missing.nc"},
         out_dir=Path(tmp_path),

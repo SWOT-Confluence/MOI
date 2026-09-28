@@ -53,6 +53,13 @@ PARAMETERS = {
 _FLP = {group: set(v) - {'sbQ_rel', 'Save'}
         for group, (_model, v) in PARAMETERS.items()}
 
+PREPROCESS_VERSION = '2026-09-28'
+PREPROCESS_ATTRIBUTES = (
+    'flowlaw_preprocess_version',
+    'flowlaw_observation_filter',
+    'flowlaw_slope_policy',
+)
+
 
 def expected_reaches(basin_json, sword_name):
     """Reach ids that basin.json assigns to ``sword_name``, in order."""
@@ -75,10 +82,19 @@ def _scalar(variable):
 
 
 def _read_reach(path, reach):
-    """``(values, problems, warnings)`` for one integrator file."""
-    values, problems, warnings = {}, [], []
+    """``(values, config, problems, warnings)`` for one integrator file."""
+    values, config, problems, warnings = {}, {}, [], []
     try:
         with Dataset(path) as integrator:
+            for name in PREPROCESS_ATTRIBUTES:
+                if name not in integrator.ncattrs():
+                    problems.append(f'{reach}: {path.name} has no {name} attribute')
+                else:
+                    config[name] = str(integrator.getncattr(name))
+            version = config.get('flowlaw_preprocess_version')
+            if version is not None and version != PREPROCESS_VERSION:
+                problems.append(f'{reach}: unsupported preprocessing version '
+                                f'{version!r}; expected {PREPROCESS_VERSION!r}')
             for group, (_model, variables) in PARAMETERS.items():
                 if group not in integrator.groups:
                     problems.append(f'{reach}: {path.name} has no {group} group')
@@ -100,7 +116,7 @@ def _read_reach(path, reach):
                     values[(group, name)] = value
     except OSError as exc:
         problems.append(f'{reach}: cannot read {path}: {exc}')
-    return values, problems, warnings
+    return values, config, problems, warnings
 
 
 def plan(source_sword, basin_json, integrator_dirs):
@@ -118,6 +134,7 @@ def plan(source_sword, basin_json, integrator_dirs):
     report['problems'] += [f'SWORD has no discharge_models/{b}'
                            for b in missing_branches]
     writes = []
+    branch_configs = {}
     for reach in reaches:
         if int(reach) not in index:
             report['reaches_missing_from_sword'].append(reach)
@@ -127,7 +144,13 @@ def plan(source_sword, basin_json, integrator_dirs):
             if not path.is_file():
                 report['missing_integrator_files'].append(f'{branch}/{reach}')
                 continue
-            values, problems, warnings = _read_reach(path, reach)
+            values, config, problems, warnings = _read_reach(path, reach)
+            if not problems:
+                previous = branch_configs.setdefault(branch, config)
+                if config != previous:
+                    problems.append(
+                        f'{reach}: preprocessing config differs from other '
+                        f'{branch} integrator files')
             report['problems'] += [f'{branch} {p}' for p in problems]
             report['warnings'] += [f'{branch} {w}' for w in warnings]
             if problems:
@@ -135,17 +158,34 @@ def plan(source_sword, basin_json, integrator_dirs):
             for (group, name), value in values.items():
                 model, variables = PARAMETERS[group]
                 writes.append((branch, model, variables[name], index[int(reach)], value))
+    # A branch that was requested but has no usable integrator file would be
+    # published without a preprocessing record, which offline cannot read.
+    report['problems'] += [
+        f'{branch}: no usable integrator file, so its preprocessing '
+        'configuration is unknown'
+        for branch in integrator_dirs
+        if branch not in branch_configs and branch not in missing_branches]
     report['values_to_write'] = len(writes)
-    return writes, report
+    report['preprocessing'] = branch_configs
+    return writes, branch_configs, report
 
 
-def _write_and_verify(path, writes):
+def _write_and_verify(path, writes, branch_configs):
     with Dataset(path, 'a') as sword:
         models = sword['reaches']['discharge_models']
+        for branch, config in branch_configs.items():
+            for name, value in config.items():
+                models[branch].setncattr(name, value)
         for branch, model, variable, i, value in writes:
             models[branch][model][variable][i] = value
     with Dataset(path) as sword:
         models = sword['reaches']['discharge_models']
+        for branch, config in branch_configs.items():
+            for name, value in config.items():
+                stored = str(models[branch].getncattr(name))
+                if stored != value:
+                    raise RuntimeError(f'verification failed for {branch}/{name}: '
+                                       f'{stored!r} != {value!r}')
         for branch, model, variable, i, value in writes:
             stored = float(np.ma.filled(np.ma.asarray(
                 models[branch][model][variable][i], dtype=float), np.nan))
@@ -165,7 +205,8 @@ def finalize(source_sword, output_sword, basin_json, integrator_dirs,
     source_sword, output_sword = Path(source_sword), Path(output_sword)
     if source_sword.resolve() == output_sword.resolve():
         raise ValueError('output SWORD must differ from the source SWORD')
-    writes, report = plan(source_sword, basin_json, integrator_dirs)
+    writes, branch_configs, report = plan(
+        source_sword, basin_json, integrator_dirs)
     blocked = (report['problems'] or report['reaches_missing_from_sword']
                or (report['missing_integrator_files'] and not allow_missing))
     report['published'] = False
@@ -178,7 +219,7 @@ def finalize(source_sword, output_sword, basin_json, integrator_dirs,
         with open(source_sword, 'rb') as src, open(temporary, 'wb') as dst:
             while chunk := src.read(1 << 24):
                 dst.write(chunk)
-        _write_and_verify(temporary, writes)
+        _write_and_verify(temporary, writes, branch_configs)
         os.replace(temporary, output_sword)
     finally:
         if temporary.exists():
