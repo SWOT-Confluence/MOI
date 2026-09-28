@@ -3,6 +3,7 @@ from pathlib import Path
 from netCDF4 import Dataset
 import numpy as np
 import pandas as pd
+import pytest
 
 from analysis.three_run_mass_conservation import (
     RunSpec,
@@ -121,6 +122,11 @@ def test_integrate_retains_full_production_workflow_by_default():
     assert _integration_call_log({}) == ["Mean", "q33", "FLPs"]
 
 
+@pytest.mark.xfail(
+    reason="SFOI_Flow_Levels / SFOI_Compute_FLPs live on origin/mean-only-test "
+    "and are not merged into width_con",
+    strict=True,
+)
 def test_integrate_mean_only_skips_q33_and_final_flps():
     params = {
         "SFOI_Flow_Levels": ("Mean",),
