@@ -424,6 +424,15 @@ def main():
               '(default: mask_unusable).'),
     )
     parser.add_argument(
+        '--defer-sword-output',
+        action='store_true',
+        help=(
+            'Do not update the continental *_moi.nc SWORD copy from this basin '
+            'task. Run moi/sword_finalize.py once after all basin tasks '
+            'instead.'
+        ),
+    )
+    parser.add_argument(
         '--require-plain-convergence',
         action='store_true',
         help=(
@@ -512,6 +521,8 @@ def main():
                 params_dict['FLPE_Outlier_Nstdev'] = args.flpe_outlier_nstdev
             if args.require_plain_convergence:
                 params_dict['SFOI_Require_Plain_Convergence'] = True
+            if args.defer_sword_output:
+                params_dict['write_sword_output'] = False
             if args.observation_filter is not None:
                 params_dict['Observation_Filter_Version'] = args.observation_filter
             if args.slope_policy is not None:

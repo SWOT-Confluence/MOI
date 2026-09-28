@@ -720,7 +720,15 @@ class Output:
              out.close()
 
     def write_sword_output(self, branch):
-        """Make a new copy of the SWORD file, and write the Confluence estimates into the file."""
+        """Make a new copy of the SWORD file, and write the Confluence estimates into the file.
+
+        Skipped when params_dict['write_sword_output'] is False (run_MOI.py
+        --defer-sword-output); moi/sword_finalize.py then writes the file once
+        after all basins have finished.
+        """
+        if not self.params_dict.get('write_sword_output', True):
+            print('Skipping SWORD output: deferred to moi/sword_finalize.py')
+            return None
         sword_src_file = self.sword_dir.joinpath(self.basin_dict['sword'])
         
         if self.out_dir == Path('/mnt/data/output'):

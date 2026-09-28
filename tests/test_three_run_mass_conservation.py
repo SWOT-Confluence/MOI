@@ -73,7 +73,9 @@ def test_load_sword_netcdf_centerlines_filters_reaches(tmp_path):
     np.testing.assert_allclose(latitude, [42, 43, 44])
 
 
-def test_sword_output_is_disabled_by_default(tmp_path, capsys):
+def test_sword_output_can_be_deferred(tmp_path, capsys):
+    # JPL requires the *_moi.nc file, so the basin write stays on by default;
+    # --defer-sword-output hands it to moi/sword_finalize.py instead.
     writer = Output(
         basin_dict={"sword": "missing.nc"},
         out_dir=Path(tmp_path),
@@ -81,7 +83,7 @@ def test_sword_output_is_disabled_by_default(tmp_path, capsys):
         alg_dict={},
         obs_dict={},
         sword_dir=Path(tmp_path),
-        params_dict={},
+        params_dict={"write_sword_output": False},
     )
 
     assert writer.write_sword_output("constrained") is None
