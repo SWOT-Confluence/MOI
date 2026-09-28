@@ -1481,12 +1481,25 @@ class Integrate:
         return qsic4dvar
 
     def flp_fit_target(self, alg, reach):
-        """Series the FLP refit should reproduce, or None to fall back."""
+        """Series the FLP refit should reproduce, or None to fall back.
+
+        Timesteps at which offline will not evaluate the flow laws
+        (obs['flowlaw_valid'], see moi.flowlaw_preprocess) are set to NaN, so
+        the exported parameters are fitted -- and scored -- only on the
+        observations offline actually uses.  FLP_Use_Offline_Mask=False
+        restores the full series.
+        """
         integ = self.alg_dict[alg][reach].get('integrator', {})
         if integ.get('q_source') != 'rescaled':
             return None
-        q = np.asarray(integ.get('q'), dtype=float).ravel()
-        return q if q.size > 0 else None
+        q = np.array(integ.get('q'), dtype=float).ravel()
+        if q.size == 0:
+            return None
+        keep = self.obs_dict.get(reach, {}).get('flowlaw_valid')
+        if (self.params_dict.get('FLP_Use_Offline_Mask', True)
+                and keep is not None and np.size(keep) == q.size):
+            q[~np.asarray(keep, dtype=bool)] = np.nan
+        return q
 
     @staticmethod
     def momma_shape_penalty(params):
@@ -1660,6 +1673,11 @@ class Integrate:
 
     FLP_ALGORITHMS = ('busboi', 'hivdi', 'metroman', 'momma', 'sad', 'sic4dvar')
 
+    # Flow laws driven by d_x_area; MOMMA uses stage instead.
+    DA_FLOW_LAW_ALGORITHMS = ('busboi', 'hivdi', 'metroman', 'sad', 'sic4dvar')
+    # Must match Input.GEOMETRY_DA_NOT_INCREASING.
+    GEOMETRY_DA_NOT_INCREASING = 'dA_not_increasing_with_wse'
+
     # Output key names for each algorithm's parameter vector, in the order the
     # corresponding *_flowlaw method expects them.
     FLP_PARAM_KEYS = {
@@ -1680,6 +1698,31 @@ class Integrate:
             except Exception:
                 return default
         return value if np.isfinite(value) else default
+
+    @staticmethod
+    def _prior_or(value, default, lower=-np.inf, upper=np.inf):
+        """``value`` if it is finite and inside [lower, upper], else ``default``."""
+        if np.isfinite(value) and lower <= value <= upper:
+            return float(value)
+        return float(default)
+
+    @staticmethod
+    def _sic4dvar_priors(n_file, a0_file):
+        """Manning n and A0 priors from a SIC4DVar output file.
+
+        With ``tmp_write_to_A0_and_n = True`` (SIC4DVar main, run_algo5 off)
+        the file's ``n`` holds the Strickler coefficient K and ``A0`` holds a
+        bed elevation (Kmi_acc / Zb_acc).  Manning n is 1/K; a bed elevation is
+        not a cross-sectional area, so there is no A0 prior.  A value already
+        in the Manning range (<= 1) is taken as n unchanged.
+        """
+        if np.isfinite(n_file) and n_file > 1.:
+            n_prior = 1. / n_file
+        elif np.isfinite(n_file) and n_file > 0.:
+            n_prior = n_file
+        else:
+            n_prior = np.nan
+        return n_prior, np.nan
 
     def _flp_reach_spec(self, alg, reach):
         """Bounds, priors and flow law for one reach/algorithm, or None.
@@ -1704,14 +1747,21 @@ class Integrate:
         with warnings.catch_warnings():
             warnings.simplefilter('ignore')
             try:
-                a0_min = -min(obs['dA']) + 1
+                # offline only evaluates the BAM-type laws when Abar > 0 and
+                # Abar + dA >= 0, so MOI must not export anything below that.
+                # obs['dA'] is NaN where offline drops the observation, so an
+                # extreme dA that offline never uses cannot move this bound.
+                a0_min = max(1., -float(np.nanmin(obs['dA'])) + 1.)
             except Exception:
-                return None
+                a0_min = 1.
+            if not np.isfinite(a0_min):
+                a0_min = 1.
 
         if alg == 'busboi':
             n0 = self._flp_prior_mean(alg, reach, 'n')
             a00 = self._flp_prior_mean(alg, reach, 'a0')
-            init = (n0, a00) if np.isfinite(n0) else (0.03, a0_min + 10.)
+            init = (self._prior_or(n0, 0.03, 0.001),
+                    self._prior_or(a00, a0_min + 10., a0_min))
             return dict(
                 flowlaw=self.bam_flowlaw, moment_objfun=self.bam_objfun,
                 moment_args=(obs, qbar, q33),
@@ -1724,8 +1774,9 @@ class Integrate:
             alpha0 = self._flp_prior_mean(alg, reach, 'alpha')
             beta0 = self._flp_prior_mean(alg, reach, 'beta')
             a00 = self._flp_prior_mean(alg, reach, 'a0')
-            init = ((alpha0, beta0, a00) if np.isfinite(alpha0)
-                    else (33.3, 1.0, a0_min + 10.))
+            init = (self._prior_or(alpha0, 33.3, 0.001),
+                    self._prior_or(beta0, 1.0, -1e1, 1e1),
+                    self._prior_or(a00, a0_min + 10., a0_min))
             return dict(
                 flowlaw=self.hivdi_flowlaw, moment_objfun=self.hivdi_objfun,
                 moment_args=(obs, qbar, q33),
@@ -1738,8 +1789,9 @@ class Integrate:
             na0 = self._flp_prior_mean(alg, reach, 'na')
             x10 = self._flp_prior_mean(alg, reach, 'x1')
             a00 = self._flp_prior_mean(alg, reach, 'a0')
-            init = ((na0, x10, a00) if np.isfinite(na0)
-                    else (0.03, -1., a0_min + 10.))
+            init = (self._prior_or(na0, 0.03, 0.001),
+                    self._prior_or(x10, -1., -1e1, 1e1),
+                    self._prior_or(a00, a0_min + 10., a0_min))
             return dict(
                 flowlaw=self.metroman_flowlaw,
                 moment_objfun=self.metroman_objfun,
@@ -1780,8 +1832,13 @@ class Integrate:
         if alg in ('sad', 'sic4dvar'):
             n0 = self._flp_prior_mean(alg, reach, 'n')
             a00 = self._flp_prior_mean(alg, reach, 'a0')
-            init = (n0, a00) if np.isfinite(n0) else (0.03, a0_min + 10.)
+            if alg == 'sic4dvar':
+                n0, a00 = self._sic4dvar_priors(n0, a00)
             n_hi = 10. if alg == 'sic4dvar' else np.inf
+            # Each parameter falls back on its own: SIC4DVar has no A0 prior
+            # at all, and a finite n must not drag a NaN A0 into the export.
+            init = (self._prior_or(n0, 0.03, 0.001, n_hi),
+                    self._prior_or(a00, a0_min + 10., a0_min))
             flowlaw = (self.sic4dvar_flowlaw if alg == 'sic4dvar'
                        else self.sad_flowlaw)
             if alg == 'sic4dvar':
@@ -1872,15 +1929,16 @@ class Integrate:
     def _store_flp_result(self, alg, reach, spec, outcome):
         """Write parameters, hydrograph and fit diagnostics for one reach.
 
-        The diagnostics are recorded for every reach and used to gate nothing.
-        That is deliberate: thresholds picked before the global distribution is
-        known are guesses.  Record first, threshold second.
+        The fitted parameters are always kept as flp_candidate_*; the plain
+        parameter keys (what Output, offline and SWORD read) are NaN when
+        flp_fit.export_decision masks the fit under FLP_Export_Policy.
         """
         integ = self.alg_dict[alg][reach].setdefault('integrator', {})
         obs = self.obs_dict[reach]
 
-        for key, value in zip(self.FLP_PARAM_KEYS[alg], outcome.params):
-            integ[key] = value
+        keys = self.FLP_PARAM_KEYS[alg]
+        for key, value in zip(keys, outcome.params):
+            integ['flp_candidate_' + key] = value
         if alg == 'momma':
             integ['Save'] = spec['save']
 
@@ -1893,8 +1951,37 @@ class Integrate:
             flp_fit._safe_flowlaw(
                 spec['flowlaw'], outcome.params, obs, spec['extra']),
             nt_valid)
+        target = self.flp_fit_target(alg, reach)
         integ['q'] = flp_fit.as_row(
             self.integrator_hydrograph(alg, reach, q_flowlaw), nt_valid)
+        integ.update(flp_fit.shape_diagnostics(q_flowlaw, target))
+        outcome.status = flp_fit.classify_fit_quality(
+            outcome.status, integ, outcome.param_at_bound)
+
+        integ['geometry_status'] = obs.get('geometry_status', '')
+        integ['width_source'] = obs.get('width_source', '')
+        integ['corr_wse_dA'] = obs.get('corr_wse_dA', np.nan)
+        if (alg in self.DA_FLOW_LAW_ALGORITHMS
+                and obs.get('geometry_status') == self.GEOMETRY_DA_NOT_INCREASING):
+            outcome.status = flp_fit.FIT_INVALID_GEOMETRY
+
+        # Only exported parameters reach offline and SWORD; a masked reach
+        # exports NaN (offline then produces no discharge) while the fitted
+        # candidate parameters and series stay available for diagnosis.
+        reason = flp_fit.export_decision(
+            outcome.status, outcome.params, q_flowlaw, integ,
+            self.params_dict.get('FLP_Export_Policy',
+                                 flp_fit.DEFAULT_EXPORT_POLICY))
+        exported = reason == flp_fit.EXPORT_REASON_NONE
+        integ['flp_exported'] = int(exported)
+        integ['flp_export_reason'] = reason
+        for key, value in zip(keys, outcome.params):
+            integ[key] = value if exported else np.nan
+        integ['q_flowlaw_candidate'] = q_flowlaw
+        integ['q_flowlaw'] = (q_flowlaw if exported
+                              else np.full_like(q_flowlaw, np.nan))
+        integ['flowlaw_valid_obs'] = int(np.sum(np.asarray(
+            obs.get('flowlaw_valid', []), dtype=bool)))
 
         integ['flp_fit_nrmse'] = outcome.nrmse_lin
         integ['flp_fit_nrmse_log'] = outcome.nrmse_log
@@ -1910,6 +1997,22 @@ class Integrate:
         # consumer could not tell a real FLPE estimate from a prior fallback.
         integ['qbar_source'] = self.alg_dict[alg][reach].get('qbar_source', '')
         integ['q33_source'] = self.alg_dict[alg][reach].get('q33_source', '')
+
+    def _count_export(self, alg, reach, status):
+        """Per-algorithm coverage: what was fitted, exported and masked."""
+        integ = self.alg_dict[alg][reach]['integrator']
+        export = self.flp_export_report.setdefault(alg, {
+            'candidates': 0, 'exported': 0, 'poor_but_exported': 0,
+            'exported_valid_obs': 0, 'masked': {}})
+        export['candidates'] += 1
+        if integ['flp_exported']:
+            export['exported'] += 1
+            export['exported_valid_obs'] += integ['flowlaw_valid_obs']
+            if status == flp_fit.FIT_POOR:
+                export['poor_but_exported'] += 1
+        else:
+            reason = integ['flp_export_reason']
+            export['masked'][reason] = export['masked'].get(reason, 0) + 1
 
     def compute_FLPs(self):
         settings = {
@@ -1927,6 +2030,7 @@ class Integrate:
         }
 
         self.flp_fit_report = {}
+        self.flp_export_report = {}
 
         for alg in self.FLP_ALGORITHMS:
             if alg not in self.alg_dict:
@@ -1955,6 +2059,7 @@ class Integrate:
                         print('    %s %s: store failed (%s)' % (alg, reach, exc))
                     continue
                 counts[outcome.status] = counts.get(outcome.status, 0) + 1
+                self._count_export(alg, reach, outcome.status)
             self.flp_fit_report[alg] = counts
             if self.VerboseFlag and counts:
                 print('    ' + ', '.join(
@@ -2100,25 +2205,30 @@ class Integrate:
           look to answer "which basins should I not trust", and it needs that
           answer even when the run itself succeeded.
           """
-          n_unconverged = len(self.unconverged_solves)
+          unconverged = list(getattr(self, 'unconverged_solves', []))
+          fit_report = getattr(self, 'flp_fit_report', {})
+          n_unconverged = len(unconverged)
           flp = {
               alg: dict(counts)
-              for alg, counts in sorted(self.flp_fit_report.items())
+              for alg, counts in sorted(fit_report.items())
           }
           n_not_good = sum(
               count
-              for counts in self.flp_fit_report.values()
+              for counts in fit_report.values()
               for status, count in counts.items()
               if status != flp_fit.FIT_GOOD
           )
           return {
-              'topology': dict(self.topology_report),
-              'unconverged_solves': list(self.unconverged_solves),
+              'topology': dict(getattr(self, 'topology_report', {})),
+              'unconverged_solves': unconverged,
               'n_unconverged_solves': n_unconverged,
               'flp_fit_status_counts': flp,
               'n_flp_fits_not_good': n_not_good,
               'n_hydrograph_repairs': int(
                   getattr(self, 'flp_hydrograph_repairs', 0)),
+              'flp_export_coverage': {
+                  alg: dict(cov) for alg, cov in sorted(
+                      getattr(self, 'flp_export_report', {}).items())},
           }
 
     def print_run_report(self):
@@ -2142,4 +2252,11 @@ class Integrate:
                       alg,
                       ', '.join('%s=%d' % kv for kv in sorted(counts.items()))))
           print('  FLP fits not marked good: %d' % report['n_flp_fits_not_good'])
+          for alg, cov in report['flp_export_coverage'].items():
+              masked = ', '.join('%s=%d' % kv for kv in sorted(cov['masked'].items()))
+              print('  export %-9s candidates=%d exported=%d '
+                    'poor_but_exported=%d valid_obs=%d masked: %s' % (
+                        alg, cov['candidates'], cov['exported'],
+                        cov['poor_but_exported'], cov['exported_valid_obs'],
+                        masked or 'none'))
           print('--- end run report ---\n')

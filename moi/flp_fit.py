@@ -52,6 +52,12 @@ FIT_UNIDENTIFIABLE = 'unidentifiable'
 FIT_FALLBACK_PRIOR = 'fallback_prior'
 FIT_NO_SERIES = 'no_series'
 FIT_FAILED = 'failed'
+# The optimiser converged but the flow law does not reproduce the hydrograph
+# it was fitted to (see classify_fit_quality).
+FIT_POOR = 'poor_fit'
+# The reach's geometry cannot support a dA-driven flow law (d_x_area does not
+# increase with WSE), whatever the optimiser returns.
+FIT_INVALID_GEOMETRY = 'invalid_geometry'
 
 FIT_STATUS_CODE = {
     FIT_GOOD: 0,
@@ -59,7 +65,26 @@ FIT_STATUS_CODE = {
     FIT_FALLBACK_PRIOR: 2,
     FIT_NO_SERIES: 3,
     FIT_FAILED: 4,
+    FIT_POOR: 5,
+    FIT_INVALID_GEOMETRY: 6,
 }
+
+# ---------------------------------------------------------------------------
+# Export policy: which fitted parameters are handed to offline/SWORD.  The
+# fitted ("candidate") parameters are always kept for diagnosis; a masked reach
+# exports NaN, which offline turns into missing discharge.
+# ---------------------------------------------------------------------------
+EXPORT_REPORT_ONLY = 'report_only'      # export everything, label only
+EXPORT_MASK_UNUSABLE = 'mask_unusable'  # mask invalid geometry, non-finite, anti-correlated
+EXPORT_MASK_ALL_POOR = 'mask_all_poor'  # additionally mask every poor_fit
+EXPORT_POLICIES = (EXPORT_REPORT_ONLY, EXPORT_MASK_UNUSABLE, EXPORT_MASK_ALL_POOR)
+DEFAULT_EXPORT_POLICY = EXPORT_MASK_UNUSABLE
+
+EXPORT_REASON_NONE = 'none'
+EXPORT_REASON_INVALID_GEOMETRY = 'invalid_geometry'
+EXPORT_REASON_NON_FINITE = 'non_finite'
+EXPORT_REASON_ANTI_CORRELATED = 'anti_correlated'
+EXPORT_REASON_POOR_FIT = 'poor_fit'
 
 # param_at_bound is a bitmask: bit i set means parameter i sits on a bound.
 BOUND_TOL = 1.0e-6
@@ -260,6 +285,90 @@ def nrmse_pair(q, target):
         log = float(np.sqrt(np.mean(r ** 2)))
 
     return lin, log
+
+
+def shape_diagnostics(q, target):
+    """Pearson r, NSE and normalised bias of ``q`` against ``target``.
+
+    Computed on the timesteps where both are finite.  ``q`` is the flow-law
+    series offline will reconstruct; ``target`` is the MOI hydrograph.  n in
+    the BAM-type laws is a pure scale factor, so r is set by A0 and the
+    geometry alone -- which is why r, not nRMSE, tells whether L2 can keep the
+    FLPE time dynamics.
+    """
+    result = {
+        'flp_fit_pearson_r': np.nan,
+        'flp_fit_nse': np.nan,
+        'flp_fit_nbias': np.nan,
+        'flp_fit_n_paired': 0,
+    }
+    if q is None or target is None:
+        return result
+    q = _as_1d(q)
+    target = _as_1d(target)
+    if q.size != target.size:
+        return result
+    good = np.isfinite(q) & np.isfinite(target)
+    result['flp_fit_n_paired'] = int(good.sum())
+    if not np.any(good):
+        return result
+    q = q[good]
+    target = target[good]
+
+    mean_target = float(np.mean(target))
+    if mean_target != 0.:
+        result['flp_fit_nbias'] = float((np.mean(q) - mean_target) / abs(mean_target))
+    ss_target = float(np.sum((target - mean_target) ** 2))
+    if ss_target > 0.:
+        result['flp_fit_nse'] = float(1. - np.sum((q - target) ** 2) / ss_target)
+        if q.size >= 2 and np.std(q) > 0.:
+            result['flp_fit_pearson_r'] = float(np.corrcoef(q, target)[0, 1])
+    return result
+
+
+def classify_fit_quality(status, diagnostics, param_at_bound):
+    """Downgrade a numerically successful fit that cannot reproduce its target.
+
+    ``good`` used to mean only "the optimiser returned finite parameters".  A
+    fit with r <= 0 or NSE <= 0 (the target mean predicts better), or with a
+    parameter pinned to a bound, is now ``poor_fit``.  The parameters are kept
+    and still exported; the status says not to trust them.
+    """
+    if status != FIT_GOOD:
+        return status
+    r = diagnostics.get('flp_fit_pearson_r', np.nan)
+    nse = diagnostics.get('flp_fit_nse', np.nan)
+    if param_at_bound or not (r > 0.) or not (nse > 0.):
+        return FIT_POOR
+    return FIT_GOOD
+
+
+def export_decision(status, params, q_flowlaw, diagnostics,
+                    policy=DEFAULT_EXPORT_POLICY, min_paired=MIN_VALID_OBS):
+    """Why a fit must not be exported, or EXPORT_REASON_NONE.
+
+    mask_unusable masks a reach whose dA-driven geometry is invalid, whose
+    parameters or flow-law series are not finite, or whose flow law is
+    anti-correlated (r <= 0 on at least ``min_paired`` paired timesteps) with
+    the MOI hydrograph.  A fit that is poor only because NSE <= 0 or a
+    parameter sits on a bound is still exported (and labelled), unless the
+    policy is mask_all_poor.  report_only never masks.
+    """
+    if policy not in EXPORT_POLICIES:
+        raise ValueError('unknown FLP export policy %r' % (policy,))
+    if policy == EXPORT_REPORT_ONLY:
+        return EXPORT_REASON_NONE
+    if status == FIT_INVALID_GEOMETRY:
+        return EXPORT_REASON_INVALID_GEOMETRY
+    q = _as_1d(q_flowlaw) if q_flowlaw is not None else np.array([])
+    if not all(np.isfinite(p) for p in params) or not np.any(np.isfinite(q)):
+        return EXPORT_REASON_NON_FINITE
+    r = diagnostics.get('flp_fit_pearson_r', np.nan)
+    if diagnostics.get('flp_fit_n_paired', 0) >= min_paired and r <= 0.:
+        return EXPORT_REASON_ANTI_CORRELATED
+    if policy == EXPORT_MASK_ALL_POOR and status == FIT_POOR:
+        return EXPORT_REASON_POOR_FIT
+    return EXPORT_REASON_NONE
 
 
 def bound_mask(params, bounds, tol=BOUND_TOL):
@@ -683,9 +792,10 @@ def refine_local(flowlaw, obs, target, params, param_bounds, extra=(),
 
     The grid answers "which basin of attraction"; this answers "where in it".
     Started from the grid optimum, so it is still deterministic, and the result
-    is kept only if it actually improves the cost -- a local solver that wanders
-    off is discarded rather than trusted, which is precisely what the previous
-    single-start code failed to do.
+    is kept only if it is finite, inside the bounds and actually improves the
+    cost -- a local solver that wanders off is discarded rather than trusted.
+    SciPy's ``success`` flag is not required: L-BFGS-B often reports
+    ABNORMAL_TERMINATION_IN_LNSRCH after reaching a far better point.
 
     SciPy is imported here rather than at module scope so the grid machinery
     stays importable (and unit-testable) with numpy alone.
@@ -717,9 +827,12 @@ def refine_local(flowlaw, obs, target, params, param_bounds, extra=(),
     except Exception:
         return params, start_cost
 
-    if not getattr(res, 'success', False):
+    refined = tuple(float(v) for v in np.ravel(getattr(res, 'x', [])))
+    if len(refined) != len(params) or not all(np.isfinite(refined)):
         return params, start_cost
-    refined = tuple(float(v) for v in res.x)
+    for value, (lo, hi) in zip(refined, param_bounds):
+        if (lo is not None and value < lo) or (hi is not None and value > hi):
+            return params, start_cost
     refined_cost = cost(np.asarray(refined, dtype=float))
     if np.isfinite(refined_cost) and refined_cost < start_cost:
         return refined, refined_cost

@@ -8,6 +8,7 @@ from pathlib import Path
 import warnings
 
 # This will now pull your modified Integrate.py
+from moi import flowlaw_preprocess, flp_fit
 from moi.Input import Input
 from moi.Integrate import Integrate
 from moi.Output import Output
@@ -160,6 +161,11 @@ def set_moi_params():
         'quit_before_flpe': False,
         'apply_patches': False,
         'write_fill_only': False,
+        # Observation preprocessing shared with offline (moi/flowlaw_preprocess.py)
+        # and which fitted flow-law parameters are exported (moi/flp_fit.py).
+        'Observation_Filter_Version': flowlaw_preprocess.DEFAULT_OBSERVATION_FILTER,
+        'Slope_Policy': flowlaw_preprocess.DEFAULT_SLOPE_POLICY,
+        'FLP_Export_Policy': flp_fit.DEFAULT_EXPORT_POLICY,
         # CORRIDORS field discharge as an extra integrator constraint.
         'UseCORRIDORS': False,
         # Matched field measurements below this leave the reach without a
@@ -398,6 +404,26 @@ def main():
         ),
     )
     parser.add_argument(
+        '--observation-filter',
+        choices=flowlaw_preprocess.OBSERVATION_FILTERS,
+        default=None,
+        help='Observation filter shared with offline (default: legacy).',
+    )
+    parser.add_argument(
+        '--slope-policy',
+        choices=flowlaw_preprocess.SLOPE_POLICIES,
+        default=None,
+        help=('slope2 handling shared with offline (default: legacy_safe: '
+              '<= 0 invalid, positive values floored at 1.7e-5).'),
+    )
+    parser.add_argument(
+        '--flp-export-policy',
+        choices=flp_fit.EXPORT_POLICIES,
+        default=None,
+        help=('Which fitted flow-law parameters are exported to offline/SWORD '
+              '(default: mask_unusable).'),
+    )
+    parser.add_argument(
         '--require-plain-convergence',
         action='store_true',
         help=(
@@ -486,6 +512,12 @@ def main():
                 params_dict['FLPE_Outlier_Nstdev'] = args.flpe_outlier_nstdev
             if args.require_plain_convergence:
                 params_dict['SFOI_Require_Plain_Convergence'] = True
+            if args.observation_filter is not None:
+                params_dict['Observation_Filter_Version'] = args.observation_filter
+            if args.slope_policy is not None:
+                params_dict['Slope_Policy'] = args.slope_policy
+            if args.flp_export_policy is not None:
+                params_dict['FLP_Export_Policy'] = args.flp_export_policy
 
             # ---------------------------------------------------------
             # 1. INPUT EXTRACTION
@@ -500,6 +532,8 @@ def main():
                 args.branch,
                 args.verbose,
             )
+            input_obj.observation_filter = params_dict['Observation_Filter_Version']
+            input_obj.slope_policy = params_dict['Slope_Policy']
             input_obj.extract_sword()
             input_obj = get_all_sword_reach_in_basin(input_obj, False)
             svs_loaded = False

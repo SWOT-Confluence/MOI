@@ -11,6 +11,18 @@ from netCDF4 import Dataset
 import numpy as np
 import shutil
 
+from moi import flowlaw_preprocess
+
+
+def _finite_or_fill(values, fillvalue):
+    """``values`` with NaN and +/-inf replaced by the NetCDF fill value.
+
+    np.nan_to_num(values, nan=fill) turned inf into +/-1.8e308, which was then
+    written as if it were a discharge.
+    """
+    values = np.asarray(values, dtype=float)
+    return np.where(np.isfinite(values), values, fillvalue)
+
 
 def _as_row(q, nt, fill=np.nan):
     """Coerce a hydrograph to the (1, nt) shape write_output needs.
@@ -334,6 +346,17 @@ class Output:
         ('dA_valid_frac', 'dA_valid_frac', 'f8'),
         ('rescale_factor', 'rescale_factor', 'f8'),
         ('rescale_exponent', 'rescale_b', 'f8'),
+        # How well q_flowlaw (what offline can reconstruct from the exported
+        # parameters) reproduces the MOI hydrograph it was fitted to.
+        ('flp_fit_pearson_r', 'flp_fit_pearson_r', 'f8'),
+        ('flp_fit_nse', 'flp_fit_nse', 'f8'),
+        ('flp_fit_nbias', 'flp_fit_nbias', 'f8'),
+        ('corr_wse_dA', 'corr_wse_dA', 'f8'),
+        ('flp_fit_n_paired', 'flp_fit_n_paired', 'i8'),
+        ('flowlaw_valid_obs', 'flowlaw_valid_obs', 'i8'),
+        # 1 if the parameters in this group are the ones offline/SWORD get;
+        # 0 if they were masked (NaN) for flp_export_reason.
+        ('flp_exported', 'flp_exported', 'i8'),
     )
 
     # CORRIDORS pseudo-gage fit diagnostics: (netCDF attribute, entry key).
@@ -362,10 +385,13 @@ class Output:
         ('hydrograph_source', 'q_source'),
         ('qbar_source', 'qbar_source'),
         ('q33_source', 'q33_source'),
+        ('geometry_status', 'geometry_status'),
+        ('width_source', 'width_source'),
+        ('flp_export_reason', 'flp_export_reason'),
     )
 
     def _expand_q_to_full_record(self, algorithm, reach, iInsert, nDelete,
-                                 fillvalue):
+                                 fillvalue, key='q'):
         """Put back the timesteps extract_swot() dropped, whatever shape q is in.
 
         This used to be ``np.insert(q, iInsert, fillvalue, 1)``, which assumed q
@@ -387,8 +413,8 @@ class Output:
         if nt_valid < 0:
             nt_valid = 0
 
-        q = integ.get('q')
-        if q is None or np.size(q) != nt_valid:
+        q = integ.get(key)
+        if key == 'q' and (q is None or np.size(q) != nt_valid):
             self.q_shape_repairs.append({
                 'algorithm': algorithm,
                 'reach': reach,
@@ -428,9 +454,33 @@ class Output:
                 value = fillvalue
             variable[:] = int(value) if dtype.startswith('i') else value
 
+        for key in ('q_flowlaw', 'q_flowlaw_candidate'):
+            if key in integ:
+                variable = group.createVariable(
+                    key, 'f8', ('nt',), fill_value=fillvalue)
+                variable[:] = _finite_or_fill(np.ravel(integ[key]), fillvalue)
+
+        # The fitted parameters, whether or not they were exported.
+        for key in sorted(k for k in integ if k.startswith('flp_candidate_')):
+            variable = group.createVariable(key, 'f8', fill_value=fillvalue)
+            variable[:] = _finite_or_fill(integ[key], fillvalue)
+
         for attr_name, key in self.FLP_DIAGNOSTIC_ATTRS:
             value = integ.get(key, '')
             setattr(group, attr_name, str(value) if value is not None else '')
+
+    def _write_preprocess_config(self, out):
+        """Record how observations were prepared; offline reads it back."""
+        values = {
+            'preprocess_version': flowlaw_preprocess.PREPROCESS_VERSION,
+            'observation_filter': self.params_dict.get(
+                'Observation_Filter_Version',
+                flowlaw_preprocess.DEFAULT_OBSERVATION_FILTER),
+            'slope_policy': self.params_dict.get(
+                'Slope_Policy', flowlaw_preprocess.DEFAULT_SLOPE_POLICY),
+        }
+        for key, attribute in flowlaw_preprocess.CONFIG_ATTRIBUTES.items():
+            out.setncattr(attribute, values[key])
 
     def write_output(self):
         """Write data stored to NetCDF files for each reach"""
@@ -466,50 +516,51 @@ class Output:
                 out_file = self.out_dir / f"{reach}_integrator.nc"
                 out = Dataset(out_file, 'w', format="NETCDF4")
                 out.production_date = datetime.now().strftime('%d-%b-%Y %H:%M:%S')
+                self._write_preprocess_config(out)
                 self._write_bias_correlation_diagnostics(out)
                 self._write_gage_metadata(out, reach)
 
                 # 1 busboi
                 gb = out.createGroup("busboi")
                 gb_qbar_stage2 = gb.createVariable("qbar_basinScale", "f8", fill_value=fillvalue)
-                gb_qbar_stage2[:] = np.nan_to_num(self.alg_dict['busboi'][reach]['integrator']['qbar'], copy=True, nan=fillvalue)
+                gb_qbar_stage2[:] = _finite_or_fill(self.alg_dict['busboi'][reach]['integrator']['qbar'], fillvalue)
                 gb_sbQ_rel = gb.createVariable("sbQ_rel", "f8", fill_value=fillvalue)
-                gb_sbQ_rel[:] = np.nan_to_num(self.alg_dict['busboi'][reach]['integrator']['sbQ_rel'], copy=True, nan=fillvalue)
+                gb_sbQ_rel[:] = _finite_or_fill(self.alg_dict['busboi'][reach]['integrator']['sbQ_rel'], fillvalue)
 
                 # 2 hivdi
                 hv = out.createGroup("hivdi")
                 hv_qbar_stage2 = hv.createVariable("qbar_basinScale", "f8", fill_value=fillvalue)
-                hv_qbar_stage2[:] = np.nan_to_num(self.alg_dict['hivdi'][reach]['integrator']['qbar'], copy=True, nan=fillvalue)
+                hv_qbar_stage2[:] = _finite_or_fill(self.alg_dict['hivdi'][reach]['integrator']['qbar'], fillvalue)
                 hv_sbQ_rel = hv.createVariable("sbQ_rel", "f8", fill_value=fillvalue)
-                hv_sbQ_rel[:] = np.nan_to_num(self.alg_dict['hivdi'][reach]['integrator']['sbQ_rel'], copy=True, nan=fillvalue)
+                hv_sbQ_rel[:] = _finite_or_fill(self.alg_dict['hivdi'][reach]['integrator']['sbQ_rel'], fillvalue)
 
                 # 3 metroman
                 mm = out.createGroup("metroman")
                 mm_qbar_stage2 = mm.createVariable("qbar_basinScale", "f8", fill_value=fillvalue)
-                mm_qbar_stage2[:] = np.nan_to_num(self.alg_dict['metroman'][reach]['integrator']['qbar'], copy=True, nan=fillvalue)
+                mm_qbar_stage2[:] = _finite_or_fill(self.alg_dict['metroman'][reach]['integrator']['qbar'], fillvalue)
                 mm_sbQ_rel = mm.createVariable("sbQ_rel", "f8", fill_value=fillvalue)
-                mm_sbQ_rel[:] = np.nan_to_num(self.alg_dict['metroman'][reach]['integrator']['sbQ_rel'], copy=True, nan=fillvalue)
+                mm_sbQ_rel[:] = _finite_or_fill(self.alg_dict['metroman'][reach]['integrator']['sbQ_rel'], fillvalue)
 
                 # 4 momma
                 mo = out.createGroup("momma")
                 mo_qbar_stage2 = mo.createVariable("qbar_basinScale", "f8", fill_value=fillvalue)
-                mo_qbar_stage2[:] = np.nan_to_num(self.alg_dict['momma'][reach]['integrator']['qbar'], copy=True, nan=fillvalue)
+                mo_qbar_stage2[:] = _finite_or_fill(self.alg_dict['momma'][reach]['integrator']['qbar'], fillvalue)
                 mo_sbQ_rel = mo.createVariable("sbQ_rel", "f8", fill_value=fillvalue)
-                mo_sbQ_rel[:] = np.nan_to_num(self.alg_dict['momma'][reach]['integrator']['sbQ_rel'], copy=True, nan=fillvalue)
+                mo_sbQ_rel[:] = _finite_or_fill(self.alg_dict['momma'][reach]['integrator']['sbQ_rel'], fillvalue)
 
                 # 5 sad
                 sad = out.createGroup("sad")
                 sad_qbar_stage2 = sad.createVariable("qbar_basinScale", "f8", fill_value=fillvalue)
-                sad_qbar_stage2[:] = np.nan_to_num(self.alg_dict['sad'][reach]['integrator']['qbar'], copy=True, nan=fillvalue)
+                sad_qbar_stage2[:] = _finite_or_fill(self.alg_dict['sad'][reach]['integrator']['qbar'], fillvalue)
                 sad_sbQ_rel = sad.createVariable("sbQ_rel", "f8", fill_value=fillvalue)
-                sad_sbQ_rel[:] = np.nan_to_num(self.alg_dict['sad'][reach]['integrator']['sbQ_rel'], copy=True, nan=fillvalue)
+                sad_sbQ_rel[:] = _finite_or_fill(self.alg_dict['sad'][reach]['integrator']['sbQ_rel'], fillvalue)
 
                 # 6 sic4dvar
                 sic = out.createGroup("sic4dvar")
                 sic_qbar_stage2 = sic.createVariable("qbar_basinScale", "f8", fill_value=fillvalue)
-                sic_qbar_stage2[:] = np.nan_to_num(self.alg_dict['sic4dvar'][reach]['integrator']['qbar'], copy=True, nan=fillvalue)
+                sic_qbar_stage2[:] = _finite_or_fill(self.alg_dict['sic4dvar'][reach]['integrator']['qbar'], fillvalue)
                 sic_sbQ_rel = sic.createVariable("sbQ_rel", "f8", fill_value=fillvalue)
-                sic_sbQ_rel[:] = np.nan_to_num(self.alg_dict['sic4dvar'][reach]['integrator']['sbQ_rel'], copy=True, nan=fillvalue)
+                sic_sbQ_rel[:] = _finite_or_fill(self.alg_dict['sic4dvar'][reach]['integrator']['sbQ_rel'], fillvalue)
                 
                 out.close()
                 continue
@@ -522,14 +573,19 @@ class Output:
              self.obs_dict[reach]['nt'] += nDelete
 
              for algo in ['busboi', 'hivdi', 'metroman', 'momma', 'sad', 'sic4dvar']:
-                 self.alg_dict[algo][reach]['integrator']['q'] = (
-                     self._expand_q_to_full_record(
-                         algo, reach, iInsert, nDelete, fillvalue))
+                 integ = self.alg_dict[algo][reach]['integrator']
+                 integ['q'] = self._expand_q_to_full_record(
+                     algo, reach, iInsert, nDelete, fillvalue)
+                 for key in ('q_flowlaw', 'q_flowlaw_candidate'):
+                     if key in integ:
+                         integ[key] = self._expand_q_to_full_record(
+                             algo, reach, iInsert, nDelete, fillvalue, key=key)
 
              # NetCDF file creation for observed reaches
              out_file = self.out_dir / f"{reach}_integrator.nc"
              out = Dataset(out_file, 'w', format="NETCDF4")
              out.production_date = datetime.now().strftime('%d-%b-%Y %H:%M:%S')
+             self._write_preprocess_config(out)
              self._write_bias_correlation_diagnostics(out)
              self._write_gage_metadata(out, reach)
 
@@ -542,123 +598,123 @@ class Output:
              # 1 busboi
              gb = out.createGroup("busboi")
              gbq = gb.createVariable("q", "f8", ("nt",), fill_value=fillvalue)
-             gbq[:] = np.nan_to_num(self.alg_dict['busboi'][reach]['integrator']['q'], copy=True, nan=fillvalue)
+             gbq[:] = _finite_or_fill(self.alg_dict['busboi'][reach]['integrator']['q'], fillvalue)
              gb_a0 = gb.createVariable("a0", "f8", fill_value=fillvalue)
-             gb_a0[:] = np.nan_to_num(self.alg_dict['busboi'][reach]['integrator']['a0'], copy=True, nan=fillvalue)
+             gb_a0[:] = _finite_or_fill(self.alg_dict['busboi'][reach]['integrator']['a0'], fillvalue)
              gb_n = gb.createVariable("n", "f8", fill_value=fillvalue)
-             gb_n[:] = np.nan_to_num(self.alg_dict['busboi'][reach]['integrator']['n'], copy=True, nan=fillvalue)
+             gb_n[:] = _finite_or_fill(self.alg_dict['busboi'][reach]['integrator']['n'], fillvalue)
              gb_qbar_s1 = gb.createVariable("qbar_reachScale", "f8", fill_value=fillvalue)
              try:
-                 gb_qbar_s1[:] = np.nan_to_num(self.alg_dict['busboi'][reach]['qbar'], copy=True, nan=fillvalue)
+                 gb_qbar_s1[:] = _finite_or_fill(self.alg_dict['busboi'][reach]['qbar'], fillvalue)
              except:
                  gb_qbar_s1[:] = np.nan
              gb_qbar_s2 = gb.createVariable("qbar_basinScale", "f8", fill_value=fillvalue)
-             gb_qbar_s2[:] = np.nan_to_num(self.alg_dict['busboi'][reach]['integrator']['qbar'], copy=True, nan=fillvalue)
+             gb_qbar_s2[:] = _finite_or_fill(self.alg_dict['busboi'][reach]['integrator']['qbar'], fillvalue)
              gb_sbQ = gb.createVariable("sbQ_rel", "f8", fill_value=fillvalue)
-             gb_sbQ[:] = np.nan_to_num(self.alg_dict['busboi'][reach]['integrator']['sbQ_rel'], copy=True, nan=fillvalue)
+             gb_sbQ[:] = _finite_or_fill(self.alg_dict['busboi'][reach]['integrator']['sbQ_rel'], fillvalue)
              self._write_flp_diagnostics(gb, 'busboi', reach, fillvalue)
 
              # 2 hivdi
              hv = out.createGroup("hivdi")
              hvq = hv.createVariable("q", "f8", ("nt",), fill_value=fillvalue)
-             hvq[:] = np.nan_to_num(self.alg_dict['hivdi'][reach]['integrator']['q'], copy=True, nan=fillvalue)
+             hvq[:] = _finite_or_fill(self.alg_dict['hivdi'][reach]['integrator']['q'], fillvalue)
              hv_Abar = hv.createVariable("Abar", "f8", fill_value=fillvalue)
-             hv_Abar[:] = np.nan_to_num(self.alg_dict['hivdi'][reach]['integrator']['Abar'], copy=True, nan=fillvalue)
+             hv_Abar[:] = _finite_or_fill(self.alg_dict['hivdi'][reach]['integrator']['Abar'], fillvalue)
              hv_alpha = hv.createVariable("alpha", "f8", fill_value=fillvalue)
-             hv_alpha[:] = np.nan_to_num(self.alg_dict['hivdi'][reach]['integrator']['alpha'], copy=True, nan=fillvalue)
+             hv_alpha[:] = _finite_or_fill(self.alg_dict['hivdi'][reach]['integrator']['alpha'], fillvalue)
              hv_beta = hv.createVariable("beta", "f8", fill_value=fillvalue)
-             hv_beta[:] = np.nan_to_num(self.alg_dict['hivdi'][reach]['integrator']['beta'], copy=True, nan=fillvalue)
+             hv_beta[:] = _finite_or_fill(self.alg_dict['hivdi'][reach]['integrator']['beta'], fillvalue)
              hv_qbar_s1 = hv.createVariable("qbar_reachScale", "f8", fill_value=fillvalue)
              try:
-                 hv_qbar_s1[:] = np.nan_to_num(self.alg_dict['hivdi'][reach]['qbar'], copy=True, nan=fillvalue)
+                 hv_qbar_s1[:] = _finite_or_fill(self.alg_dict['hivdi'][reach]['qbar'], fillvalue)
              except:
                  hv_qbar_s1[:] = np.nan
              hv_qbar_s2 = hv.createVariable("qbar_basinScale", "f8", fill_value=fillvalue)
-             hv_qbar_s2[:] = np.nan_to_num(self.alg_dict['hivdi'][reach]['integrator']['qbar'], copy=True, nan=fillvalue)
+             hv_qbar_s2[:] = _finite_or_fill(self.alg_dict['hivdi'][reach]['integrator']['qbar'], fillvalue)
              hv_sbQ = hv.createVariable("sbQ_rel", "f8", fill_value=fillvalue)
-             hv_sbQ[:] = np.nan_to_num(self.alg_dict['hivdi'][reach]['integrator']['sbQ_rel'], copy=True, nan=fillvalue)
+             hv_sbQ[:] = _finite_or_fill(self.alg_dict['hivdi'][reach]['integrator']['sbQ_rel'], fillvalue)
              self._write_flp_diagnostics(hv, 'hivdi', reach, fillvalue)
 
              # 3 metroman
              mm = out.createGroup("metroman")
              mmq = mm.createVariable("q", "f8", ("nt",), fill_value=fillvalue)
-             mmq[:] = np.nan_to_num(self.alg_dict['metroman'][reach]['integrator']['q'], copy=True, nan=fillvalue)
+             mmq[:] = _finite_or_fill(self.alg_dict['metroman'][reach]['integrator']['q'], fillvalue)
              mm_Abar = mm.createVariable("Abar", "f8", fill_value=fillvalue)
-             mm_Abar[:] = np.nan_to_num(self.alg_dict['metroman'][reach]['integrator']['a0'], copy=True, nan=fillvalue)
+             mm_Abar[:] = _finite_or_fill(self.alg_dict['metroman'][reach]['integrator']['a0'], fillvalue)
              mm_na = mm.createVariable("na", "f8", fill_value=fillvalue)
-             mm_na[:] = np.nan_to_num(self.alg_dict['metroman'][reach]['integrator']['na'], copy=True, nan=fillvalue)
+             mm_na[:] = _finite_or_fill(self.alg_dict['metroman'][reach]['integrator']['na'], fillvalue)
              mm_x1 = mm.createVariable("x1", "f8", fill_value=fillvalue)
-             mm_x1[:] = np.nan_to_num(self.alg_dict['metroman'][reach]['integrator']['x1'], copy=True, nan=fillvalue)
+             mm_x1[:] = _finite_or_fill(self.alg_dict['metroman'][reach]['integrator']['x1'], fillvalue)
              mm_qbar_s1 = mm.createVariable("qbar_reachScale", "f8", fill_value=fillvalue)
              try:
-                 mm_qbar_s1[:] = np.nan_to_num(self.alg_dict['metroman'][reach]['qbar'], copy=True, nan=fillvalue)
+                 mm_qbar_s1[:] = _finite_or_fill(self.alg_dict['metroman'][reach]['qbar'], fillvalue)
              except:
                  mm_qbar_s1[:] = np.nan
              mm_qbar_s2 = mm.createVariable("qbar_basinScale", "f8", fill_value=fillvalue)
-             mm_qbar_s2[:] = np.nan_to_num(self.alg_dict['metroman'][reach]['integrator']['qbar'], copy=True, nan=fillvalue)
+             mm_qbar_s2[:] = _finite_or_fill(self.alg_dict['metroman'][reach]['integrator']['qbar'], fillvalue)
              mm_q33 = mm.createVariable("q33_basinScale", "f8", fill_value=fillvalue)
-             mm_q33[:] = np.nan_to_num(self.alg_dict['metroman'][reach]['integrator']['q33'], copy=True, nan=fillvalue)
+             mm_q33[:] = _finite_or_fill(self.alg_dict['metroman'][reach]['integrator']['q33'], fillvalue)
              mm_sbQ = mm.createVariable("sbQ_rel", "f8", fill_value=fillvalue)
-             mm_sbQ[:] = np.nan_to_num(self.alg_dict['metroman'][reach]['integrator']['sbQ_rel'], copy=True, nan=fillvalue)
+             mm_sbQ[:] = _finite_or_fill(self.alg_dict['metroman'][reach]['integrator']['sbQ_rel'], fillvalue)
              self._write_flp_diagnostics(mm, 'metroman', reach, fillvalue)
 
              # 4 momma
              mo = out.createGroup("momma")
              moq = mo.createVariable("q", "f8", ("nt",), fill_value=fillvalue)
-             moq[:] = np.nan_to_num(self.alg_dict['momma'][reach]['integrator']['q'], copy=True, nan=fillvalue)
+             moq[:] = _finite_or_fill(self.alg_dict['momma'][reach]['integrator']['q'], fillvalue)
              mo_B = mo.createVariable("B", "f8", fill_value=fillvalue)
-             mo_B[:] = np.nan_to_num(self.alg_dict['momma'][reach]['integrator']['B'], copy=True, nan=fillvalue)
+             mo_B[:] = _finite_or_fill(self.alg_dict['momma'][reach]['integrator']['B'], fillvalue)
              mo_H = mo.createVariable("H", "f8", fill_value=fillvalue)
-             mo_H[:] = np.nan_to_num(self.alg_dict['momma'][reach]['integrator']['H'], copy=True, nan=fillvalue)
+             mo_H[:] = _finite_or_fill(self.alg_dict['momma'][reach]['integrator']['H'], fillvalue)
              mo_S = mo.createVariable("Save", "f8", fill_value=fillvalue)
-             mo_S[:] = np.nan_to_num(self.alg_dict['momma'][reach]['integrator']['Save'], copy=True, nan=fillvalue)
+             mo_S[:] = _finite_or_fill(self.alg_dict['momma'][reach]['integrator']['Save'], fillvalue)
              mo_qbar_s1 = mo.createVariable("qbar_reachScale", "f8", fill_value=fillvalue)
              try:
-                 mo_qbar_s1[:] = np.nan_to_num(self.alg_dict['momma'][reach]['qbar'], copy=True, nan=fillvalue)
+                 mo_qbar_s1[:] = _finite_or_fill(self.alg_dict['momma'][reach]['qbar'], fillvalue)
              except:
                  mo_qbar_s1[:] = np.nan
              mo_qbar_s2 = mo.createVariable("qbar_basinScale", "f8", fill_value=fillvalue)
-             mo_qbar_s2[:] = np.nan_to_num(self.alg_dict['momma'][reach]['integrator']['qbar'], copy=True, nan=fillvalue)
+             mo_qbar_s2[:] = _finite_or_fill(self.alg_dict['momma'][reach]['integrator']['qbar'], fillvalue)
              mo_sbQ = mo.createVariable("sbQ_rel", "f8", fill_value=fillvalue)
-             mo_sbQ[:] = np.nan_to_num(self.alg_dict['momma'][reach]['integrator']['sbQ_rel'], copy=True, nan=fillvalue)
+             mo_sbQ[:] = _finite_or_fill(self.alg_dict['momma'][reach]['integrator']['sbQ_rel'], fillvalue)
              self._write_flp_diagnostics(mo, 'momma', reach, fillvalue)
 
              # 5 sad
              sd = out.createGroup("sad")
              sdq = sd.createVariable("q", "f8", ("nt",), fill_value=fillvalue)
-             sdq[:] = np.nan_to_num(self.alg_dict['sad'][reach]['integrator']['q'], copy=True, nan=fillvalue)
+             sdq[:] = _finite_or_fill(self.alg_dict['sad'][reach]['integrator']['q'], fillvalue)
              sd_n = sd.createVariable("n", "f8", fill_value=fillvalue)
-             sd_n[:] = np.nan_to_num(self.alg_dict['sad'][reach]['integrator']['n'], copy=True, nan=fillvalue)
+             sd_n[:] = _finite_or_fill(self.alg_dict['sad'][reach]['integrator']['n'], fillvalue)
              sd_a0 = sd.createVariable("a0", "f8", fill_value=fillvalue)
-             sd_a0[:] = np.nan_to_num(self.alg_dict['sad'][reach]['integrator']['a0'], copy=True, nan=fillvalue)
+             sd_a0[:] = _finite_or_fill(self.alg_dict['sad'][reach]['integrator']['a0'], fillvalue)
              sd_qbar_s1 = sd.createVariable("qbar_reachScale", "f8", fill_value=fillvalue)
              try:
-                 sd_qbar_s1[:] = np.nan_to_num(self.alg_dict['sad'][reach]['qbar'], copy=True, nan=fillvalue)
+                 sd_qbar_s1[:] = _finite_or_fill(self.alg_dict['sad'][reach]['qbar'], fillvalue)
              except:
                  sd_qbar_s1[:] = np.nan
              sd_qbar_s2 = sd.createVariable("qbar_basinScale", "f8", fill_value=fillvalue)
-             sd_qbar_s2[:] = np.nan_to_num(self.alg_dict['sad'][reach]['integrator']['qbar'], copy=True, nan=fillvalue)
+             sd_qbar_s2[:] = _finite_or_fill(self.alg_dict['sad'][reach]['integrator']['qbar'], fillvalue)
              sd_sbQ = sd.createVariable("sbQ_rel", "f8", fill_value=fillvalue)
-             sd_sbQ[:] = np.nan_to_num(self.alg_dict['sad'][reach]['integrator']['sbQ_rel'], copy=True, nan=fillvalue)
+             sd_sbQ[:] = _finite_or_fill(self.alg_dict['sad'][reach]['integrator']['sbQ_rel'], fillvalue)
              self._write_flp_diagnostics(sd, 'sad', reach, fillvalue)
 
              # 6 sic4dvar
              sic = out.createGroup("sic4dvar")
              sicq = sic.createVariable("q", "f8", ("nt",), fill_value=fillvalue)
-             sicq[:] = np.nan_to_num(self.alg_dict['sic4dvar'][reach]['integrator']['q'], copy=True, nan=fillvalue)
+             sicq[:] = _finite_or_fill(self.alg_dict['sic4dvar'][reach]['integrator']['q'], fillvalue)
              sic_n = sic.createVariable("n", "f8", fill_value=fillvalue)
-             sic_n[:] = np.nan_to_num(self.alg_dict['sic4dvar'][reach]['integrator']['n'], copy=True, nan=fillvalue)
+             sic_n[:] = _finite_or_fill(self.alg_dict['sic4dvar'][reach]['integrator']['n'], fillvalue)
              sic_a0 = sic.createVariable("a0", "f8", fill_value=fillvalue)
-             sic_a0[:] = np.nan_to_num(self.alg_dict['sic4dvar'][reach]['integrator']['a0'], copy=True, nan=fillvalue)
+             sic_a0[:] = _finite_or_fill(self.alg_dict['sic4dvar'][reach]['integrator']['a0'], fillvalue)
              sic_qbar_s1 = sic.createVariable("qbar_reachScale", "f8", fill_value=fillvalue)
              try:
-                 sic_qbar_s1[:] = np.nan_to_num(self.alg_dict['sic4dvar'][reach]['qbar'], copy=True, nan=fillvalue)
+                 sic_qbar_s1[:] = _finite_or_fill(self.alg_dict['sic4dvar'][reach]['qbar'], fillvalue)
              except:
                  sic_qbar_s1[:] = np.nan
              sic_qbar_s2 = sic.createVariable("qbar_basinScale", "f8", fill_value=fillvalue)
-             sic_qbar_s2[:] = np.nan_to_num(self.alg_dict['sic4dvar'][reach]['integrator']['qbar'], copy=True, nan=fillvalue)
+             sic_qbar_s2[:] = _finite_or_fill(self.alg_dict['sic4dvar'][reach]['integrator']['qbar'], fillvalue)
              sic_sbQ = sic.createVariable("sbQ_rel", "f8", fill_value=fillvalue)
-             sic_sbQ[:] = np.nan_to_num(self.alg_dict['sic4dvar'][reach]['integrator']['sbQ_rel'], copy=True, nan=fillvalue)
+             sic_sbQ[:] = _finite_or_fill(self.alg_dict['sic4dvar'][reach]['integrator']['sbQ_rel'], fillvalue)
              self._write_flp_diagnostics(sic, 'sic4dvar', reach, fillvalue)
 
              out.close()

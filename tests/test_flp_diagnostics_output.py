@@ -197,3 +197,40 @@ def test_output_row_helper_does_not_drift_from_flp_fit():
         theirs = flp_fit.as_row(q, nt)
         assert mine.shape == theirs.shape, (q, nt)
         np.testing.assert_array_equal(mine, theirs)
+
+
+def test_export_fields_candidates_and_nonfinite_values(tmp_path):
+    from moi import flowlaw_preprocess
+    from moi.Output import _finite_or_fill
+
+    integrator = {
+        'flp_exported': 0,
+        'flp_export_reason': flp_fit.EXPORT_REASON_INVALID_GEOMETRY,
+        'flp_candidate_n': 0.03,
+        'flp_candidate_a0': 250.0,
+        'q_flowlaw': np.full(3, np.nan),
+        'q_flowlaw_candidate': np.array([1.0, np.inf, 3.0]),
+    }
+    writer = make_writer(tmp_path, integrator)
+    writer.params_dict = {'Slope_Policy': flowlaw_preprocess.SLOPE_L2_3P4}
+
+    path = tmp_path / 'export.nc'
+    with Dataset(path, 'w', format='NETCDF4') as out:
+        out.createDimension('nt', 3)
+        writer._write_preprocess_config(out)
+        group = out.createGroup('sic4dvar')
+        writer._write_flp_diagnostics(group, 'sic4dvar', '12345', FILL)
+
+    with Dataset(path) as ds:
+        assert flowlaw_preprocess.read_config(ds)['slope_policy'] == 'l2_3p4'
+        group = ds['sic4dvar']
+        assert int(group['flp_exported'][:]) == 0
+        assert group.flp_export_reason == 'invalid_geometry'
+        assert float(group['flp_candidate_a0'][:]) == pytest.approx(250.0)
+        assert np.ma.getmaskarray(group['q_flowlaw'][:]).all()
+        candidate = group['q_flowlaw_candidate'][:]
+        # inf is written as fill, not as 1.8e308
+        assert np.ma.getmaskarray(candidate).tolist() == [False, True, False]
+
+    np.testing.assert_array_equal(
+        _finite_or_fill([1.0, np.nan, -np.inf], FILL), [1.0, FILL, FILL])

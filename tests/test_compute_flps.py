@@ -415,3 +415,167 @@ def test_length_repair_is_counted_not_silent():
         q = integrator.alg_dict[alg][stray]['integrator']['q']
         assert q.shape == (1, 40), alg
         assert np.isnan(q[0, 7])
+
+
+# ---------------------------------------------------------------------------
+# fit quality, q_flowlaw and geometry status
+def test_shape_diagnostics_and_classification():
+    target = np.array([1.0, 2.0, 3.0, 4.0])
+    good = flp_fit.shape_diagnostics(target * 1.1, target)
+    assert good['flp_fit_pearson_r'] > 0.999
+    assert np.isclose(good['flp_fit_nbias'], 0.1)
+    assert flp_fit.classify_fit_quality(flp_fit.FIT_GOOD, good, 0) == flp_fit.FIT_GOOD
+    # At a bound is poor even when the shape matches.
+    assert flp_fit.classify_fit_quality(flp_fit.FIT_GOOD, good, 1) == flp_fit.FIT_POOR
+
+    reversed_shape = flp_fit.shape_diagnostics(target[::-1], target)
+    assert reversed_shape['flp_fit_pearson_r'] < 0
+    assert flp_fit.classify_fit_quality(
+        flp_fit.FIT_GOOD, reversed_shape, 0) == flp_fit.FIT_POOR
+    # Only 'good' is ever downgraded.
+    assert flp_fit.classify_fit_quality(
+        flp_fit.FIT_NO_SERIES, reversed_shape, 0) == flp_fit.FIT_NO_SERIES
+
+
+def test_flowlaw_series_and_diagnostics_are_stored():
+    integrator, reach = make_integrator()
+    run(integrator)
+    for alg in ALGS:
+        integ = integrator.alg_dict[alg][reach]['integrator']
+        assert np.shape(integ['q_flowlaw']) == (1, 40), alg
+        assert np.isfinite(integ['flp_fit_pearson_r']), alg
+        assert np.isfinite(integ['flp_fit_nse']), alg
+        assert integ['flp_fit_status'] in (flp_fit.FIT_GOOD, flp_fit.FIT_POOR), alg
+        if integ['flp_fit_status'] == flp_fit.FIT_GOOD:
+            assert integ['flp_fit_pearson_r'] > 0 and integ['flp_fit_nse'] > 0
+
+
+def test_sign_reversed_area_marks_da_laws_invalid():
+    integrator, reach = make_integrator()
+    integrator.obs_dict[reach]['geometry_status'] = 'dA_not_increasing_with_wse'
+    run(integrator)
+    for alg in ALGS:
+        status = integrator.alg_dict[alg][reach]['integrator']['flp_fit_status']
+        if alg == 'momma':
+            assert status != flp_fit.FIT_INVALID_GEOMETRY
+        else:
+            assert status == flp_fit.FIT_INVALID_GEOMETRY, alg
+    assert integrator.flp_fit_report['busboi'] == {flp_fit.FIT_INVALID_GEOMETRY: 1}
+
+
+def test_a0_lower_bound_is_admissible_offline():
+    integrator, reach = make_integrator()
+    integrator.obs_dict[reach]['dA'] = integrator.obs_dict[reach]['dA'] + 1000.
+    for alg in ('busboi', 'sad', 'sic4dvar', 'hivdi', 'metroman'):
+        spec = integrator._flp_reach_spec(alg, reach)
+        assert spec['a0_min'] >= 1.0, alg
+
+
+def test_sic4dvar_file_values_are_strickler_and_bed_elevation():
+    n, a0 = Integrate._sic4dvar_priors(30.0, 150.2)
+    assert np.isclose(n, 1.0 / 30.0) and np.isnan(a0)
+    assert np.isclose(Integrate._sic4dvar_priors(0.03, 5.0)[0], 0.03)
+    assert np.isnan(Integrate._sic4dvar_priors(np.nan, 5.0)[0])
+
+
+def test_offline_mask_removes_timesteps_from_the_fit_target():
+    integrator, reach = make_integrator()
+    keep = np.ones(40, dtype=bool)
+    keep[[3, 7, 11]] = False
+    integrator.obs_dict[reach]['flowlaw_valid'] = keep
+    integrator.calc_integrator_hydrographs()
+
+    target = integrator.flp_fit_target('busboi', reach)
+    assert np.isnan(target[[3, 7, 11]]).all()
+    assert np.isfinite(target[keep]).all()
+    # The retained MOI hydrograph itself is untouched.
+    q = integrator.alg_dict['busboi'][reach]['integrator']['q']
+    assert np.isfinite(np.ravel(q)).all()
+
+    integrator.params_dict['FLP_Use_Offline_Mask'] = False
+    assert np.isfinite(integrator.flp_fit_target('busboi', reach)).all()
+
+
+# ---------------------------------------------------------------------------
+# export gating: what offline and SWORD receive
+# ---------------------------------------------------------------------------
+
+def _exported(integrator, reach, alg):
+    return integrator.alg_dict[alg][reach]['integrator']
+
+
+def test_invalid_geometry_masks_da_laws_but_keeps_candidates():
+    integrator, reach = make_integrator()
+    integrator.obs_dict[reach]['geometry_status'] = 'dA_not_increasing_with_wse'
+    run(integrator)
+    for alg in ALGS:
+        integ = _exported(integrator, reach, alg)
+        keys = Integrate.FLP_PARAM_KEYS[alg]
+        if alg == 'momma':
+            assert integ['flp_exported'] == 1
+            continue
+        assert integ['flp_exported'] == 0, alg
+        assert integ['flp_export_reason'] == flp_fit.EXPORT_REASON_INVALID_GEOMETRY
+        assert all(np.isnan(integ[k]) for k in keys), alg
+        assert all(np.isfinite(integ['flp_candidate_' + k]) for k in keys), alg
+        assert np.isnan(integ['q_flowlaw']).all()
+        assert np.isfinite(integ['q_flowlaw_candidate']).any()
+        # The MOI hydrograph itself is not touched.
+        assert np.isfinite(np.ravel(integ['q'])).all()
+    coverage = integrator.run_report()['flp_export_coverage']['busboi']
+    assert coverage['exported'] == 0
+    assert coverage['masked'] == {flp_fit.EXPORT_REASON_INVALID_GEOMETRY: 1}
+
+
+def test_report_only_exports_everything():
+    integrator, reach = make_integrator(
+        params={'FLP_Export_Policy': flp_fit.EXPORT_REPORT_ONLY})
+    integrator.obs_dict[reach]['geometry_status'] = 'dA_not_increasing_with_wse'
+    run(integrator)
+    for alg in ALGS:
+        integ = _exported(integrator, reach, alg)
+        assert integ['flp_exported'] == 1, alg
+        assert integ['flp_fit_status'] in (flp_fit.FIT_INVALID_GEOMETRY,
+                                           flp_fit.FIT_GOOD, flp_fit.FIT_POOR)
+
+
+def test_export_decision_rules():
+    good_q = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
+    anti = {'flp_fit_pearson_r': -0.4, 'flp_fit_n_paired': 20}
+    weak = {'flp_fit_pearson_r': 0.3, 'flp_fit_n_paired': 20}
+    few = {'flp_fit_pearson_r': -0.4, 'flp_fit_n_paired': 3}
+    decide = flp_fit.export_decision
+    assert decide(flp_fit.FIT_POOR, (1., 2.), good_q, anti) == \
+        flp_fit.EXPORT_REASON_ANTI_CORRELATED
+    assert decide(flp_fit.FIT_POOR, (1., 2.), good_q, few) == \
+        flp_fit.EXPORT_REASON_NONE
+    assert decide(flp_fit.FIT_POOR, (1., 2.), good_q, weak) == \
+        flp_fit.EXPORT_REASON_NONE
+    assert decide(flp_fit.FIT_POOR, (1., 2.), good_q, weak,
+                  flp_fit.EXPORT_MASK_ALL_POOR) == flp_fit.EXPORT_REASON_POOR_FIT
+    assert decide(flp_fit.FIT_GOOD, (1., np.nan), good_q, weak) == \
+        flp_fit.EXPORT_REASON_NON_FINITE
+    assert decide(flp_fit.FIT_GOOD, (1., 2.), good_q * np.nan, weak) == \
+        flp_fit.EXPORT_REASON_NON_FINITE
+    assert decide(flp_fit.FIT_INVALID_GEOMETRY, (1., 2.), good_q, anti,
+                  flp_fit.EXPORT_REPORT_ONLY) == flp_fit.EXPORT_REASON_NONE
+    with pytest.raises(ValueError):
+        decide(flp_fit.FIT_GOOD, (1., 2.), good_q, weak, 'mask_everything')
+
+
+def test_sic4dvar_fallback_exports_a_usable_a0():
+    # Constant dA -> unidentifiable -> the fallback (init) parameters are used.
+    integrator, reach = make_integrator(constant_da=True)
+    integrator.alg_dict['sic4dvar'][reach]['n'] = 30.0   # Strickler K in file
+    run(integrator)
+    integ = _exported(integrator, reach, 'sic4dvar')
+    assert integ['flp_fit_status'] == flp_fit.FIT_UNIDENTIFIABLE
+    assert np.isclose(integ['flp_candidate_n'], 1.0 / 30.0)
+    assert np.isfinite(integ['flp_candidate_a0'])
+    assert integ['flp_candidate_a0'] >= 1.0
+
+
+def test_prior_or_respects_bounds():
+    assert Integrate._prior_or(np.nan, 0.03, 0.001) == 0.03
+    assert Integrate._prior_or(5.0, 0.03, 0.001, 1.0) == 0.03
+    assert Integrate._prior_or(0.5, 0.03, 0.001, 1.0) == 0.5

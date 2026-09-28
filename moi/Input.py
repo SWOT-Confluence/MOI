@@ -4,7 +4,7 @@ import csv
 import datetime
 import json
 import warnings
-from moi.constrainwidthMM import ConstrainWidth
+from moi import flowlaw_preprocess
 
 try:
     import geopandas as gpd
@@ -85,6 +85,10 @@ class Input:
         # FLPE files that existed but could not be read, one entry per
         # algorithm/reach; each was treated as missing for that algorithm.
         self.flpe_read_failures = []
+        # How extract_swot prepares observations for the flow laws; must
+        # match what offline uses (both are written to the integrator files).
+        self.observation_filter = flowlaw_preprocess.DEFAULT_OBSERVATION_FILTER
+        self.slope_policy = flowlaw_preprocess.DEFAULT_SLOPE_POLICY
         self.sword_dir = sword_dir
         self.swot_dir = swot_dir
         self.branch = branch
@@ -658,75 +662,122 @@ class Input:
                 continue
             # -----------------------------
 
-            self.obs_dict[reach] = {}
             nt = swot_dataset.dimensions['nt'].size
-            self.obs_dict[reach]['nt'] = nt
-            self.obs_dict[reach]['h'] = swot_dataset["reach/wse"][0:nt].filled(np.nan)
-            self.obs_dict[reach]['w'] = swot_dataset["reach/width"][0:nt].filled(np.nan)
-            self.obs_dict[reach]['S'] = swot_dataset["reach/slope2"][0:nt].filled(np.nan)
-            self.obs_dict[reach]['dA'] = swot_dataset["reach/d_x_area"][0:nt].filled(np.nan)
-            self.obs_dict[reach]['t'] = swot_dataset["reach/time"][0:nt].filled(np.nan)
-            #constrain widths
-            area_fit={}
-            area_fit['h_break']=swot_dataset['reach']['hwfit']['h_break'][:].filled(np.nan)
-            area_fit['fit_coeffs']=swot_dataset['reach']['hwfit']['fit_coeffs'][:].filled(np.nan) #slope: index 1; intercept: index 0
-            hhat,what=ConstrainWidth(swot_dataset["reach/wse"][0:nt].filled(np.nan),
-                                     swot_dataset["reach/width"][0:nt].filled(np.nan),
-                                     area_fit,nt)
-            self.obs_dict[reach]['w']=what
             reach_group = swot_dataset['reach']
+            obs = self.obs_dict[reach] = {'nt': nt}
+            h = reach_group['wse'][0:nt].filled(np.nan)
+            w_raw = reach_group['width'][0:nt].filled(np.nan)
+            s_raw = reach_group['slope2'][0:nt].filled(np.nan)
+            obs['dA'] = reach_group['d_x_area'][0:nt].filled(np.nan)
+            obs['t'] = reach_group['time'][0:nt].filled(np.nan)
+
+            # A file without a usable reach/hwfit gets the median observed width.
+            area_fit = {'h_break': np.full(4, np.nan), 'fit_coeffs': None}
+            if 'hwfit' in reach_group.groups:
+                area_fit['h_break'] = reach_group['hwfit']['h_break'][:].filled(np.nan)
+                # fit_coeffs[0] holds the slopes, fit_coeffs[1] the intercepts
+                area_fit['fit_coeffs'] = reach_group['hwfit']['fit_coeffs'][:].filled(np.nan)
+
+            # Same preprocessing offline applies before evaluating the FLPs.
+            prep = flowlaw_preprocess.prepare_flowlaw_inputs(
+                h, w_raw, s_raw, area_fit,
+                self._quality_variables(reach_group, nt),
+                self.observation_filter, self.slope_policy)
+            obs['h'] = h
+            obs['w'] = prep['width_used']
+            obs['S'] = prep['slope_used']
+            obs['w_raw'] = w_raw
+            obs['S_raw'] = s_raw
+            obs['width_source'] = prep['width_source']
+            obs['slope_status'] = prep['slope_status']
+            obs['flowlaw_valid'] = prep['flowlaw_valid']
+            obs['observation_filter_counts'] = {
+                key: prep[key] for key in (
+                    'n_nrt_bad', 'n_quality_unknown', 'n_outlier',
+                    'outlier_test_skipped')}
+
             if 'time_str' in reach_group.variables:
-                self.obs_dict[reach]['time_str'] = self._decode_time_strings(
+                obs['time_str'] = self._decode_time_strings(
                     reach_group['time_str'][0:nt],
                     expected_size=nt,
                 )
-                self.obs_dict[reach]['time_str_source'] = 'SWOT reach/time_str'
+                obs['time_str_source'] = 'SWOT reach/time_str'
             else:
-                self.obs_dict[reach]['time_str'] = self._time_strings_from_seconds(
-                    self.obs_dict[reach]['t']
-                )
-                self.obs_dict[reach]['time_str_source'] = (
-                    'derived from SWOT reach/time'
-                )
+                obs['time_str'] = self._time_strings_from_seconds(obs['t'])
+                obs['time_str_source'] = 'derived from SWOT reach/time'
 
-            self.obs_dict[reach]['reach_q'] = swot_dataset["reach/reach_q"][0:nt].filled(np.nan)
-            self.obs_dict[reach]['xovr_cal_q'] = swot_dataset["reach/xovr_cal_q"][0:nt].filled(np.nan)
+            obs['reach_q'] = reach_group['reach_q'][0:nt].filled(np.nan)
+            obs['xovr_cal_q'] = reach_group['xovr_cal_q'][0:nt].filled(np.nan)
 
             swot_dataset.close()
 
-            # select observations that are NOT equal to the fill value
+            # Timesteps with no WSE, width, slope or area at all are dropped
+            # from every MOI product (and re-inserted as fill on output).
             iDelete = np.where(
-    		np.isnan(self.obs_dict[reach]['h']) |
-    		np.isnan(self.obs_dict[reach]['w']) |
-    		np.isnan(self.obs_dict[reach]['S']) |
-    		np.isnan(self.obs_dict[reach]['dA'])
-		)
-
-            self.obs_dict[reach]['h'] = np.delete(self.obs_dict[reach]['h'], iDelete, 0)
-            self.obs_dict[reach]['w'] = np.delete(self.obs_dict[reach]['w'], iDelete, 0)
-            self.obs_dict[reach]['S'] = np.delete(self.obs_dict[reach]['S'], iDelete, 0)
-            self.obs_dict[reach]['dA'] = np.delete(self.obs_dict[reach]['dA'], iDelete, 0)
-            self.obs_dict[reach]['t'] = np.delete(self.obs_dict[reach]['t'], iDelete, 0)
-
-            self.obs_dict[reach]['iDelete'] = iDelete
-
-            Smin = 1.7e-5
-            np.putmask(
-                self.obs_dict[reach]['S'],
-                self.obs_dict[reach]['S'] < Smin,
-                Smin,
+                np.isnan(h) | np.isnan(obs['w']) | np.isnan(s_raw)
+                | np.isnan(obs['dA'])
             )
+            for key in ('h', 'w', 'S', 'dA', 't', 'w_raw', 'S_raw',
+                        'slope_status', 'flowlaw_valid', 'reach_q',
+                        'xovr_cal_q'):
+                obs[key] = np.delete(obs[key], iDelete, 0)
+            obs['iDelete'] = iDelete
+            obs['nt'] -= np.shape(iDelete)[1]
 
-            shape_iDelete = np.shape(iDelete)
-            nDelete = shape_iDelete[1]
-            self.obs_dict[reach]['nt'] -= nDelete
-            
+            # The flow-law geometry is defined only where offline will also
+            # evaluate the flow laws; elsewhere it is NaN, so FLP fitting,
+            # parameter bounds and the geometry check see exactly offline's
+            # observations and q_flowlaw is NaN where L2 is missing.
+            valid = obs['flowlaw_valid']
+            for key in ('h', 'w', 'S', 'dA'):
+                obs[key] = np.where(valid, obs[key], np.nan)
+
+            corr, status = self.geometry_status(obs['h'], obs['dA'])
+            obs['corr_wse_dA'] = corr
+            obs['geometry_status'] = status
+
         # RESTORED CHECK: Triggers if ALL files failed to open or process
         if self.obs_dict == {}:
             raise LookupError('No reaches in basin processed')
 
 
 
+
+    @staticmethod
+    def _quality_variables(reach_group, nt):
+        """Quality series offline filters on, or None if any is missing."""
+        try:
+            return {name: np.ma.filled(
+                        np.ma.asarray(reach_group[name][0:nt], dtype=float), np.nan)
+                    for name in flowlaw_preprocess.QUALITY_VARIABLES}
+        except (IndexError, KeyError):
+            return None
+
+    GEOMETRY_OK = 'ok'
+    GEOMETRY_DA_NOT_INCREASING = 'dA_not_increasing_with_wse'
+    GEOMETRY_TOO_FEW_OBS = 'too_few_obs'
+    MIN_GEOMETRY_OBS = 3
+
+    @classmethod
+    def geometry_status(cls, h, dA):
+        """``(corr(wse, dA), status)`` for one reach's valid observations.
+
+        d_x_area is an integral of width over stage, so it has to increase with
+        WSE.  A non-positive correlation means the area anomaly is sign-reversed
+        or degenerate (for example the Input HWS fallback with a negative
+        width), and no flow law driven by dA can reproduce the FLPE dynamics.
+        """
+        h = np.asarray(h, dtype=float).ravel()
+        dA = np.asarray(dA, dtype=float).ravel()
+        good = np.isfinite(h) & np.isfinite(dA)
+        if good.sum() < cls.MIN_GEOMETRY_OBS:
+            return np.nan, cls.GEOMETRY_TOO_FEW_OBS
+        if np.std(h[good]) == 0 or np.std(dA[good]) == 0:
+            return np.nan, cls.GEOMETRY_DA_NOT_INCREASING
+        corr = float(np.corrcoef(h[good], dA[good])[0, 1])
+        if not corr > 0:
+            return corr, cls.GEOMETRY_DA_NOT_INCREASING
+        return corr, cls.GEOMETRY_OK
 
     def extract_alg(self):
         """Extracts and stores reach-level FLPE algorithm data in alg_dict."""
