@@ -508,6 +508,11 @@ def main():
                 input_obj.extract_swot()
                 input_obj.extract_sos()
                 input_obj.extract_alg()
+                for failure in input_obj.flpe_read_failures:
+                    log.write(
+                        f"Unreadable FLPE file treated as missing: "
+                        f"{failure['algorithm']} {failure['reach_id']} "
+                        f"({failure['reason']})\n")
 
                 if args.branch == 'constrained':
                     svs_file = args.svs_file

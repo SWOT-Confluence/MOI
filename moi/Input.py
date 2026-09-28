@@ -82,6 +82,9 @@ class Input:
         # two apart once merge_corridors_and_gages has folded them together.
         self.corridors_reaches = set()
         self.sos_dir = sos_dir
+        # FLPE files that existed but could not be read, one entry per
+        # algorithm/reach; each was treated as missing for that algorithm.
+        self.flpe_read_failures = []
         self.sword_dir = sword_dir
         self.swot_dir = swot_dir
         self.branch = branch
@@ -759,195 +762,122 @@ class Input:
                         "qbar": np.nan
                         }
 
-    def __extract_valid(self, r_id, bb_file, hv_file, mo_file, sd_file, mm_file, sv_file):
-        """ Extract valid data from the output of each reach-level FLPE alg.
-        Parameters
-        ----------
-        r_id: str
-            Unique reach identifier
-        bb_file: Path
-            Path to BUSBOI results file
-        hv_file: Path
-            Path to HiVDI results file
-        mo_file: Path
-            Path to MOMMA results file
-        sd_file: Path
-            Path to SAD results file
-        mm_file: Path
-            Path to MetroMan results file
-        sv_file: Path
-            Path to SIC4DVar results file
+    # Keys each algorithm carries when no usable FLPE file exists.  Identical
+    # to what the per-algorithm branches used to build inline.
+    FLPE_MISSING_KEYS = {
+        "busboi": ("q", "r", "bed", "chainage", "prior_q", "n", "a0"),
+        "hivdi": ("q", "alpha", "beta"),
+        "momma": ("q", "B", "H", "Save"),
+        "sad": ("q", "n", "a0"),
+        "metroman": ("q", "na", "x1", "a0"),
+        "sic4dvar": ("q_mm", "q", "n", "a0"),
+    }
+
+    @staticmethod
+    def _optional(read):
+        """Value of ``read()``, or NaN when the variable is absent/unreadable."""
+        try:
+            return read()
+        except Exception:
+            return np.nan
+
+    @classmethod
+    def _read_busboi(cls, ds):
+        return {
+            "q": np.array(ds["q"]["q"][:].filled(np.nan)),
+            "r": cls._optional(lambda: np.array(ds["r"]["mean"][:].filled(np.nan))),
+            "bed": cls._optional(lambda: np.array(ds["bed"]["elevation"][:].filled(np.nan))),
+            "chainage": cls._optional(lambda: np.array(ds["bed"]["chainage"][:].filled(np.nan))),
+            "prior_q": cls._optional(lambda: np.array(ds["prior_q"]["q"][:].filled(np.nan))),
+            # placeholders for MOI surrogate BAM-compatible refit
+            "n": np.nan,
+            "a0": np.nan,
+        }
+
+    @staticmethod
+    def _read_hivdi(ds):
+        return {
+            "q": ds["reach"]["Q"][:].filled(np.nan),
+            "alpha": ds["reach"]["alpha"][:].filled(np.nan),
+            "beta": ds["reach"]["beta"][:].filled(np.nan),
+            "a0": ds["reach"]["A0"][:].filled(np.nan),
+        }
+
+    @staticmethod
+    def _read_momma(ds):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            return {
+                "q": ds["Q"][:].filled(np.nan),
+                "B": ds["zero_flow_stage"][:].filled(np.nan),
+                "H": ds["bankfull_stage"][:].filled(np.nan),
+                "Save": np.nanmean(ds["slope"][:].filled(np.nan)),
+            }
+
+    @staticmethod
+    def _read_sad(ds):
+        return {
+            "q": ds["Qa"][:].filled(np.nan),
+            "n": ds["n"][:].filled(np.nan),
+            "a0": ds["A0"][:].filled(np.nan),
+        }
+
+    @staticmethod
+    def _read_metroman(ds):
+        return {
+            "q": ds["average"]["allq"][:].filled(np.nan),
+            "na": ds["average"]["nahat"][:].filled(np.nan),
+            "x1": ds["average"]["x1hat"][:].filled(np.nan),
+            "a0": ds["average"]["A0hat"][:].filled(np.nan),
+        }
+
+    @staticmethod
+    def _read_sic4dvar(ds):
+        return {
+            "q_mm": ds["Q_mm"][:].filled(np.nan),
+            "q": ds["Q_da"][:].filled(np.nan),
+            "n": ds["n"][:].filled(np.nan),
+            "a0": ds["A0"][:].filled(np.nan),
+        }
+
+    def _missing_flpe(self, alg, r_id):
+        entry = {"s1-flpe-exists": False}
+        entry.update({key: np.nan for key in self.FLPE_MISSING_KEYS[alg]})
+        entry["qbar"] = self.sos_dict[str(r_id)]['Qbar']
+        entry["q33"] = self.sos_dict[str(r_id)]['q33']
+        return entry
+
+    def _extract_one_flpe(self, alg, r_id, path, reader):
+        """One algorithm's FLPE record for one reach.
+
+        A file that exists but cannot be read (for example an H2iVDI failure
+        file with no ``reach`` group) is treated exactly like a missing file
+        for that algorithm only.  Previously the exception escaped
+        extract_alg() and run_MOI skipped the whole basin, so enabling one
+        algorithm could remove every other algorithm's MOI output.
         """
+        if not path.exists():
+            return self._missing_flpe(alg, r_id)
+        try:
+            with Dataset(path, 'r', format="NETCDF4") as ds:
+                entry = reader(ds)
+        except Exception as exc:
+            self.flpe_read_failures.append(
+                {"algorithm": alg, "reach_id": str(r_id), "reason": repr(exc)})
+            warnings.warn(f"Unreadable {alg} FLPE file {path}: {exc!r}; "
+                          f"treating {alg} as missing for reach {r_id}")
+            return self._missing_flpe(alg, r_id)
+        return {"s1-flpe-exists": True, **entry}
 
-        # busboi
-        if bb_file.exists():
-            bb = Dataset(bb_file, 'r', format="NETCDF4")
-            try:
-                q = np.array(bb["q"]["q"][:].filled(np.nan))
-            except Exception:
-                q = np.nan
-
-            try:
-                r = np.array(bb["r"]["mean"][:].filled(np.nan))
-            except Exception:
-                try:
-                    r = np.array(bb["r"]["mean"].getValue())
-                except Exception:
-                    r = np.nan
-
-            try:
-                bed = np.array(bb["bed"]["elevation"][:].filled(np.nan))
-            except Exception:
-                bed = np.nan
-
-            try:
-                chainage = np.array(bb["bed"]["chainage"][:].filled(np.nan))
-            except Exception:
-                chainage = np.nan
-
-            try:
-                prior_q = np.array(bb["prior_q"]["q"][:].filled(np.nan))
-            except Exception:
-                prior_q = np.nan
-
-            self.alg_dict["busboi"][r_id] = {
-                "s1-flpe-exists": True,
-                "q": q,
-                "r": r,
-                "bed": bed,
-                "chainage": chainage,
-                "prior_q": prior_q,
-                # placeholders for MOI surrogate BAM-compatible refit
-                "n": np.nan,
-                "a0": np.nan
-            }
-            bb.close()
-
-        else:
-            self.alg_dict["busboi"][r_id] = { 
-                "s1-flpe-exists" : False ,
-                "q" : np.nan,
-                "r" : np.nan,
-                "bed" : np.nan,
-                "chainage" : np.nan,
-                "prior_q" : np.nan,
-                "n" : np.nan,
-                "a0" : np.nan,
-                "qbar" : self.sos_dict[str(r_id)]['Qbar'],
-                "q33" : self.sos_dict[str(r_id)]['q33']
-            }
-
-        # hivdi
-        if hv_file.exists():
-            hv = Dataset(hv_file, 'r', format="NETCDF4")
-            self.alg_dict["hivdi"][r_id] = {
-                "s1-flpe-exists": True,
-                "q" : hv["reach"]["Q"][:].filled(np.nan),
-                "alpha" : hv["reach"]["alpha"][:].filled(np.nan),  
-                "beta" : hv["reach"]["beta"][:].filled(np.nan),  
-                "a0" : hv["reach"]["A0"][:].filled(np.nan)
-            }
-            hv.close()
-        else:
-            self.alg_dict["hivdi"][r_id] = { 
-                "s1-flpe-exists" : False ,
-                "q" : np.nan,
-                "alpha" : np.nan,
-                "beta" : np.nan,
-                "qbar" : self.sos_dict[str(r_id)]['Qbar'],
-                "q33" : self.sos_dict[str(r_id)]['q33']
-            }
-
-        # momma
-        if mo_file.exists():
-            mo = Dataset(mo_file, 'r', format="NETCDF4")
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", category=RuntimeWarning)
-                self.alg_dict["momma"][r_id] = {
-                    "s1-flpe-exists": True,
-                    "q" : mo["Q"][:].filled(np.nan),
-                    "B" : mo["zero_flow_stage"][:].filled(np.nan),
-                    "H" : mo["bankfull_stage"][:].filled(np.nan),                                  
-                    "Save" : np.nanmean(mo["slope"][:].filled(np.nan))
-                }
-            mo.close()
-        else:
-            self.alg_dict["momma"][r_id] = { 
-                "s1-flpe-exists" : False ,
-                "q" : np.nan,
-                "B" : np.nan,
-                "H" : np.nan,
-                "Save" : np.nan,
-                "qbar" : self.sos_dict[str(r_id)]['Qbar'],
-                "q33" : self.sos_dict[str(r_id)]['q33']
-            }
-
-        # sad
-        if sd_file.exists():
-            sd = Dataset(sd_file, 'r', format="NETCDF4")
-            self.alg_dict["sad"][r_id] = {
-                "s1-flpe-exists": True,
-                "q" : sd["Qa"][:].filled(np.nan),
-                "n" : sd["n"][:].filled(np.nan),
-                "a0" : sd["A0"][:].filled(np.nan)
-            }
-            sd.close()
-        else:
-            self.alg_dict["sad"][r_id] = { 
-                "s1-flpe-exists" : False ,
-                "q" : np.nan,
-                "n" : np.nan,
-                "a0" : np.nan,
-                "qbar" : self.sos_dict[str(r_id)]['Qbar'],
-                "q33" : self.sos_dict[str(r_id)]['q33']
-            }
-
-        # metroman    
-        if mm_file.exists():
-            mm = Dataset(mm_file, 'r', format="NETCDF4")
-            # index = np.where(mm["reach_id"][:] == int(r_id))
-            self.alg_dict["metroman"][r_id] = {
-                 "s1-flpe-exists": True,
-                 "q" : mm["average"]["allq"][:].filled(np.nan),
-                 "na" : mm["average"]["nahat"][:].filled(np.nan),
-                 "x1" : mm["average"]["x1hat"][:].filled(np.nan),
-                 "a0" : mm["average"]["A0hat"][:].filled(np.nan)
-            }
-            mm.close()
-            #print('MetroMan file found. ')
-        else:
-            self.alg_dict["metroman"][r_id] = { 
-                "s1-flpe-exists" : False ,
-                "q" : np.nan,
-                "na" : np.nan,
-                "x1" : np.nan,
-                "a0" : np.nan,
-                "qbar" : self.sos_dict[str(r_id)]['Qbar'],
-                "q33" : self.sos_dict[str(r_id)]['q33']
-            }
-            #print('MetroMan file not found. Using prior')
-
-        # sic4dvar
-        if sv_file.exists():
-            sv = Dataset(sv_file, 'r', format="NETCDF4")
-            self.alg_dict["sic4dvar"][r_id] = {
-                #"q31": sv["Qalgo31"][:].filled(np.nan),#unclear which of these to use
-                "s1-flpe-exists": True,
-                "q_mm": sv["Q_mm"][:].filled(np.nan),
-                "q": sv["Q_da"][:].filled(np.nan),
-                # "q5": sv["Qalgo5"][:].filled(np.nan),
-                "n": sv["n"][:].filled(np.nan),
-                "a0": sv["A0"][:].filled(np.nan)
-            }
-            sv.close()
-        else:
-            self.alg_dict["sic4dvar"][r_id] = { 
-                "s1-flpe-exists" : False ,
-                "q_mm": np.nan,
-                "q": np.nan,
-                "n" : np.nan,
-                "a0" : np.nan,
-                "qbar" : self.sos_dict[str(r_id)]['Qbar'],
-                "q33" : self.sos_dict[str(r_id)]['q33']
-            }
+    def __extract_valid(self, r_id, bb_file, hv_file, mo_file, sd_file, mm_file, sv_file):
+        """Extract valid data from the output of each reach-level FLPE alg."""
+        for alg, path, reader in (
+            ("busboi", bb_file, self._read_busboi),
+            ("hivdi", hv_file, self._read_hivdi),
+            ("momma", mo_file, self._read_momma),
+            ("sad", sd_file, self._read_sad),
+            ("metroman", mm_file, self._read_metroman),
+            ("sic4dvar", sv_file, self._read_sic4dvar),
+        ):
+            self.alg_dict[alg][r_id] = self._extract_one_flpe(alg, r_id, path, reader)
 
