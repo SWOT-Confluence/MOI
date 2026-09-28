@@ -2,12 +2,10 @@
 import warnings
 import sys
 import datetime
-import csv
 import copy
 
 # Third-party imports
 import numpy as np
-import pandas as pd
 from scipy import optimize
 import scipy.sparse as sp
 
@@ -250,10 +248,6 @@ class Integrate:
         if self.VerboseFlag:
             print(f'Prepared {len(self.gage_dict)} independent gage constraints')
 
-    def get_gage_mean_q(self):
-        """Backward-compatible alias for the new independent-gage preparation."""
-        self.prepare_gage_constraints()
-
     def build_gage_observation_rows(self, problem, FlowLevel):
         """Build H_g rows selecting physical Q states for gage flow statistics."""
         nvar = problem['A_obs'].shape[1]
@@ -439,22 +433,6 @@ class Integrate:
                        + ', '.join(r['missing_from_sword'][:10])
                        + (' ...' if len(r['missing_from_sword']) > 10 else ''))
 
-
-    def calcG(self, m, n):
-        G = np.zeros((m, n))
-        for junction in self.junctions:
-            row = junction['row_num']
-            for upflow in junction['upflows']:
-                try:
-                     kup = self.basin_dict['reach_ids_all'].index(str(upflow))
-                     G[row, kup] = 1
-                except ValueError: pass
-            for downflow in junction['downflows']:
-                try:
-                     kdn = self.basin_dict['reach_ids_all'].index(str(downflow))
-                     G[row, kdn] = -1
-                except ValueError: pass
-        return G
 
     def _summary(self, name, values):
         arr = np.asarray(values, dtype=float).ravel()
@@ -1544,56 +1522,6 @@ class Integrate:
         if penalty is not None:
             y *= penalty(params)
         return y
-
-    def flp_objective(self, alg, reach, flowlaw, moment_objfun, moment_args,
-                      extra=(), penalty=None):
-        """(fun, args) for optimize.minimize.
-
-        Fit the flow law to the integrator hydrograph where we have one; fall
-        back to the old qbar/q33 moment match where we do not, or wherever
-        FLP_Fit_Method is set to 'moments'.  Combined with
-        Integrator_Hydrograph_Method, that lets one build reproduce every
-        combination of old and new behaviour without a rebuild.
-        """
-        if self.params_dict.get('FLP_Fit_Method', 'series') != 'series':
-            return moment_objfun, moment_args
-        q_target = self.flp_fit_target(alg, reach)
-        if q_target is None:
-            return moment_objfun, moment_args
-        return (self.flp_series_objfun,
-                (self.obs_dict[reach], flowlaw, q_target, extra, penalty))
-
-    def flp_fit_diagnostic(self, alg, reach, params, flowlaw, extra=()):
-        """Store how well the refitted flow law reproduces the hydrograph.
-
-        nRMSE against the stored hydrograph, normalised by its mean.  Left as
-        NaN when there was no series to fit, so a fill value in the output also
-        marks a reach that fell back to the flow-law hydrograph.
-        """
-        integ = self.alg_dict[alg][reach].setdefault('integrator', {})
-        integ.setdefault('flp_fit_nrmse', np.nan)
-        q_target = self.flp_fit_target(alg, reach)
-        if q_target is None:
-            return
-        try:
-            q = np.asarray(
-                flowlaw(params, self.obs_dict[reach], *extra), dtype=float
-            ).ravel()
-        except Exception:
-            return
-        if q.size != q_target.size:
-            return
-        r = q - q_target
-        good = np.isfinite(r)
-        if not np.any(good):
-            return
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", category=RuntimeWarning)
-            denom = np.nanmean(q_target[good])
-            if np.isfinite(denom) and denom > 0.:
-                integ['flp_fit_nrmse'] = float(
-                    np.sqrt(np.mean(r[good] ** 2)) / denom
-                )
 
     def calc_integrator_hydrographs(self):
         """Build the integrator hydrograph for every observed reach/algorithm.

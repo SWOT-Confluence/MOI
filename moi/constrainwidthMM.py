@@ -9,7 +9,6 @@ Function to constrain widths to hypsometric curve
 """
 
 import numpy as np
-import sys
 
 def ConstrainWidth(h,w,area_fit,nt):
 

@@ -66,13 +66,3 @@ class ErrorStats:
 
         self.n=len(self.Qt)
     
-    def ShowKeyErrorMetrics(self):
-        print('Normalized RMSE:', '%.2f'%self.nRMSE)
-        print('nMAE:', '%.2f'%self.nMAE)        
-        print('r:', '%.2f'%self.r)        
-        print('KGE:', '%.2f'%self.KGE)        
-        print('NSE:', '%.2f'%self.NSE)        
-        print('RMSE/std(Q):', '%.2f'%(self.RMSE/std(self.Qt)))        
-        print('σQ/Q:', '%.2f'%self.stdRelRes)
-        print('nBias', '%.2f'%self.nbias)
-        print('67th percentile absolute error', '%.2f'%self.anr67)

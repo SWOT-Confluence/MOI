@@ -3,7 +3,7 @@ from datetime import datetime
 from pathlib import Path
 import time
 import random
-import os, sys
+import os
 import warnings
 
 # Third-party imports

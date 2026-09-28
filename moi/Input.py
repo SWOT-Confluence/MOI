@@ -1,12 +1,9 @@
 # Standard imports
-from glob import glob
 from pathlib import Path
 import csv
 import datetime
 import json
 import warnings
-import os
-import sys
 from moi.constrainwidthMM import ConstrainWidth
 
 try:
@@ -642,51 +639,6 @@ class Input:
         sword_dataset.close()
         
     
-    def extract_sword_gpkg(self):
-        swordfile = self.sword_dir.joinpath(self.basin_dict['sword']) 
-
-        if gpd is None:
-            raise RuntimeError('geopandas is required to read a SWORD GeoPackage')
-        try:
-            gdf = gpd.read_file(swordfile)
-        except Exception as e:
-            raise RuntimeError(f"Failed to read SWORD gpkg file: {swordfile}. Error: {e}")
-
-        self.sword_dict = {}
-
-        self.sword_dict['num_reaches'] = len(gdf)
-
-        self.sword_dict['reach_id'] = gdf['reach_id'].values
-        self.sword_dict['facc'] = gdf['facc'].to_numpy(dtype=float, na_value=np.nan)
-        self.sword_dict['n_rch_up'] = gdf['n_rch_up'].values
-        self.sword_dict['n_rch_down'] = gdf['n_rch_down'].values
-        self.sword_dict['swot_obs'] = gdf['swot_obs'].values
-
-        if 'facc_quality' in gdf.columns:
-            self.sword_dict['facc_quality'] = (
-                gdf['facc_quality'].fillna(-9999).astype(np.int32).values
-            )
-
-        self.sword_dict['width'] = gdf['width'].fillna(0).values 
-
-        rch_id_up = np.zeros((4, len(gdf)), dtype=np.int64)
-        rch_id_dn = np.zeros((4, len(gdf)), dtype=np.int64)
-
-        for i in range(1, 5):
-            up_col = f'rch_id_up_{i}'
-            dn_col = f'rch_id_dn_{i}'
-
-            if up_col in gdf.columns:
-                rch_id_up[i-1, :] = gdf[up_col].fillna(0).astype(np.int64).values
-            if dn_col in gdf.columns:
-                rch_id_dn[i-1, :] = gdf[dn_col].fillna(0).astype(np.int64).values
-
-        self.sword_dict['rch_id_up'] = rch_id_up
-        self.sword_dict['rch_id_dn'] = rch_id_dn
-
-        self.sword_dict['swot_orbits'] = np.zeros((1, len(gdf)))
-        
-        
     def extract_swot(self):
         self.obs_dict = {}
 
@@ -999,106 +951,3 @@ class Input:
                 "q33" : self.sos_dict[str(r_id)]['q33']
             }
 
-    def __indicate_no_data(self, r_id):
-        """Indicate no data is available for the reach.
-        TODO: Metroman results
-        Parameters
-        ----------
-        r_id: str
-            Unique reach identifier
-        """
-
-        self.alg_dict["busboi"][r_id] = {
-            "q": np.nan,
-            "r": np.nan,
-            "bed": np.nan,
-            "chainage": np.nan,
-            "prior_q": np.nan,
-            "n": np.nan,
-            "a0": np.nan
-        }
-
-        # hivdi
-        self.alg_dict["hivdi"][r_id] = {
-            "q" : np.nan,
-            "alpha" : np.nan,  
-            "beta" : np.nan,  
-            "a0" : np.nan
-        }
-
-        # momma
-        self.alg_dict["momma"][r_id] = {
-            "q" : np.nan,
-            "B" : np.nan,
-            "H" : np.nan,
-            "Save" : np.nan
-        }
-
-        # sad
-        self.alg_dict["sad"][r_id] = {
-            "q" : np.nan,
-            "n" : np.nan,
-            "a0" : np.nan
-        }
-
-        # metroman    
-        self.alg_dict["metroman"][r_id] = {
-             "q" : np.nan,
-             "na" : np.nan,
-             "x1" : np.nan,
-             "a0" : np.nan
-        }
-
-        # sic4dvar
-        self.alg_dict["sic4dvar"][r_id] = {
-            "q_mm": np.nan,
-            "q": np.nan,
-            "n": np.nan,
-            "a0": np.nan
-        }
-
-    def __get_gb_data(self, gb,group, pre, logged):
-        """Return legacy neoBAM data as a numpy array.
-        
-        Parameters
-        ----------
-        gb: netCDF4.Dataset
-            NetCDF file dataset to extract discharge time series
-        group: str
-            string name of group to access chains
-        pre: str
-            string prefix of variable name
-        logged: bool
-            boolean indicating if result is logged
-        """
-
-        variables = gb[group].variables
-        if pre in variables:
-            q = variables[pre][:]
-            q = q.filled(np.nan) if hasattr(q, 'filled') else np.asarray(q)
-        else:
-            chain_names = [
-                f'{pre}{chain_number}'
-                for chain_number in range(1, 4)
-                if f'{pre}{chain_number}' in variables
-            ]
-            if not chain_names:
-                raise KeyError(
-                    f'No variable {pre!r} or chain variables {pre!r}1..3 '
-                    f'in NetCDF group {group!r}'
-                )
-            chains = []
-            for name in chain_names:
-                values = variables[name][:]
-                if hasattr(values, 'filled'):
-                    values = values.filled(np.nan)
-                chains.append(np.asarray(values, dtype=float))
-            q = np.vstack(chains)
-
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", category=RuntimeWarning)
-            mean_q = np.nanmean(q, axis=0) if np.ndim(q) > 1 else np.asarray(q)
-            if logged:
-                return np.exp(mean_q)
-            else:
-                return mean_q

@@ -23,7 +23,7 @@ The solver implements:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import scipy.sparse as sp
@@ -72,49 +72,6 @@ class SparseSFOIResult:
 # -----------------------------------------------------------------------------
 # Backward-compatible helpers retained from the old core
 # -----------------------------------------------------------------------------
-
-def calcG_sparse(m, n, junctions, basin_dict, reachlist='reach_ids_all'):
-    rows, cols, data = [], [], []
-    reach_map = {str(r): i for i, r in enumerate(basin_dict[reachlist])}
-
-    for junction in junctions:
-        row = junction['row_num']
-        for upflow in junction['upflows']:
-            if str(upflow) in reach_map:
-                rows.append(row)
-                cols.append(reach_map[str(upflow)])
-                data.append(1.0)
-        for downflow in junction['downflows']:
-            if str(downflow) in reach_map:
-                rows.append(row)
-                cols.append(reach_map[str(downflow)])
-                data.append(-1.0)
-    return sp.csr_matrix((data, (rows, cols)), shape=(m, n))
-
-
-def getA_sparse(C_sparse, n, D, l):
-    I_n = sp.eye(n, format='csr')
-    A = sp.bmat([[C_sparse], [I_n]], format='csr')
-    A_lil = A.tolil()
-    Dind = np.array([D[l + i] for i in range(n)])
-
-    for i in range(l):
-        nonzero_cols = A_lil.rows[i]
-        if not nonzero_cols:
-            continue
-        sum_Dind = np.sum(Dind[nonzero_cols])
-        if sum_Dind > 0:
-            scale = D[i] / sum_Dind
-            for idx in range(len(nonzero_cols)):
-                A_lil.data[i][idx] *= scale
-    return A_lil.tocsr()
-
-
-def getP_1D(covQ, Qbar, norm=2):
-    sigma_q = np.abs(np.array(Qbar, dtype=float)) * covQ
-    sigma_q = np.clip(sigma_q, 1e-6, np.inf)
-    return 1.0 / (sigma_q ** norm), 1.0 / (sigma_q ** (norm / 2.0))
-
 
 # -----------------------------------------------------------------------------
 # Sparse SFOI problem construction
@@ -556,32 +513,6 @@ def _solve_wls_sparse(
     raise RuntimeError(f'Sparse WLS solver failed. Last error: {last_error}')
 
 
-def adjust_lsq_sparse(
-    A_sparse,
-    W_1d,
-    L,
-    o=1,
-    bound=True,
-    idxbad=None,
-    A_eq=None,
-    b_eq=None,
-    lb=None,
-    ub=None,
-):
-    """Backward-compatible sparse WLS wrapper.
-
-    Old calls solve min ||W(Ax-L)||^2 with optional Ax>=0. New calls may pass
-    A_eq/lb/ub to solve the rebuilt sparse SFOI problem.
-    """
-    if lb is None and bound:
-        lb = np.zeros(A_sparse.shape[1], dtype=float)
-    if idxbad is not None:
-        W_1d = np.asarray(W_1d, dtype=float).copy()
-        W_1d[idxbad] = _W_MIN
-    x, status = _solve_wls_sparse(A_sparse, L, W_1d, A_eq=A_eq, b_eq=b_eq, lb=lb, ub=ub)
-    return x, status
-
-
 def robust_inner_loop_sparse(
     A_obs: sp.spmatrix,
     L: np.ndarray,
@@ -690,30 +621,6 @@ def robust_inner_loop_sparse(
         raise RuntimeError('robust_inner_loop_sparse failed before producing a solution')
 
     return x_best, P, V_best, So_best, good, W, status_best, iters
-
-
-def adjust_lsq_sparse_irls(
-    A_sparse,
-    W_1d,
-    L,
-    o=1,
-    bound=True,
-    idxbad=None,
-    itermax=15,
-    limit=2.5,
-    A_eq=None,
-    b_eq=None,
-    lb=None,
-    ub=None,
-):
-    """Backward-compatible IRLS wrapper returning x and status."""
-    if lb is None and bound:
-        lb = np.zeros(A_sparse.shape[1], dtype=float)
-    x, P, V, So, index, W, status, _ = robust_inner_loop_sparse(
-        A_sparse, L, W_1d, A_eq=A_eq, b_eq=b_eq, lb=lb, ub=ub,
-        idxbad=idxbad, itermax=itermax, limit=limit,
-    )
-    return x, status
 
 
 def adjust_lsq_mult_sparse(
@@ -1747,17 +1654,3 @@ def estimate_q_uncertainty_rel(
 
 
 # Old strict-mass function retained for imports/backward compatibility only.
-def adjust_lsq_sparse_strict_mass(A_sparse, W_1d, L, n_mass_rows, bound=True):
-    mA, nA = A_sparse.shape
-    n_prior_rows = mA - n_mass_rows
-    A_prior = A_sparse[:n_prior_rows, :]
-    A_mass = A_sparse[n_prior_rows:, :]
-    W_prior = np.asarray(W_1d[:n_prior_rows], dtype=float)
-    L_prior = np.asarray(L[:n_prior_rows], dtype=float)
-    lb = np.zeros(nA) if bound else None
-    try:
-        x, status = _solve_wls_sparse(A_prior, L_prior, W_prior, A_eq=A_mass, b_eq=np.zeros(A_mass.shape[0]), lb=lb)
-        return x, status
-    except Exception as exc:
-        print(f'      [Strict Mass Solver] failed: {exc}')
-        return None, 'failed'

@@ -37,7 +37,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import numpy as np
 
-from moi.FlowLaws import MWAPN, MWACN, MWHFN
+from moi.FlowLaws import MWHFN
 from moi.Domain import Domain
 from moi.FlowLawCalibration import FlowLawCalibration
 
