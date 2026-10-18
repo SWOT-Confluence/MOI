@@ -12,9 +12,11 @@ those directly keeps the test independent of SoS, SWORD and netCDF.
 
 import numpy as np
 import pytest
+from netCDF4 import Dataset
 
 from moi import flp_fit
 from moi.Integrate import Integrate
+from moi.Output import Output
 
 ALGS = ('busboi', 'hivdi', 'metroman', 'momma', 'sad', 'sic4dvar')
 
@@ -24,6 +26,7 @@ def make_obs(nt=40, seed=5, constant_da=False):
     dA = np.zeros(nt) if constant_da else np.sort(rng.normal(0., 150., nt))
     return {
         'nt': nt,
+        'nt_full': nt,
         'dA': dA,
         'w': 180. + rng.normal(0., 8., nt),
         'S': np.full(nt, 1.2e-4),
@@ -90,6 +93,24 @@ def run(integrator):
     integrator.compute_FLPs()
 
 
+def drop_geometry_steps(integrator, reach, indices):
+    """Apply extract_swot()'s common-geometry deletion to a test record."""
+    obs = integrator.obs_dict[reach]
+    nt_full = int(obs.get('nt_full', obs['nt']))
+    indices = np.asarray(indices, dtype=int).ravel()
+    assert np.unique(indices).size == indices.size
+    assert np.all((indices >= 0) & (indices < nt_full))
+
+    for key in ('dA', 'w', 'S', 'h', 't', 'reach_q', 'xovr_cal_q',
+                'flowlaw_valid', 'flowlaw_valid_da'):
+        obs[key] = np.delete(obs[key], indices)
+    obs['iDelete'] = (indices,)
+    obs['nt'] = nt_full - indices.size
+    obs['nt_full'] = nt_full
+    if obs['nt'] == 0:
+        obs['geometry_status'] = 'too_few_obs'
+
+
 # ---------------------------------------------------------------------------
 
 def test_every_algorithm_produces_a_labelled_fit():
@@ -105,6 +126,8 @@ def test_every_algorithm_produces_a_labelled_fit():
         assert integ['qbar_source'] == 'FLPE', alg
         assert integ['q33_source'] == 'FLPE', alg
         assert integ['rescale_method'] == 'mean', alg
+        assert integ['rescale_failure_reason'] == 'none', alg
+        assert integ['rescale_input_grid'] == 'full_record', alg
         assert np.isfinite(integ['rescale_factor']), alg
 
 
@@ -120,14 +143,166 @@ def test_parameters_land_under_the_expected_names():
     assert np.isfinite(integrator.alg_dict['momma'][reach]['integrator']['Save'])
 
 
-def test_rescaled_hydrograph_hits_the_integrated_mean():
+def test_full_record_rescaled_hydrograph_hits_the_integrated_mean():
+    """The integrated mean belongs to q_full, not a filtered FLP subset."""
     integrator, reach = make_integrator(qbar=250.)
     run(integrator)
 
     for alg in ALGS:
         integ = integrator.alg_dict[alg][reach]['integrator']
         assert integ['q_source'] == 'rescaled', alg
-        assert float(np.nanmean(integ['q'])) == pytest.approx(250., rel=1e-10)
+        assert float(np.nanmean(integ['q_full'])) == pytest.approx(
+            250., rel=1e-10)
+
+
+def test_rescale_keeps_full_q_and_subsets_once_for_flp_fit():
+    integrator, reach = make_integrator(qbar=250.)
+    deleted = np.array([3, 7, 11])
+    raw = integrator.alg_dict['busboi'][reach]['q'].copy()
+    expected_full = raw * (250. / np.nanmean(raw))
+    drop_geometry_steps(integrator, reach, deleted)
+
+    integrator.calc_integrator_hydrographs()
+
+    for alg in ALGS:
+        integ = integrator.alg_dict[alg][reach]['integrator']
+        np.testing.assert_allclose(integ['q_full'][0], expected_full)
+        np.testing.assert_allclose(integ['q'][0],
+                                   np.delete(expected_full, deleted))
+        assert np.nanmean(integ['q_full']) == pytest.approx(250.)
+        np.testing.assert_allclose(
+            integrator.flp_fit_target(alg, reach), integ['q'][0])
+
+    integrator.compute_FLPs()
+    for alg in ALGS:
+        integ = integrator.alg_dict[alg][reach]['integrator']
+        np.testing.assert_allclose(integ['q_full'][0], expected_full)
+        np.testing.assert_allclose(integ['q'][0],
+                                   np.delete(expected_full, deleted))
+    assert integrator.run_report()['n_hydrograph_repairs'] == 0
+
+
+def test_rescale_survives_zero_valid_geometry_and_masks_only_flps():
+    integrator, reach = make_integrator(qbar=250.)
+    raw = integrator.alg_dict['sic4dvar'][reach]['q'].copy()
+    expected_full = raw * (250. / np.nanmean(raw))
+    drop_geometry_steps(integrator, reach, np.arange(raw.size))
+
+    run(integrator)
+
+    for alg in ALGS:
+        integ = integrator.alg_dict[alg][reach]['integrator']
+        assert integ['q_source'] == 'rescaled', alg
+        assert integ['q'].shape == (1, 0), alg
+        assert integ['q_full'].shape == (1, raw.size), alg
+        np.testing.assert_allclose(integ['q_full'][0], expected_full)
+        assert np.nanmean(integ['q_full']) == pytest.approx(250.)
+        assert integ['flp_fit_status'] == flp_fit.FIT_NO_SERIES
+        assert integ['flp_exported'] == 0
+        assert (integ['flp_export_reason']
+                == flp_fit.EXPORT_REASON_NO_GEOMETRY)
+        assert all(np.isnan(integ[key])
+                   for key in Integrate.FLP_PARAM_KEYS[alg])
+    report = integrator.run_report()
+    assert report['n_hydrograph_repairs'] == 0
+    for alg in ALGS:
+        assert report['flp_unavailable'][alg] == {
+            flp_fit.EXPORT_REASON_NO_GEOMETRY: 1}
+        assert alg not in report['flp_export_coverage']
+
+
+def test_rescale_rejects_unalignable_length_and_clears_stale_q_full():
+    integrator, reach = make_integrator()
+    drop_geometry_steps(integrator, reach, [3, 7])
+    integrator.calc_integrator_hydrographs()
+    integ = integrator.alg_dict['busboi'][reach]['integrator']
+    assert 'q_full' in integ
+
+    # Neither the 40-step full grid nor the 38-step fit grid.
+    integrator.alg_dict['busboi'][reach]['q'] = np.arange(39., dtype=float)
+    integrator.calc_integrator_hydrographs()
+
+    assert integ['q_source'] == 'flowlaw'
+    assert integ['rescale_failure_reason'] == 'length_mismatch'
+    assert 'q_full' not in integ
+
+
+def test_rescale_rejects_fit_grid_only_flpe_input():
+    """A reduced series cannot prove alignment to the deleted timestamps."""
+    integrator, reach = make_integrator()
+    deleted = np.array([3, 7])
+    drop_geometry_steps(integrator, reach, deleted)
+    entry = integrator.alg_dict['busboi'][reach]
+    entry['q'] = np.delete(entry['q'], deleted)
+
+    integrator.calc_integrator_hydrographs()
+
+    integ = entry['integrator']
+    assert integ['q_source'] == 'flowlaw'
+    assert integ['rescale_failure_reason'] == 'length_mismatch'
+    assert 'q_full' not in integ
+
+
+def test_invalid_geometry_index_map_does_not_crash_rescaling():
+    integrator, reach = make_integrator()
+    obs = integrator.obs_dict[reach]
+    obs['iDelete'] = (np.array([3, 40]),)
+    obs['nt'] = 38
+
+    assert integrator.rescaled_flpe_hydrograph('busboi', reach) is None
+    integ = integrator.alg_dict['busboi'][reach]['integrator']
+    assert integ['rescale_failure_reason'] == 'invalid_geometry_index_map'
+
+
+def test_mixed_rescaled_and_flowlaw_hydrographs_reach_output(tmp_path):
+    """Integrate -> Output preserves full Q only for rescaled algorithms."""
+    integrator, reach = make_integrator(qbar=250.)
+    deleted = np.array([3, 7, 11])
+    retained_nan = 5
+    for alg in ALGS:
+        integrator.alg_dict[alg][reach]['q'][retained_nan] = np.nan
+
+    # Simulate one unreadable/missing reach-scale FLPE algorithm.  It must use
+    # the fitted flow law and therefore cannot reconstruct deleted geometry.
+    integrator.alg_dict['hivdi'][reach]['qbar_source'] = 'Prior'
+    drop_geometry_steps(integrator, reach, deleted)
+    obs = integrator.obs_dict[reach]
+    obs['time_str'] = np.asarray(
+        [f'2024-01-{index + 1:02d}T00:00:00Z'
+         for index in range(obs['nt_full'])], dtype=str)
+    obs['time_str_source'] = 'synthetic test record'
+
+    run(integrator)
+
+    writer = Output(
+        basin_dict=integrator.basin_dict,
+        out_dir=tmp_path,
+        integ_dict={},
+        alg_dict=integrator.alg_dict,
+        obs_dict=integrator.obs_dict,
+        sword_dir=tmp_path,
+        params_dict={**integrator.params_dict, 'write_fill_only': False},
+    )
+    writer.write_output()
+
+    rescaled = set(ALGS) - {'hivdi'}
+    with Dataset(tmp_path / f'{reach}_integrator.nc') as dataset:
+        for alg in rescaled:
+            group = dataset.groups[alg]
+            q = group.variables['q'][:]
+            q_mask = np.ma.getmaskarray(q)
+            assert not q_mask[deleted].any(), alg
+            assert q_mask[retained_nan], alg
+            assert float(np.ma.mean(q)) == pytest.approx(250.), alg
+
+            q_flowlaw = group.variables['q_flowlaw'][:]
+            assert np.ma.getmaskarray(q_flowlaw)[deleted].all(), alg
+
+        hivdi_q = dataset.groups['hivdi'].variables['q'][:]
+        assert np.ma.getmaskarray(hivdi_q)[deleted].all()
+        assert dataset.groups['hivdi'].hydrograph_source == 'flowlaw'
+
+    assert writer.q_shape_repairs == []
 
 
 def test_diagnostics_are_recorded_for_every_reach():
@@ -268,13 +443,16 @@ def test_legacy_momma_paths_accept_a_negative_stage(params):
 def test_powerlaw_rescale_matches_mean_and_q33():
     integrator, reach = make_integrator(
         qbar=250., q33=170., params={'Rescale_Transform': 'powerlaw'})
+    deleted = np.array([3, 7, 11])
+    drop_geometry_steps(integrator, reach, deleted)
     run(integrator)
 
     integ = integrator.alg_dict['busboi'][reach]['integrator']
     assert integ['rescale_method'] == 'powerlaw'
-    q = np.asarray(integ['q'], dtype=float).ravel()
-    assert float(np.mean(q)) == pytest.approx(250., rel=1e-6)
-    assert float(np.quantile(q, 0.33)) == pytest.approx(170., rel=1e-4)
+    q_full = np.asarray(integ['q_full'], dtype=float).ravel()
+    assert float(np.mean(q_full)) == pytest.approx(250., rel=1e-6)
+    assert float(np.quantile(q_full, 0.33)) == pytest.approx(170., rel=1e-4)
+    np.testing.assert_allclose(integ['q'][0], np.delete(q_full, deleted))
 
 
 def test_log_space_objective_runs_and_changes_the_fit():
@@ -321,6 +499,30 @@ def test_one_broken_reach_does_not_take_down_the_algorithm():
         assert 'flp_fit_status' in integrator.alg_dict[alg][good]['integrator'], alg
         assert np.isfinite(
             integrator.alg_dict[alg][good]['integrator']['flp_fit_nrmse']), alg
+
+
+def test_store_failure_masks_export_but_keeps_current_candidate_params():
+    integrator, reach = make_integrator()
+    original = integrator._store_flp_result
+
+    def fail_busboi_store(alg, current_reach, spec, outcome):
+        if alg == 'busboi':
+            raise RuntimeError('synthetic store failure')
+        return original(alg, current_reach, spec, outcome)
+
+    integrator._store_flp_result = fail_busboi_store
+    run(integrator)
+
+    integ = integrator.alg_dict['busboi'][reach]['integrator']
+    assert integ['flp_fit_status'] == flp_fit.FIT_FAILED
+    assert integ['flp_exported'] == 0
+    assert integ['flp_export_reason'] == flp_fit.EXPORT_REASON_FIT_FAILED
+    for key in Integrate.FLP_PARAM_KEYS['busboi']:
+        assert np.isnan(integ[key])
+        assert np.isfinite(integ['flp_candidate_' + key])
+    coverage = integrator.run_report()['flp_export_coverage']['busboi']
+    assert coverage['candidates'] == 1
+    assert coverage['masked'] == {flp_fit.EXPORT_REASON_FIT_FAILED: 1}
 
 
 # ---------------------------------------------------------------------------

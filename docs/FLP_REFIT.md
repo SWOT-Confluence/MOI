@@ -131,16 +131,36 @@ the optimiser. Run this before spending more on either.
 
 ## The hydrograph shape contract
 
-`integrator['q']` is **always `(1, nt_valid)`** — a row, never a 1-D series,
-for every algorithm and every reach, whether the hydrograph came from the
-rescale path or from the refitted flow law.
+MOI keeps two explicit hydrograph grids:
+
+- `integrator['q']` is **always `(1, nt_valid)`** — a row on the
+  geometry-filtered grid used by FLP fitting.
+- When a reach-scale FLPE series is available on the original SWOT record,
+  `integrator['q_full']` is **always `(1, nt_full)`**. It is rescaled on that
+  complete record and becomes the public NetCDF `q`.
+
+`q_full` is transformed once and `q` is obtained by deleting `iDelete` from
+that transformed result. They must never be scaled independently. Geometry
+gaps therefore affect the exported FLPs and `q_flowlaw`, but do not erase a
+valid FLPE discharge observation from the primary MOI hydrograph.
+
+The scaling target applies to the public grid:
+`nanmean(q_full) == qbar_basinScale`. The filtered FLP target `q` is not
+renormalised after `iDelete`, so its mean can differ when geometry availability
+is correlated with discharge. Consequently this fix can change values at the
+retained timestamps as well as restoring values at deleted timestamps. Compare
+L2 and MOI only on a common timestamp mask.
+
+FLPE discharge must have exactly `nt_full` values. A legacy fit-grid-only
+series is rejected with `rescale_failure_reason=length_mismatch` and falls back
+to the flow law because its missing timestamp alignment cannot be proven.
 
 This was never written down, but the pipeline depended on it:
-`Output.write_output` re-inserts the timesteps `extract_swot()` dropped with
-`np.insert(q, iInsert, fillvalue, 1)`, which raises `AxisError` on a 1-D array —
-and that raise kills `write_output` for the **entire basin**, all six algorithms
-and every reach, over one malformed hydrograph. It held only by accident,
-because each `*_flowlaw` happens to end with `np.reshape(q, (1, nt))`.
+For a rescaled FLPE hydrograph, `Output.write_output` writes `q_full` directly.
+For a flow-law fallback and for `q_flowlaw`, it re-inserts the timesteps
+`extract_swot()` dropped with `np.insert(q, iInsert, fillvalue, 1)`. That call
+raises `AxisError` on a 1-D array and can kill output for the **entire basin**,
+so reduced-grid arrays must still keep the row-shape contract.
 
 It is now explicit in three places:
 
@@ -148,8 +168,10 @@ It is now explicit in three places:
   series or a row, pads or truncates to `nt`, and never raises.
 - `compute_FLPs()` stores through it and normalises every reach again at the
   end, counting any length repair into `run_report()['n_hydrograph_repairs']`.
-- `Output._expand_q_to_full_record()` accepts either shape and repairs a wrong
-  length rather than raising, recording it in `Output.q_shape_repairs`. It uses
+- `Output._expand_q_to_full_record()` prefers a correctly sized `q_full` for
+  primary rescaled discharge; otherwise it accepts either reduced-grid shape
+  and repairs a wrong length rather than raising, recording it in
+  `Output.q_shape_repairs`. It uses
   a **local** `Output._as_row`, deliberately duplicated rather than imported:
   Output.py is the last-mile stage, where a failed import or attribute lookup
   costs an entire basin every output file. It had no dependency on

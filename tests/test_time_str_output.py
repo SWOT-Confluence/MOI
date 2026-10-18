@@ -108,6 +108,7 @@ def test_extract_swot_keeps_full_time_strings_across_qc_deletions(tmp_path):
     input_obj.extract_swot()
 
     assert input_obj.obs_dict[reach]['nt'] == 2
+    assert input_obj.obs_dict[reach]['nt_full'] == 3
     np.testing.assert_array_equal(
         input_obj.obs_dict[reach]['time_str'],
         TIME_STRINGS,
@@ -144,3 +145,59 @@ def test_output_writes_root_time_str_aligned_with_restored_q_axis(tmp_path):
         q = dataset.groups['metroman'].variables['q'][:]
         np.testing.assert_allclose(q[[0, 2]], [10.0, 30.0])
         assert np.ma.getmaskarray(q)[1]
+
+
+def test_output_preserves_full_q_when_all_geometry_is_missing(tmp_path):
+    reach = '1001'
+    obs_dict = {
+        reach: {
+            'nt': 0,
+            'nt_full': 3,
+            'iDelete': (np.asarray([0, 1, 2]),),
+            'time_str': TIME_STRINGS.copy(),
+            'time_str_source': 'SWOT reach/time_str',
+        }
+    }
+    alg_dict = _algorithm_data(reach)
+    expected = np.asarray([[40., 80., 120.]])
+    for algorithm in alg_dict.values():
+        integ = algorithm[reach]['integrator']
+        integ['q'] = np.empty((1, 0))
+        integ['q_full'] = expected.copy()
+        integ['q_source'] = 'rescaled'
+        integ['flp_exported'] = 0
+        integ['flp_export_reason'] = 'no_usable_geometry'
+        integ['flp_fit_status'] = 'no_series'
+    for key in ('n', 'a0'):
+        alg_dict['sic4dvar'][reach]['integrator'][key] = np.nan
+
+    writer = Output(
+        basin_dict={'reach_ids': [reach], 'reach_ids_all': [reach]},
+        out_dir=tmp_path,
+        integ_dict={},
+        alg_dict=alg_dict,
+        obs_dict=obs_dict,
+        sword_dir=tmp_path,
+        params_dict={'write_fill_only': False},
+    )
+
+    # Writing twice must not re-insert the deleted time steps a second time.
+    writer.write_output()
+    writer.write_output()
+
+    with Dataset(tmp_path / f'{reach}_integrator.nc', 'r') as dataset:
+        assert len(dataset.dimensions['nt']) == 3
+        assert dataset.variables['time_str'][:].tolist() == TIME_STRINGS.tolist()
+        sic = dataset.groups['sic4dvar']
+        np.testing.assert_allclose(sic.variables['q'][:], expected[0])
+        assert np.ma.getmaskarray(sic.variables['n'][:]).all()
+        assert np.ma.getmaskarray(sic.variables['a0'][:]).all()
+        assert int(sic.variables['flp_exported'][:]) == 0
+        assert sic.flp_export_reason == 'no_usable_geometry'
+
+    # A fill-only run must not leak the preferred q_full array.
+    writer.params_dict['write_fill_only'] = True
+    writer.write_output()
+    with Dataset(tmp_path / f'{reach}_integrator.nc', 'r') as dataset:
+        assert np.ma.getmaskarray(
+            dataset.groups['sic4dvar'].variables['q'][:]).all()

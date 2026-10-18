@@ -57,6 +57,7 @@ class Integrate:
         # went wrong and how, without anyone re-reading stdout for a traceback.
         self.topology_report = {}
         self.flp_fit_report = {}
+        self.flp_unavailable_report = {}
         self.unconverged_solves = []
         self.flp_hydrograph_repairs = 0
         
@@ -1552,9 +1553,11 @@ class Integrate:
         as 'flowlaw' -- discards that shape, because the FLP fit only ever
         constrained two moments of the series.
 
-        Arrays are (1, obs_dict[reach]['nt']), i.e. on the valid-timestep grid,
-        exactly like the flow-law hydrographs they replace.  write_output()
-        re-inserts the deleted timesteps, so nothing downstream changes.
+        ``integrator['q']`` remains on the valid-geometry fitting grid so the
+        FLP code keeps its existing shape contract.  When the FLPE input is on
+        the complete SWOT record, ``integrator['q_full']`` stores the same
+        transform on that full record for the public MOI output.  Geometry
+        gaps therefore limit the FLP fit without erasing valid FLPE discharge.
 
         Reaches this cannot serve keep q_source == 'flowlaw' and are filled in
         by compute_FLPs() from the refitted flow law, as before.
@@ -1568,14 +1571,25 @@ class Integrate:
         for alg in self.alg_dict:
             for reach in self.alg_dict[alg]:
                 integ = self.alg_dict[alg][reach].setdefault('integrator', {})
+                # calc_integrator_hydrographs() may be called more than once in
+                # tests or diagnostics.  Never retain a full record from an
+                # earlier call that falls back to the flow law this time.
+                for key in ('q_full', 'rescale_method', 'rescale_a',
+                            'rescale_b', 'rescale_factor',
+                            'rescale_failure_reason', 'rescale_input_grid'):
+                    integ.pop(key, None)
                 integ['q_source'] = 'flowlaw'
                 if not use_rescale:
+                    integ['rescale_failure_reason'] = 'disabled'
                     continue
-                q = self.rescaled_flpe_hydrograph(alg, reach)
-                if q is None:
+                result = self.rescaled_flpe_hydrograph(alg, reach)
+                if result is None:
                     n_flowlaw += 1
                     continue
-                integ['q'] = q
+                q_fit, q_full = result
+                integ['q'] = q_fit
+                if q_full is not None:
+                    integ['q_full'] = q_full
                 integ['q_source'] = 'rescaled'
                 n_rescaled += 1
 
@@ -1584,53 +1598,83 @@ class Integrate:
                   f'{n_flowlaw} left to the flow law')
 
     def rescaled_flpe_hydrograph(self, alg, reach):
-        """FLPE hydrograph rescaled to the integrated mean, or None."""
+        """Return ``(q_fit, q_full)`` after one FLPE transform, or None.
+
+        ``q_fit`` is aligned with the geometry-filtered observations used for
+        FLP fitting.  ``q_full`` is aligned with the original SWOT record and
+        is what Output writes as the primary MOI hydrograph.  The input must be
+        on the full record: a fit-grid-only series cannot prove its timestamp
+        alignment or restore the observations removed for missing geometry.
+        """
         if reach not in self.basin_dict['reach_ids']:
             return None
         obs = self.obs_dict.get(reach)
         if not obs:
             return None
-        nt_valid = int(obs['nt'])
-        if nt_valid < 1:
+        nt_fit = int(obs['nt'])
+        if nt_fit < 0:
             return None
 
         reach_data = self.alg_dict[alg][reach]
+        integ = reach_data.setdefault('integrator', {})
 
         # get_pre_mean_q() substitutes the SoS prior into reach_data['qbar']
         # when the algorithm produced nothing.  Rescaling by that is meaningless
         # -- the numerator would be an all-NaN placeholder anyway.
         if reach_data.get('qbar_source') != 'FLPE':
+            integ['rescale_failure_reason'] = 'no_flpe_series'
             return None
 
-        qbar_int = reach_data.get('integrator', {}).get('qbar', np.nan)
+        qbar_int = integ.get('qbar', np.nan)
         if not np.isfinite(qbar_int):
+            integ['rescale_failure_reason'] = 'invalid_integrated_qbar'
             return None
 
-        q = np.asarray(reach_data.get('q', np.nan), dtype=float).ravel()
-
-        # FLPE writes results on the full SWOT record; extract_swot() dropped
-        # the timesteps with fill geometry, so drop the same ones here.
-        nDelete = int(np.shape(obs['iDelete'])[1])
-        if q.size == nt_valid + nDelete and nDelete > 0:
-            q = np.delete(q, np.reshape(obs['iDelete'], (-1,)))
-        if q.size != nt_valid or not np.any(np.isfinite(q)):
+        q_raw = np.asarray(reach_data.get('q', np.nan), dtype=float).ravel()
+        delete_idx = np.asarray(
+            obs.get('iDelete', (np.array([], dtype=int),))[0], dtype=int
+        ).ravel()
+        nt_full = int(obs.get('nt_full', nt_fit + delete_idx.size))
+        if nt_full < nt_fit:
+            integ['rescale_failure_reason'] = 'invalid_time_grid'
             return None
 
-        # Normalise by the mean of the timesteps actually written out, not by
-        # reach_data['qbar'] (the mean over the full record), so that
-        # nanmean(q_out) == qbar_integrator exactly.
+        # Real FLPE files are on the complete SWOT record.  A fit-grid-only
+        # series is rejected even when its length equals nt_fit: without FLPE
+        # timestamps there is no safe way to infer alignment or restore the
+        # deleted observations.  Never silently pad or truncate it.
+        if q_raw.size != nt_full:
+            integ['rescale_failure_reason'] = 'length_mismatch'
+            return None
+        q_scale = q_raw
+        integ['rescale_input_grid'] = 'full_record'
+
+        if (delete_idx.size != nt_full - nt_fit
+                or np.any(delete_idx < 0)
+                or np.any(delete_idx >= nt_full)
+                or np.unique(delete_idx).size != delete_idx.size):
+            integ['rescale_failure_reason'] = 'invalid_geometry_index_map'
+            return None
+
+        if not np.any(np.isfinite(q_scale)):
+            integ['rescale_failure_reason'] = 'no_finite_flpe_q'
+            return None
+
+        # The public hydrograph must match the integrated mean on its public,
+        # full time axis.  Scaling the geometry subset and later restoring fill
+        # values is the bug that removed otherwise valid FLPE observations.
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", category=RuntimeWarning)
-            qbar_flpe = np.nanmean(q)
+            qbar_flpe = np.nanmean(q_scale)
         if not (np.isfinite(qbar_flpe) and qbar_flpe > 0.):
+            integ['rescale_failure_reason'] = 'invalid_flpe_mean'
             return None
-
-        integ = reach_data.setdefault('integrator', {})
 
         # The rescale factor is deliberately not clamped.  A wild factor is a
         # real disagreement between FLPE and the integrator, and it should show
         # up in flp_fit_nrmse rather than be silently absorbed.
         factor = qbar_int / qbar_flpe
+        q_scaled = None
 
         method = self.params_dict.get('Rescale_Transform', 'mean')
         if method == 'powerlaw':
@@ -1641,23 +1685,36 @@ class Integrate:
             # targets admit no solution in range, fall back rather than force
             # one -- a forced fit is a silently wrong hydrograph.
             q33_int = integ.get('q33', np.nan)
-            solved = flp_fit.powerlaw_rescale(q, qbar_int, q33_int)
+            solved = flp_fit.powerlaw_rescale(q_scale, qbar_int, q33_int)
             if solved is not None:
                 a, b = solved
                 with np.errstate(all='ignore'):
-                    q_out = a * np.power(q, b)
-                if np.any(np.isfinite(q_out)):
+                    candidate = a * np.power(q_scale, b)
+                if np.any(np.isfinite(candidate)):
+                    q_scaled = candidate
                     integ['rescale_method'] = 'powerlaw'
                     integ['rescale_a'] = float(a)
                     integ['rescale_b'] = float(b)
-                    integ['rescale_factor'] = float(factor)
-                    return np.reshape(q_out, (1, nt_valid))
 
-        integ['rescale_method'] = 'mean'
-        integ['rescale_a'] = float(factor)
-        integ['rescale_b'] = 1.0
+        # A failed power-law solve deliberately falls back to the established
+        # mean transform, but still applies it to the full record once.
+        if q_scaled is None:
+            q_scaled = q_scale * factor
+            integ['rescale_method'] = 'mean'
+            integ['rescale_a'] = float(factor)
+            integ['rescale_b'] = 1.0
+
         integ['rescale_factor'] = float(factor)
-        return np.reshape(q * factor, (1, nt_valid))
+        integ['rescale_failure_reason'] = 'none'
+
+        # Derive the fit-grid target from the already-transformed full record.
+        # Never calculate a second factor on the subset.
+        q_fit = np.delete(q_scaled, delete_idx)
+        if q_fit.size != nt_fit:
+            integ['rescale_failure_reason'] = 'invalid_geometry_index_map'
+            return None
+        return (flp_fit.as_row(q_fit, nt_fit),
+                flp_fit.as_row(q_scaled, nt_full))
 
     def integrator_hydrograph(self, alg, reach, q_flowlaw):
         """Hydrograph to keep for one reach/algorithm after the FLP refit."""
@@ -1733,9 +1790,11 @@ class Integrate:
     def _flp_reach_spec(self, alg, reach):
         """Bounds, priors and flow law for one reach/algorithm, or None.
 
-        None means this reach is not a candidate at all -- outside the basin,
-        or with no usable geometry.  Every reach that gets a spec gets a
-        result, even if that result is "could not be fitted".
+        None means this reach is not an FLP fitting candidate -- it is outside
+        the basin or has no usable geometry.  An observed non-candidate still
+        gets an explicit masked output record, but is reported separately from
+        reaches for which a fit was attempted.  Every reach that gets a spec
+        gets a fit result, even if that result is "could not be fitted".
         """
         try:
             datagood = (self.obs_dict[reach]['nt'] > 0
@@ -2005,6 +2064,64 @@ class Integrate:
         integ['qbar_source'] = self.alg_dict[alg][reach].get('qbar_source', '')
         integ['q33_source'] = self.alg_dict[alg][reach].get('q33_source', '')
 
+    def _store_unavailable_flp(
+            self, alg, reach, status=flp_fit.FIT_NO_SERIES,
+            reason=flp_fit.EXPORT_REASON_NO_GEOMETRY,
+            candidate_params=None):
+        """Store an explicitly masked FLP result without touching full Q(t).
+
+        The primary rescaled FLPE hydrograph is intentionally left untouched.
+        Explicitly masking the flow-law export lets the serial SWORD finalizer
+        distinguish an expected unavailable result from an unexplained missing
+        parameter.  This also clears candidate parameters from an earlier call
+        so a reused Integrate object cannot leak a stale fit.
+        """
+        obs = self.obs_dict[reach]
+        integ = self.alg_dict[alg][reach].setdefault('integrator', {})
+        nt_fit = max(int(obs.get('nt', 0)), 0)
+        missing = np.full((1, nt_fit), np.nan)
+
+        for key in list(integ):
+            if key.startswith('flp_candidate_'):
+                integ.pop(key)
+        for key in self.FLP_PARAM_KEYS[alg]:
+            integ[key] = np.nan
+        if candidate_params is not None:
+            for key, value in zip(self.FLP_PARAM_KEYS[alg], candidate_params):
+                integ['flp_candidate_' + key] = value
+        if alg == 'momma':
+            integ.setdefault('Save', np.nan)
+
+        # A rescaled q/q_full pair is independent of geometry and survives.
+        # A flow-law fallback has no usable series when its FLP is unavailable.
+        if integ.get('q_source') != 'rescaled':
+            integ['q'] = missing.copy()
+
+        integ['q_flowlaw_candidate'] = missing.copy()
+        integ['q_flowlaw'] = missing.copy()
+        integ.update(flp_fit.shape_diagnostics(missing, None))
+        integ['flowlaw_valid_obs'] = int(np.sum(np.asarray(
+            self.flowlaw_mask(alg, reach)
+            if self.flowlaw_mask(alg, reach) is not None else [],
+            dtype=bool)))
+
+        integ['flp_fit_nrmse'] = np.nan
+        integ['flp_fit_nrmse_log'] = np.nan
+        integ['flp_fit_status'] = status
+        integ['flp_fit_status_code'] = flp_fit.FIT_STATUS_CODE[status]
+        integ['flp_param_at_bound'] = 0
+        integ['flp_n_valid_obs'] = 0
+        integ['flp_grid_evals'] = 0
+        integ['flp_fit_method'] = 'none'
+        integ['dA_valid_frac'] = flp_fit.da_valid_fraction(obs)
+        integ['flp_exported'] = 0
+        integ['flp_export_reason'] = reason
+        integ['geometry_status'] = obs.get('geometry_status', '')
+        integ['width_source'] = obs.get('width_source', '')
+        integ['corr_wse_dA'] = obs.get('corr_wse_dA', np.nan)
+        integ['qbar_source'] = self.alg_dict[alg][reach].get('qbar_source', '')
+        integ['q33_source'] = self.alg_dict[alg][reach].get('q33_source', '')
+
     def _count_export(self, alg, reach, status):
         """Per-algorithm coverage: what was fitted, exported and masked."""
         integ = self.alg_dict[alg][reach]['integrator']
@@ -2020,6 +2137,11 @@ class Integrate:
         else:
             reason = integ['flp_export_reason']
             export['masked'][reason] = export['masked'].get(reason, 0) + 1
+
+    def _count_flp_unavailable(self, alg, reason):
+        """Observed reaches that were not candidates for an FLP fit."""
+        counts = self.flp_unavailable_report.setdefault(alg, {})
+        counts[reason] = counts.get(reason, 0) + 1
 
     def compute_FLPs(self):
         settings = {
@@ -2038,6 +2160,7 @@ class Integrate:
 
         self.flp_fit_report = {}
         self.flp_export_report = {}
+        self.flp_unavailable_report = {}
 
         for alg in self.FLP_ALGORITHMS:
             if alg not in self.alg_dict:
@@ -2048,6 +2171,15 @@ class Integrate:
             for reach in self.alg_dict[alg]:
                 spec = self._flp_reach_spec(alg, reach)
                 if spec is None:
+                    # Reaches outside this observed basin are not candidates.
+                    # An observed reach with zero usable geometry is a real,
+                    # explicitly masked FLP result; its full FLPE Q(t) remains
+                    # available independently in integrator['q_full'].
+                    if (reach in self.basin_dict['reach_ids']
+                            and reach in self.obs_dict):
+                        self._store_unavailable_flp(alg, reach)
+                        self._count_flp_unavailable(
+                            alg, flp_fit.EXPORT_REASON_NO_GEOMETRY)
                     continue
                 try:
                     outcome = self._fit_one_flp(alg, reach, spec, settings)
@@ -2064,6 +2196,13 @@ class Integrate:
                 except Exception as exc:
                     if self.VerboseFlag:
                         print('    %s %s: store failed (%s)' % (alg, reach, exc))
+                    self._store_unavailable_flp(
+                        alg, reach, status=flp_fit.FIT_FAILED,
+                        reason=flp_fit.EXPORT_REASON_FIT_FAILED,
+                        candidate_params=outcome.params)
+                    counts[flp_fit.FIT_FAILED] = (
+                        counts.get(flp_fit.FIT_FAILED, 0) + 1)
+                    self._count_export(alg, reach, flp_fit.FIT_FAILED)
                     continue
                 counts[outcome.status] = counts.get(outcome.status, 0) + 1
                 self._count_export(alg, reach, outcome.status)
@@ -2230,6 +2369,9 @@ class Integrate:
               'unconverged_solves': unconverged,
               'n_unconverged_solves': n_unconverged,
               'flp_fit_status_counts': flp,
+              'flp_unavailable': {
+                  alg: dict(counts) for alg, counts in sorted(
+                      getattr(self, 'flp_unavailable_report', {}).items())},
               'n_flp_fits_not_good': n_not_good,
               'n_hydrograph_repairs': int(
                   getattr(self, 'flp_hydrograph_repairs', 0)),
@@ -2256,6 +2398,11 @@ class Integrate:
           for alg, counts in report['flp_fit_status_counts'].items():
               if counts:
                   print('  FLP %-9s %s' % (
+                      alg,
+                      ', '.join('%s=%d' % kv for kv in sorted(counts.items()))))
+          for alg, counts in report['flp_unavailable'].items():
+              if counts:
+                  print('  FLP unavailable %-9s %s' % (
                       alg,
                       ', '.join('%s=%d' % kv for kv in sorted(counts.items()))))
           print('  FLP fits not marked good: %d' % report['n_flp_fits_not_good'])

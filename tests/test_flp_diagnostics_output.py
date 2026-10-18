@@ -42,6 +42,8 @@ def test_diagnostics_round_trip(tmp_path):
         'rescale_factor': 1.47,
         'rescale_b': 1.0,
         'rescale_method': 'mean',
+        'rescale_failure_reason': 'none',
+        'rescale_input_grid': 'full_record',
         'flp_fit_method': 'varpro',
         'q_source': 'rescaled',
         'qbar_source': 'FLPE',
@@ -66,6 +68,8 @@ def test_diagnostics_round_trip(tmp_path):
         assert group.flp_fit_status == 'good'
         assert group.flp_fit_method == 'varpro'
         assert group.rescale_method == 'mean'
+        assert group.rescale_failure_reason == 'none'
+        assert group.rescale_input_grid == 'full_record'
         assert group.hydrograph_source == 'rescaled'
         # The provenance gap the canary run identified.
         assert group.qbar_source == 'FLPE'
@@ -96,13 +100,16 @@ def test_missing_diagnostics_become_fill_not_a_crash(tmp_path):
 # write_output down for every reach and every algorithm in the basin.
 # ---------------------------------------------------------------------------
 
-def make_expander(tmp_path, q, nt_full):
+def make_expander(tmp_path, q, nt_full, q_full=None, q_source='flowlaw'):
+    integrator = {'q': q, 'q_source': q_source}
+    if q_full is not None:
+        integrator['q_full'] = q_full
     writer = Output(
         basin_dict={},
         out_dir=Path(tmp_path),
         integ_dict={},
-        alg_dict={'sad': {'12345': {'integrator': {'q': q}}}},
-        obs_dict={'12345': {'nt': nt_full}},
+        alg_dict={'sad': {'12345': {'integrator': integrator}}},
+        obs_dict={'12345': {'nt': nt_full, 'nt_full': nt_full}},
         sword_dir=Path(tmp_path),
         params_dict={},
     )
@@ -157,7 +164,7 @@ def test_expand_with_nothing_dropped_is_a_passthrough(tmp_path):
 
 
 def test_expand_zero_valid_timesteps_has_no_off_by_one(tmp_path):
-    """All geometry-filtered timesteps must round-trip to the full record."""
+    """A flow-law fallback has fill where every geometry sample was dropped."""
     writer = make_expander(tmp_path, np.array([], dtype=float), nt_full=2)
 
     out = writer._expand_q_to_full_record(
@@ -166,6 +173,44 @@ def test_expand_zero_valid_timesteps_has_no_off_by_one(tmp_path):
     assert out.shape == (1, 2)
     np.testing.assert_array_equal(out[0], np.array([FILL, FILL]))
     assert writer.q_shape_repairs == []
+
+
+def test_expand_prefers_q_full_for_partial_geometry_deletion(tmp_path):
+    writer = make_expander(
+        tmp_path, np.array([10., 30.]), nt_full=3,
+        q_full=np.array([10., 20., 30.]), q_source='rescaled')
+
+    out = writer._expand_q_to_full_record(
+        'sad', '12345', np.array([1]), 1, FILL)
+
+    np.testing.assert_array_equal(out[0], np.array([10., 20., 30.]))
+    assert writer.q_shape_repairs == []
+
+
+def test_expand_prefers_q_full_when_no_geometry_is_valid(tmp_path):
+    writer = make_expander(
+        tmp_path, np.empty((1, 0)), nt_full=2,
+        q_full=np.array([[10., 20.]]), q_source='rescaled')
+
+    out = writer._expand_q_to_full_record(
+        'sad', '12345', np.array([0, 0]), 2, FILL)
+
+    np.testing.assert_array_equal(out[0], np.array([10., 20.]))
+    assert writer.q_shape_repairs == []
+
+
+def test_malformed_q_full_warns_and_falls_back_to_filtered_q(tmp_path):
+    writer = make_expander(
+        tmp_path, np.array([10., 30.]), nt_full=3,
+        q_full=np.array([10., 20.]), q_source='rescaled')
+
+    with pytest.warns(UserWarning, match='q_full'):
+        out = writer._expand_q_to_full_record(
+            'sad', '12345', np.array([1]), 1, FILL)
+
+    np.testing.assert_array_equal(out[0], np.array([10., FILL, 30.]))
+    assert writer.q_shape_repairs[0]['key'] == 'q_full'
+    assert writer.q_shape_repairs[0]['expected'] == 3
 
 
 def test_output_row_helper_does_not_drift_from_flp_fit():

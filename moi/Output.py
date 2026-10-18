@@ -382,6 +382,8 @@ class Output:
         ('flp_fit_status', 'flp_fit_status'),
         ('flp_fit_method', 'flp_fit_method'),
         ('rescale_method', 'rescale_method'),
+        ('rescale_failure_reason', 'rescale_failure_reason'),
+        ('rescale_input_grid', 'rescale_input_grid'),
         ('hydrograph_source', 'q_source'),
         ('qbar_source', 'qbar_source'),
         ('q33_source', 'q33_source'),
@@ -409,11 +411,38 @@ class Output:
         Note the helper is local to this module on purpose -- see ``_as_row``.
         """
         integ = self.alg_dict[algorithm][reach]['integrator']
-        nt_valid = int(self.obs_dict[reach]['nt']) - int(nDelete)
-        if nt_valid < 0:
-            nt_valid = 0
+        obs = self.obs_dict[reach]
+        nt_full = int(obs.get('nt_full', int(obs['nt']) + int(nDelete)))
+        nt_valid = max(nt_full - int(nDelete), 0)
+
+        # The primary rescaled hydrograph is independent of flow-law geometry.
+        # Prefer its explicit full-record copy, but only with matching
+        # provenance and length; a stale or malformed array must not silently
+        # shift timestamps.
+        if (key == 'q' and integ.get('q_source') == 'rescaled'
+                and integ.get('q_full') is not None):
+            q_full = integ['q_full']
+            if np.size(q_full) == nt_full:
+                return _as_row(q_full, nt_full)
+            self.q_shape_repairs.append({
+                'algorithm': algorithm,
+                'reach': reach,
+                'key': 'q_full',
+                'size': int(np.size(q_full)),
+                'expected': nt_full,
+            })
+            warnings.warn(
+                'integrator q_full for %s/%s had %d values, expected %d; '
+                'falling back to filtered q'
+                % (algorithm, reach, np.size(q_full), nt_full)
+            )
 
         q = integ.get(key)
+        # write_output() is an output boundary and may be called twice by a
+        # diagnostic workflow.  An already-expanded series is a passthrough,
+        # not something to truncate and expand a second time.
+        if q is not None and np.size(q) == nt_full:
+            return _as_row(q, nt_full)
         if key == 'q' and (q is None or np.size(q) != nt_valid):
             self.q_shape_repairs.append({
                 'algorithm': algorithm,
@@ -495,11 +524,13 @@ class Output:
         for reach in reaches_to_write:
              if self.params_dict['write_fill_only']:
                  for algo in self.alg_dict.keys():
-                     if 'q' in self.alg_dict[algo][reach]['integrator'].keys():
-                         self.alg_dict[algo][reach]['integrator']['q'][:] = np.nan
-                     self.alg_dict[algo][reach]['integrator']['qbar'] = np.nan
-                     self.alg_dict[algo][reach]['integrator']['q33'] = np.nan
-                     self.alg_dict[algo][reach]['integrator']['sbQ_rel'] = np.nan
+                     integ = self.alg_dict[algo][reach]['integrator']
+                     for key in ('q', 'q_full'):
+                         if key in integ:
+                             integ[key][:] = np.nan
+                     integ['qbar'] = np.nan
+                     integ['q33'] = np.nan
+                     integ['sbQ_rel'] = np.nan
                      if 'qbar' in self.alg_dict[algo][reach].keys():
                          self.alg_dict[algo][reach]['qbar'] = np.nan
 
@@ -570,7 +601,8 @@ class Output:
              nDelete = shape_iDelete[1]
              iInsert = iDelete - np.arange(nDelete)
              iInsert = np.reshape(iInsert,[nDelete,]) 
-             self.obs_dict[reach]['nt'] += nDelete
+             nt_full = int(self.obs_dict[reach].get(
+                 'nt_full', self.obs_dict[reach]['nt'] + nDelete))
 
              for algo in ['busboi', 'hivdi', 'metroman', 'momma', 'sad', 'sic4dvar']:
                  integ = self.alg_dict[algo][reach]['integrator']
@@ -589,10 +621,10 @@ class Output:
              self._write_bias_correlation_diagnostics(out)
              self._write_gage_metadata(out, reach)
 
-             out.createDimension("nt", self.obs_dict[reach]['nt'])
+             out.createDimension("nt", nt_full)
              nt = out.createVariable("nt", "i4", ("nt",))
              nt.units = "time steps"
-             nt[:] = range(self.obs_dict[reach]['nt'])
+             nt[:] = range(nt_full)
              self._write_time_strings(out, reach)
 
              # 1 busboi

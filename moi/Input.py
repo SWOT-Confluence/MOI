@@ -664,7 +664,10 @@ class Input:
 
             nt = swot_dataset.dimensions['nt'].size
             reach_group = swot_dataset['reach']
-            obs = self.obs_dict[reach] = {'nt': nt}
+            # Keep the original SWOT-record length separate from the reduced
+            # flow-law fitting grid.  Geometry filtering below changes ``nt``;
+            # the FLPE hydrograph remains aligned to ``nt_full``.
+            obs = self.obs_dict[reach] = {'nt': nt, 'nt_full': nt}
             h = reach_group['wse'][0:nt].filled(np.nan)
             w_raw = reach_group['width'][0:nt].filled(np.nan)
             s_raw = reach_group['slope2'][0:nt].filled(np.nan)
