@@ -421,18 +421,24 @@ class Input:
             }
 
         # hivdi
+        hivdi_ok = False
         if hv_file.exists():
             hv = Dataset(hv_file, 'r', format="NETCDF4")
+            try:
+                self.alg_dict["hivdi"][r_id] = {
+                    "s1-flpe-exists": True,
+                    "q" : hv["reach"]["Q"][:].filled(np.nan),
+                    "alpha" : hv["reach"]["alpha"][:].filled(np.nan),
+                    "beta" : hv["reach"]["beta"][:].filled(np.nan),
+                    "a0" : hv["reach"]["A0"][:].filled(np.nan)
+                }
+                hivdi_ok = True
+            except Exception as e:
+                print(f'Reach {r_id}: failed to read {hv_file}. Reason: {e}')
+            finally:
+                hv.close()
+        if not hivdi_ok:
             self.alg_dict["hivdi"][r_id] = {
-                "s1-flpe-exists": True,
-                "q" : hv["reach"]["Q"][:].filled(np.nan),
-                "alpha" : hv["reach"]["alpha"][:].filled(np.nan),  
-                "beta" : hv["reach"]["beta"][:].filled(np.nan),  
-                "a0" : hv["reach"]["A0"][:].filled(np.nan)
-            }
-            hv.close()
-        else:
-            self.alg_dict["hivdi"][r_id] = { 
                 "s1-flpe-exists" : False ,
                 "q" : np.nan,
                 "alpha" : np.nan,
@@ -442,20 +448,26 @@ class Input:
             }
 
         # momma
+        momma_ok = False
         if mo_file.exists():
             mo = Dataset(mo_file, 'r', format="NETCDF4")
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", category=RuntimeWarning)
-                self.alg_dict["momma"][r_id] = {
-                    "s1-flpe-exists": True,
-                    "q" : mo["Q"][:].filled(np.nan),
-                    "B" : mo["zero_flow_stage"][:].filled(np.nan),
-                    "H" : mo["bankfull_stage"][:].filled(np.nan),                                  
-                    "Save" : np.nanmean(mo["slope"][:].filled(np.nan))
-                }
-            mo.close()
-        else:
-            self.alg_dict["momma"][r_id] = { 
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", category=RuntimeWarning)
+                    self.alg_dict["momma"][r_id] = {
+                        "s1-flpe-exists": True,
+                        "q" : mo["Q"][:].filled(np.nan),
+                        "B" : mo["zero_flow_stage"][:].filled(np.nan),
+                        "H" : mo["bankfull_stage"][:].filled(np.nan),
+                        "Save" : np.nanmean(mo["slope"][:].filled(np.nan))
+                    }
+                momma_ok = True
+            except Exception as e:
+                print(f'Reach {r_id}: failed to read {mo_file}. Reason: {e}')
+            finally:
+                mo.close()
+        if not momma_ok:
+            self.alg_dict["momma"][r_id] = {
                 "s1-flpe-exists" : False ,
                 "q" : np.nan,
                 "B" : np.nan,
@@ -466,17 +478,23 @@ class Input:
             }
 
         # sad
+        sad_ok = False
         if sd_file.exists():
             sd = Dataset(sd_file, 'r', format="NETCDF4")
+            try:
+                self.alg_dict["sad"][r_id] = {
+                    "s1-flpe-exists": True,
+                    "q" : sd["Qa"][:].filled(np.nan),
+                    "n" : sd["n"][:].filled(np.nan),
+                    "a0" : sd["A0"][:].filled(np.nan)
+                }
+                sad_ok = True
+            except Exception as e:
+                print(f'Reach {r_id}: failed to read {sd_file}. Reason: {e}')
+            finally:
+                sd.close()
+        if not sad_ok:
             self.alg_dict["sad"][r_id] = {
-                "s1-flpe-exists": True,
-                "q" : sd["Qa"][:].filled(np.nan),
-                "n" : sd["n"][:].filled(np.nan),
-                "a0" : sd["A0"][:].filled(np.nan)
-            }
-            sd.close()
-        else:
-            self.alg_dict["sad"][r_id] = { 
                 "s1-flpe-exists" : False ,
                 "q" : np.nan,
                 "n" : np.nan,
@@ -485,21 +503,26 @@ class Input:
                 "q33" : self.sos_dict[str(r_id)]['q33']
             }
 
-        # metroman    
+        # metroman
+        metroman_ok = False
         if mm_file.exists():
             mm = Dataset(mm_file, 'r', format="NETCDF4")
-            # index = np.where(mm["reach_id"][:] == int(r_id))
+            try:
+                # index = np.where(mm["reach_id"][:] == int(r_id))
+                self.alg_dict["metroman"][r_id] = {
+                     "s1-flpe-exists": True,
+                     "q" : mm["average"]["allq"][:].filled(np.nan),
+                     "na" : mm["average"]["nahat"][:].filled(np.nan),
+                     "x1" : mm["average"]["x1hat"][:].filled(np.nan),
+                     "a0" : mm["average"]["A0hat"][:].filled(np.nan)
+                }
+                metroman_ok = True
+            except Exception as e:
+                print(f'Reach {r_id}: failed to read {mm_file}. Reason: {e}')
+            finally:
+                mm.close()
+        if not metroman_ok:
             self.alg_dict["metroman"][r_id] = {
-                 "s1-flpe-exists": True,
-                 "q" : mm["average"]["allq"][:].filled(np.nan),
-                 "na" : mm["average"]["nahat"][:].filled(np.nan),
-                 "x1" : mm["average"]["x1hat"][:].filled(np.nan),
-                 "a0" : mm["average"]["A0hat"][:].filled(np.nan)
-            }
-            mm.close()
-            #print('MetroMan file found. ')
-        else:
-            self.alg_dict["metroman"][r_id] = { 
                 "s1-flpe-exists" : False ,
                 "q" : np.nan,
                 "na" : np.nan,
@@ -508,23 +531,28 @@ class Input:
                 "qbar" : self.sos_dict[str(r_id)]['Qbar'],
                 "q33" : self.sos_dict[str(r_id)]['q33']
             }
-            #print('MetroMan file not found. Using prior')
 
         # sic4dvar
+        sic4dvar_ok = False
         if sv_file.exists():
             sv = Dataset(sv_file, 'r', format="NETCDF4")
+            try:
+                self.alg_dict["sic4dvar"][r_id] = {
+                    #"q31": sv["Qalgo31"][:].filled(np.nan),#unclear which of these to use
+                    "s1-flpe-exists": True,
+                    "q_mm": sv["Q_mm"][:].filled(np.nan),
+                    "q": sv["Q_da"][:].filled(np.nan),
+                    # "q5": sv["Qalgo5"][:].filled(np.nan),
+                    "n": sv["n"][:].filled(np.nan),
+                    "a0": sv["A0"][:].filled(np.nan)
+                }
+                sic4dvar_ok = True
+            except Exception as e:
+                print(f'Reach {r_id}: failed to read {sv_file}. Reason: {e}')
+            finally:
+                sv.close()
+        if not sic4dvar_ok:
             self.alg_dict["sic4dvar"][r_id] = {
-                #"q31": sv["Qalgo31"][:].filled(np.nan),#unclear which of these to use
-                "s1-flpe-exists": True,
-                "q_mm": sv["Q_mm"][:].filled(np.nan),
-                "q": sv["Q_da"][:].filled(np.nan),
-                # "q5": sv["Qalgo5"][:].filled(np.nan),
-                "n": sv["n"][:].filled(np.nan),
-                "a0": sv["A0"][:].filled(np.nan)
-            }
-            sv.close()
-        else:
-            self.alg_dict["sic4dvar"][r_id] = { 
                 "s1-flpe-exists" : False ,
                 "q_mm": np.nan,
                 "q": np.nan,
