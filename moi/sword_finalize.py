@@ -21,9 +21,9 @@ have finished:
 5. atomically rename it to the output path.
 
 The output path is explicit: the source SWORD directory is treated as
-read-only.  Exposing the output at the path JPL requires
-(/mnt/data/input/sword/<continent>_sword_v17_moi.nc) is a job for the
-container bind/DAG.  Standalone (no moi imports) so it runs as
+read-only.  The basin-task writer (Output.write_sword_output) publishes to
+/mnt/data/output/sword_l2/<continent>_sword_v17_moi.nc; pass the same path
+here to keep the two consistent.  Standalone (no moi imports) so it runs as
 ``python3 /app/moi/sword_finalize.py`` inside the MOI container.
 """
 

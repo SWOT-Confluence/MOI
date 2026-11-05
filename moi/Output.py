@@ -764,7 +764,11 @@ class Output:
         sword_src_file = self.sword_dir.joinpath(self.basin_dict['sword'])
         
         if self.out_dir == Path('/mnt/data/output'):
-            sword_dest_file = self.sword_dir.joinpath(self.basin_dict['sword'].replace('.nc', '_moi.nc'))
+            # The SWORD input mount (/mnt/data/input/sword) is read-only, so the
+            # continental *_moi.nc copy lives under the output mount instead.
+            sword_out_dir = self.out_dir.joinpath('sword_l2')
+            sword_out_dir.mkdir(parents=True, exist_ok=True)
+            sword_dest_file = sword_out_dir.joinpath(self.basin_dict['sword'].replace('.nc', '_moi.nc'))
         else:
             print('Debug mode: writing to output directory')
             sword_dest_file = self.out_dir.joinpath(self.basin_dict['sword'].replace('.nc', '_moi.nc'))
