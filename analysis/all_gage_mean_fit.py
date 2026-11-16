@@ -550,12 +550,14 @@ def run_one_basin(
     input_obj.extract_sword()
     input_obj = get_all_sword_reach_in_basin(input_obj, verbose)
     input_obj.extract_swot()
+    gage_period = input_obj.configure_gage_period(params)
     input_obj.extract_sos()
     input_obj.extract_alg()
     input_obj.extract_svs(
         svs_file,
         reach_id_col="reach_id_v17b",
         calval_file=all_gage_calval_csv,
+        gage_period=gage_period,
     )
     n_svs_gages_loaded = len(input_obj.gage_dict)
 

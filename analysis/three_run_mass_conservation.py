@@ -587,6 +587,7 @@ def run_one_basin_experiment(
     input_obj.extract_sword()
     input_obj = get_all_sword_reach_in_basin(input_obj, verbose)
     input_obj.extract_swot()
+    gage_period = input_obj.configure_gage_period(params) if run_spec.uses_gages else None
     input_obj.extract_sos()
     input_obj.extract_alg()
 
@@ -598,6 +599,7 @@ def run_one_basin_experiment(
             Path(svs_file),
             reach_id_col="reach_id_v17b",
             calval_file=run_spec.calval_csv,
+            gage_period=gage_period,
         )
         gage_dict = input_obj.gage_dict
     n_svs_gages_loaded = len(gage_dict)

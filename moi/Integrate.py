@@ -10,6 +10,7 @@ from scipy import optimize
 import scipy.sparse as sp
 
 from moi import flp_fit
+from moi.gage_statistics import daily_gage_values, study_period, swot_ordinal_days
 from moi.sfoi_math_core import (
     adjust_lsq_bias_correlated_sparse,
     adjust_lsq_mult_sparse,
@@ -158,16 +159,7 @@ class Integrate:
 
     @staticmethod
     def _swot_ordinal_days(times):
-        epoch = datetime.datetime(2000, 1, 1)
-        ordinals = []
-        for value in np.asarray(times, dtype=float).ravel():
-            if not np.isfinite(value):
-                continue
-            try:
-                ordinals.append((epoch + datetime.timedelta(seconds=float(value))).toordinal())
-            except (OverflowError, ValueError):
-                continue
-        return np.asarray(ordinals, dtype=np.int64)
+        return swot_ordinal_days(times)
 
     def _merge_sos_gages(self):
         """Use legacy SoS gages only where no explicit SVS gage was loaded."""
@@ -188,64 +180,121 @@ class Integrate:
             }
 
     def prepare_gage_constraints(self):
-        """Match gage data to SWOT sampling days and compute mean/q33 constraints."""
+        """Use a common raw-SWOT period for real gages; preserve pseudo-gages."""
         self._merge_sos_gages()
-        all_swot_days = []
-        for obs in self.obs_dict.values():
-            all_swot_days.extend(self._swot_ordinal_days(obs.get('t', [])).tolist())
-        all_swot_days = np.unique(np.asarray(all_swot_days, dtype=np.int64))
+        params = self.params_dict
+        mode = params.get('Gage_Statistic_Mode')
+        if mode is None:
+            # Preserve explicit settings used by older library callers.
+            if 'Gage_Match_SWOT_Days' in params:
+                mode = 'swot_days' if params['Gage_Match_SWOT_Days'] else 'full_record'
+            else:
+                mode = 'period'
+        if mode not in ('period', 'swot_days', 'full_record'):
+            raise ValueError(f'Unknown Gage_Statistic_Mode: {mode!r}')
+        min_samples = int(params.get('Gage_Min_Matched_Samples', 1))
+        min_coverage = float(params.get('Gage_Min_Period_Coverage', 0.20))
+        if min_samples < 1:
+            raise ValueError('Gage_Min_Matched_Samples must be at least 1')
+        if not np.isfinite(min_coverage) or not 0.0 <= min_coverage <= 1.0:
+            raise ValueError('Gage_Min_Period_Coverage must be in [0, 1]')
 
-        min_samples = int(self.params_dict.get('Gage_Min_Matched_Samples', 1))
-        match_swot_days = bool(self.params_dict.get('Gage_Match_SWOT_Days', True))
-        allow_full_record = bool(self.params_dict.get('Gage_Allow_Full_Record_Fallback', False))
+        first = last = None
+        real_gages = any(g.get('source') != 'corridors' for g in self.gage_dict.values())
+        if mode == 'period' and (real_gages or params.get('Gage_Period_Start')
+                                 or params.get('Gage_Period_End')):
+            first, last = study_period(
+                self.obs_dict, params.get('Gage_Period_Start'),
+                params.get('Gage_Period_End'))
+        period_days = last - first + 1 if first is not None else None
+        report = {
+            'statistic_mode': mode,
+            'period_start': datetime.date.fromordinal(first).isoformat() if first else None,
+            'period_end': datetime.date.fromordinal(last).isoformat() if last else None,
+            'period_days': period_days,
+            'period_source': params.get('Gage_Period_Source', 'raw_observations_with_optional_overrides'),
+            'min_period_coverage': min_coverage,
+            'reaches': {},
+        }
+        all_swot_days = np.unique(np.concatenate([
+            self._swot_ordinal_days(obs.get('t', []))
+            for obs in self.obs_dict.values()
+        ])) if self.obs_dict else np.array([], dtype=np.int64)
         prepared = {}
 
         for reach, gage in self.gage_dict.items():
             reach = str(reach)
-            q_raw = gage.get('Q', [])
-            qt_raw = gage.get('t', [])
-            if hasattr(q_raw, 'filled'):
-                q_raw = q_raw.filled(np.nan)
-            if hasattr(qt_raw, 'filled'):
-                qt_raw = qt_raw.filled(np.nan)
-            q = np.asarray(q_raw, dtype=float).ravel()
-            qt = np.asarray(qt_raw, dtype=float).ravel()
-            count = min(q.size, qt.size)
-            q = q[:count]
-            qt = qt[:count]
-            valid = np.isfinite(q) & (q > 0) & np.isfinite(qt)
-            q = q[valid]
-            qt = qt[valid].astype(np.int64)
-            if q.size == 0:
+            pseudo = gage.get('source') == 'corridors'
+            gage_mode = 'swot_days' if pseudo else mode
+            diagnostic = {
+                'station_id': str(gage.get('station_id', '')),
+                'source': str(gage.get('source', 'unknown')),
+                'statistic_mode': gage_mode,
+                'status': 'no_valid_gage_data',
+                'n_valid_days': 0,
+                'period_coverage': None,
+            }
+            report['reaches'][reach] = diagnostic
+            group = str(gage.get('group', '')).strip().lower()
+            if group and group != 'calibration' and not pseudo:
+                diagnostic['status'] = 'not_calibration'
+                continue
+            days, q = daily_gage_values(
+                gage.get('t', []), gage.get('Q', []),
+                include_zero=gage_mode == 'period')
+            if not q.size:
                 continue
 
-            if match_swot_days:
-                if reach in self.obs_dict:
-                    target_days = self._swot_ordinal_days(self.obs_dict[reach].get('t', []))
+            if gage_mode == 'period':
+                in_period = (days >= first) & (days <= last)
+                days, q = days[in_period], q[in_period]
+                diagnostic['n_valid_days'] = int(q.size)
+                diagnostic['period_coverage'] = float(q.size / period_days)
+                if not q.size:
+                    diagnostic['status'] = 'no_gage_data_in_period'
+                    continue
+                diagnostic['first_valid_date'] = datetime.date.fromordinal(int(days[0])).isoformat()
+                diagnostic['last_valid_date'] = datetime.date.fromordinal(int(days[-1])).isoformat()
+                if diagnostic['period_coverage'] < min_coverage:
+                    diagnostic['status'] = 'insufficient_period_coverage'
+                    continue
+            elif gage_mode == 'swot_days':
+                obs = self.obs_dict.get(reach)
+                targets = (self._swot_ordinal_days(obs.get('t', []))
+                           if obs is not None else all_swot_days)
+                matched = np.isin(days, np.unique(targets))
+                if (matched.sum() < min_samples and not pseudo
+                        and params.get('Gage_Allow_Full_Record_Fallback', False)):
+                    diagnostic['statistic_mode'] = 'full_record_fallback'
                 else:
-                    target_days = all_swot_days
-                target_days = np.unique(target_days)
-                matched = []
-                for day in target_days:
-                    index = np.where(qt == day)[0]
-                    if index.size:
-                        matched.append(float(q[index[0]]))
-                matched_q = np.asarray(matched, dtype=float)
-            else:
-                matched_q = q
-
-            if matched_q.size < min_samples and allow_full_record:
-                matched_q = q
-            if matched_q.size < min_samples:
+                    days, q = days[matched], q[matched]
+            diagnostic['n_valid_days'] = int(q.size)
+            if q.size < min_samples:
+                diagnostic['status'] = 'too_few_samples'
                 continue
 
             prepared_gage = dict(gage)
-            prepared_gage['Qbar'] = float(np.nanmean(matched_q))
-            prepared_gage['q33'] = float(np.nanquantile(matched_q, 0.33))
-            prepared_gage['n_matched'] = int(matched_q.size)
+            prepared_gage['Qbar'] = float(np.mean(q))
+            prepared_gage['q33'] = float(np.quantile(q, 0.33))
+            prepared_gage['n_matched'] = int(q.size)
+            diagnostic.update({
+                'status': 'included',
+                'Qbar': prepared_gage['Qbar'],
+                'q33': prepared_gage['q33'],
+                'first_valid_date': datetime.date.fromordinal(int(days[0])).isoformat(),
+                'last_valid_date': datetime.date.fromordinal(int(days[-1])).isoformat(),
+            })
             prepared[reach] = prepared_gage
 
         self.gage_dict = prepared
+        if not hasattr(self, 'integ_dict'):
+            self.integ_dict = {}
+        self.integ_dict['gage_preparation'] = report
+        # Print the scientific target even when verbose solver logging is off.
+        if first is not None:
+            print(f'Gage study period: {report["period_start"]} .. '
+                  f'{report["period_end"]} (inclusive UTC; '
+                  f'minimum coverage {min_coverage:.0%})')
         if self.VerboseFlag:
             print(f'Prepared {len(self.gage_dict)} independent gage constraints')
 
@@ -272,7 +321,7 @@ class Integrate:
         for reach, gage in self.gage_dict.items():
             index = reach_index.get(str(reach))
             value = float(gage.get(value_key, np.nan))
-            if index is None or not np.isfinite(value) or value <= 0:
+            if index is None or not np.isfinite(value) or value < 0:
                 continue
             row = len(values)
             rows.append(row)

@@ -59,7 +59,11 @@ def set_moi_params():
         'Prior_Uncertainty': 0.60,
         'Gage_Uncertainty': 0.10,
         'Gage_Min_Matched_Samples': 1,
-        'Gage_Match_SWOT_Days': True,
+        'Gage_Statistic_Mode': 'period',
+        'Gage_Period_Start': None,
+        'Gage_Period_End': None,
+        'Gage_Min_Period_Coverage': 0.20,
+        'Gage_Match_SWOT_Days': False,
         'Gage_Allow_Full_Record_Fallback': False,
         'Fill_Uncertainty': 1.0,
         # Soft mass rows target zero, so configure their uncertainty as an
@@ -257,6 +261,25 @@ def main():
         type=Path,
         default=None,
         help='Optional JSON list/dict of reach IDs reserved from gage constraints.',
+    )
+    parser.add_argument(
+        '--gage-statistic-mode',
+        choices=['period', 'swot_days'],
+        default=None,
+        help=('Gage Mean/q33 target: all valid daily observations within the '
+              'basin SWOT period (default), or legacy SWOT-day matching.'),
+    )
+    parser.add_argument(
+        '--gage-period-start', type=str, default=None, metavar='YYYY-MM-DD',
+        help='Inclusive UTC start; defaults to the first raw SWOT date in this basin.',
+    )
+    parser.add_argument(
+        '--gage-period-end', type=str, default=None, metavar='YYYY-MM-DD',
+        help='Inclusive UTC end; defaults to the last raw SWOT date in this basin.',
+    )
+    parser.add_argument(
+        '--gage-min-period-coverage', type=float, default=None, metavar='FRACTION',
+        help='Minimum fraction of study-period days with gage data (default: 0.20).',
     )
     parser.add_argument(
         '--correlation-rho',
@@ -480,6 +503,14 @@ def main():
             log.write(f"Starting SFOI Pipeline Index {index_to_run}, Basin {basin_id}\n")
 
             params_dict = set_moi_params()
+            if args.gage_statistic_mode is not None:
+                params_dict['Gage_Statistic_Mode'] = args.gage_statistic_mode
+            params_dict['Gage_Period_Start'] = args.gage_period_start
+            params_dict['Gage_Period_End'] = args.gage_period_end
+            if args.gage_min_period_coverage is not None:
+                if not 0.0 <= args.gage_min_period_coverage <= 1.0:
+                    raise ValueError('--gage-min-period-coverage must be in [0, 1]')
+                params_dict['Gage_Min_Period_Coverage'] = args.gage_min_period_coverage
             if args.use_corridors:
                 params_dict['UseCORRIDORS'] = True
             if args.corridors_override_gage:
@@ -563,6 +594,7 @@ def main():
                         f"({failure['reason']})\n")
 
                 if args.branch == 'constrained':
+                    gage_period = input_obj.configure_gage_period(params_dict)
                     svs_file = args.svs_file
                     if svs_file is None:
                         svs_candidates = sorted((input_dir / 'svs').glob('*SVS*.nc'))
@@ -591,6 +623,7 @@ def main():
                             include_reach_ids=args.gage_include_json,
                             exclude_reach_ids=args.gage_exclude_json,
                             calval_file=calval_file,
+                            gage_period=gage_period,
                         )
                         svs_loaded = True
                     else:
@@ -665,6 +698,14 @@ def main():
                 ),
                 corridors_dict=corridors_dict,
             )
+
+            # Persist every selected/rejected gage, even if the solve fails later.
+            if integrate_obj.integ_dict.get('gage_preparation'):
+                gage_report = log_dir / f'gage_constraints_{basin_id}.json'
+                with gage_report.open('w') as stream:
+                    json.dump(integrate_obj.integ_dict['gage_preparation'], stream,
+                              indent=2, allow_nan=False)
+                print(f'[{basin_id}] Gage preparation report: {gage_report}')
 
             try:
                 integrate_obj.integrate()

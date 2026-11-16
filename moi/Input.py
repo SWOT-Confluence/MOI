@@ -5,6 +5,7 @@ import datetime
 import json
 import warnings
 from moi import flowlaw_preprocess
+from moi.gage_statistics import study_period
 
 try:
     import geopandas as gpd
@@ -329,6 +330,7 @@ class Input:
         calval_file=None,
         calval_reach_id_col='reach_id_v17b',
         calibration_group='calibration',
+        gage_period=None,
     ):
         """Extract SVS gage time series for reaches in the current basin.
 
@@ -336,6 +338,9 @@ class Input:
         integrator can append them as independent soft constraints rather than
         replacing the FLPE observation at a gaged reach. When a Cal/Val CSV is
         supplied, only reaches assigned to the calibration group are eligible.
+        If several stations share a reach, gage_period selects the one with
+        the most valid days inside the target interval, rather than counting
+        observations outside it.
         """
         svs_file = Path(svs_file)
         if not svs_file.is_file():
@@ -395,11 +400,16 @@ class Input:
                 valid_counts = []
                 for station_index in station_indices:
                     q = np.asarray(q_all[station_index], dtype=float)
-                    valid_counts.append(np.count_nonzero(np.isfinite(q) & (q > 0)))
+                    valid = np.isfinite(q) & (q >= 0) & (ordinal_dates > 0)
+                    if gage_period is not None:
+                        valid &= ((ordinal_dates >= gage_period[0])
+                                  & (ordinal_dates <= gage_period[1]))
+                    valid_counts.append(np.unique(ordinal_dates[valid]).size)
                 station_index = int(station_indices[int(np.argmax(valid_counts))])
 
                 q = np.asarray(q_all[station_index], dtype=float)
-                valid = np.isfinite(q) & (q > 0) & (ordinal_dates > 0)
+                # Zero discharge is an observation, not a missing value.
+                valid = np.isfinite(q) & (q >= 0) & (ordinal_dates > 0)
                 if not np.any(valid):
                     continue
 
@@ -646,6 +656,40 @@ class Input:
         sword_dataset.close()
         
     
+    def configure_gage_period(self, params):
+        """Resolve and record the shared target before selecting SVS stations."""
+        if params.get('Gage_Statistic_Mode') != 'period':
+            return None
+        start, end = params.get('Gage_Period_Start'), params.get('Gage_Period_End')
+        first, last = self.gage_study_period(start, end)
+        params['Gage_Period_Source'] = (
+            'explicit' if start and end else 'basin_raw_swot_with_optional_overrides')
+        params['Gage_Period_Start'] = datetime.date.fromordinal(first).isoformat()
+        params['Gage_Period_End'] = datetime.date.fromordinal(last).isoformat()
+        return first, last
+
+    def gage_study_period(self, start=None, end=None):
+        """Bounds of downloaded raw SWOT data in this basin, before setfinder/QC.
+
+        Reuse already loaded full axes, and read only time from additional
+        basin files that did not survive the reach selection. Explicit bounds
+        can instead give several basins exactly the same scientific target.
+        """
+        if start and end:
+            return study_period({}, start, end)
+        observations = dict(getattr(self, 'obs_dict', {}))
+        basin = self.basin_dict.get('basin_id')
+        if basin is not None:
+            for path in sorted(self.swot_dir.glob(f'{basin}*_SWOT.nc')):
+                reach = path.name.removesuffix('_SWOT.nc')
+                if reach in observations:
+                    continue
+                with Dataset(path) as dataset:
+                    observations[reach] = {
+                        't_full': self._filled_array(dataset['reach/time'][:], np.nan)
+                    }
+        return study_period(observations, start, end)
+
     def extract_swot(self):
         self.obs_dict = {}
 
@@ -673,6 +717,8 @@ class Input:
             s_raw = reach_group['slope2'][0:nt].filled(np.nan)
             obs['dA'] = reach_group['d_x_area'][0:nt].filled(np.nan)
             obs['t'] = reach_group['time'][0:nt].filled(np.nan)
+            # Study-period endpoints must survive the geometry filter below.
+            obs['t_full'] = obs['t'].copy()
 
             # A file without a usable reach/hwfit gets the median observed width.
             area_fit = {'h_break': np.full(4, np.nan), 'fit_coeffs': None}

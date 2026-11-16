@@ -110,6 +110,10 @@ def test_extract_swot_keeps_full_time_strings_across_qc_deletions(tmp_path):
     assert input_obj.obs_dict[reach]['nt'] == 2
     assert input_obj.obs_dict[reach]['nt_full'] == 3
     np.testing.assert_array_equal(
+        input_obj.obs_dict[reach]['t_full'],
+        [757382400.0, 758246400.0, 759110400.0],
+    )
+    np.testing.assert_array_equal(
         input_obj.obs_dict[reach]['time_str'],
         TIME_STRINGS,
     )

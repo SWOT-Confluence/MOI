@@ -102,6 +102,7 @@ class Output:
         self.basin_dict = basin_dict
         self.out_dir = out_dir
         self.stage_estimate = integ_dict
+        self.gage_preparation = (integ_dict or {}).get('gage_preparation', {})
         self.alg_dict = alg_dict
         self.obs_dict = obs_dict
         self.sword_dir = sword_dir
@@ -314,6 +315,17 @@ class Output:
             'group',
             self.gage_groups.get(reach, 'none') if has_gage else 'none',
         )
+
+        preparation = self.gage_preparation
+        for attribute in ('statistic_mode', 'period_start', 'period_end', 'period_source',
+                          'period_days', 'min_period_coverage'):
+            value = preparation.get(attribute)
+            if value is not None:
+                gage.setncattr(attribute, value)
+        diagnostic = preparation.get('reaches', {}).get(reach, {})
+        for attribute, value in diagnostic.items():
+            if value is not None:
+                gage.setncattr(attribute, value)
 
         # Written only where a pseudo-gage was actually built, so their absence
         # is itself the signal that CORRIDORS had nothing for the reach.

@@ -19,6 +19,7 @@ From: ghcr.io/swot-confluence/moi:4.0.0
     moi/Integrate.py /app/moi/Integrate.py
     moi/Output.py /app/moi/Output.py
     moi/flp_fit.py /app/moi/flp_fit.py
+    moi/gage_statistics.py /app/moi/gage_statistics.py
     moi/sfoi_math_core.py /app/moi/sfoi_math_core.py
     run_MOI.py /app/run_MOI.py
     tests/test_bias_correlation.py /app/tests/test_bias_correlation.py
@@ -32,6 +33,7 @@ From: ghcr.io/swot-confluence/moi:4.0.0
     tests/test_flowlaw_preprocess.py /app/tests/test_flowlaw_preprocess.py
     tests/test_sword_finalize.py /app/tests/test_sword_finalize.py
     tests/test_gage_constraints.py /app/tests/test_gage_constraints.py
+    tests/test_gage_period.py /app/tests/test_gage_period.py
     tests/test_output_diagnostics.py /app/tests/test_output_diagnostics.py
     tests/test_sword_v17c_input.py /app/tests/test_sword_v17c_input.py
     tests/test_time_str_output.py /app/tests/test_time_str_output.py

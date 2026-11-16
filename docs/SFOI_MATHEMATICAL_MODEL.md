@@ -112,9 +112,19 @@ For a calibration gage on reach `j`,
 y_j^{gage}=Q_j+e_j^{gage}.
 \]
 
+For Mean, `y_j` is the mean of all valid daily gage observations in the
+basin-wide raw-SWOT study period (first through last UTC date, inclusive).
+For q33 it is the 0.33 quantile of the same daily record. These are not
+per-reach SWOT-day statistics. Each real station needs at least 20% coverage
+of the full interval by default; manually selected start/end dates and a
+configurable coverage threshold are supported. Missing/negative values are
+excluded and valid zero flow is retained. CORRIDORS pseudo-gages continue to
+use SWOT-day matching without the daily-record coverage gate.
+
 The default coefficient of variation is `0.10`. Gage sigma is frozen at its
-observation scale and gages are excluded from robust downweighting. Gages do
-not receive FLPE bias or regional correlation.
+observation scale (using the existing theta floor for small or zero targets).
+Gages are excluded from robust downweighting and do not receive FLPE bias or
+regional correlation.
 
 Implementation: `Integrate.build_gage_observation_rows` appends selector rows
 after the physical system has been built.

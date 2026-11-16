@@ -14,7 +14,7 @@ files without `time_str`, MOI derives UTC ISO timestamps from `reach/time`.
 ## Gage-constrained SFOI
 
 For `constrained` runs, MOI can read the Surface-water Validation System (SVS)
-NetCDF and append time-matched mean discharge and q33 as independent soft
+NetCDF and append study-period mean discharge and q33 as independent soft
 observations. The FLPE value at a gaged reach is retained; it is not replaced
 by the gage.
 
@@ -22,8 +22,59 @@ The sparse state remains `x = [Q_all, R_regions]`. Each gage contributes one
 selector row `H_g x = Q_gage` with finite relative uncertainty. Gage rows use a
 fixed observation-scale weight in the multiplicative outer loop, participate in
 the global chi-square diagnostic, and are protected from robust downweighting in
-the inner loop. The matched gage mean constrains the `Mean` run and the matched
-33rd-percentile gage discharge constrains the `q33` run.
+the inner loop. The study-period gage mean constrains the `Mean` run and the
+33rd-percentile gage discharge over the same period constrains the `q33` run.
+
+By default, each basin uses a single inclusive UTC calendar-date interval from
+its first to its last downloaded SWOT observation, **before geometry QC**.
+Files in the basin that did not survive the reach selection also contribute
+their raw timestamps; geometry and setfinder cannot silently shorten the window.
+Every eligible real calibration gage uses all valid daily observations within
+that continuous interval, including days without SWOT overpasses. A gage does
+not need usable SWOT geometry or an overpass on its own reach to participate.
+Data outside the interval are excluded; the window is never shortened to an
+individual station's available record. This estimates the mean over the finite
+SWOT study period, not a multi-decade climatological mean.
+
+The default minimum gage coverage is **20% of all calendar days in the study
+period**, with at least one valid observation. Coverage counts unique valid
+dates; duplicate values on a date are averaged before computing Mean/q33.
+Finite zero discharge is retained; negative and missing values are excluded.
+The existing solver observation-scale floor keeps zero-valued constraints at
+finite uncertainty. Coverage alone does not establish seasonal representativeness.
+Gages below the threshold are omitted with an explicit diagnostic, without
+falling back to observations outside the period. Calibration/validation and
+include/exclude filters still apply.
+When multiple SVS stations map to one reach, the station with the most valid
+days inside the chosen study period is selected.
+
+Use `--gage-period-start YYYY-MM-DD` and `--gage-period-end YYYY-MM-DD` to
+replace either automatically inferred endpoint. Supplying both dates gives
+all basins a common study period. Set `--gage-min-period-coverage 0.20` to
+change the coverage threshold. A missing automatic endpoint is an error rather
+than an implicit use of a station's historical record.
+
+```bash
+python run_MOI.py -i 0 -j basins.json -b constrained \
+  --svs-file /mnt/data/input/svs/SVS_v1_1_2.nc \
+  --svs-reach-id-col reach_id_v17c \
+  --gage-period-start 2023-01-01 --gage-period-end 2026-10-16 \
+  --gage-min-period-coverage 0.20
+```
+
+For comparison experiments, `--gage-statistic-mode swot_days` retains the old
+per-reach geometry-filtered SWOT-day target. Legacy library callers can still
+set `Gage_Match_SWOT_Days` explicitly when `Gage_Statistic_Mode` is absent.
+CORRIDORS pseudo-gages remain matched to SWOT days: they are sparse synthetic
+observations, not daily station records, and are not subject to the real-gage
+period-coverage gate.
+
+Each run writes `output/logs/gage_constraints_<basin_id>.json` before solving,
+including the period, coverage threshold, included/rejected status, valid-day
+count, coverage and used Mean/q33 for each available gage. The `gage` group in
+each integrator NetCDF carries the same study-period and per-reach diagnostics.
+These targets do not change how the FLPE hydrograph is rescaled; Qbar and
+same-day q(t) accuracy must still be assessed separately.
 
 When exactly one `*SVS*.nc` file exists in `/mnt/data/input/svs`, constrained
 runs discover it automatically. A calibration/validation CSV is required and
