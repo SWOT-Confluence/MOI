@@ -44,7 +44,8 @@ PARAMETERS = {
                         'sbQ_rel': 'sbQ_rel'}),
     'metroman': ('MetroMan', {'Abar': 'Abar', 'na': 'ninf', 'x1': 'p',
                               'sbQ_rel': 'sbQ_rel'}),
-    'momma': ('MOMMA', {'B': 'B', 'H': 'H', 'Save': 'Save'}),
+    'momma': ('MOMMA', {'B': 'B', 'H': 'H', 'Save': 'Save',
+                          'sbQ_rel': 'sbQ_rel'}),
     'sad': ('SADS', {'a0': 'Abar', 'n': 'n', 'sbQ_rel': 'sbQ_rel'}),
     'sic4dvar': ('SIC4DVar', {'a0': 'Abar', 'n': 'n', 'sbQ_rel': 'sbQ_rel'}),
 }

@@ -839,6 +839,8 @@ class Output:
                         self.alg_dict['momma'][reach]['integrator']['H']
                     sword_dataset['reaches']['discharge_models'][branch]['MOMMA']['Save'][reach_ind] = \
                         self.alg_dict['momma'][reach]['integrator']['Save']
+                    sword_dataset['reaches']['discharge_models'][branch]['MOMMA']['sbQ_rel'][reach_ind] = \
+                        self.alg_dict['momma'][reach]['integrator']['sbQ_rel']
 
                     # 5) SADS
                     sword_dataset['reaches']['discharge_models'][branch]['SADS']['Abar'][reach_ind] = \
